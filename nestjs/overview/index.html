@@ -1,0 +1,33 @@
+<h1>NestJS Overview <span class="tag express">NestJS</span></h1>
+<p>NestJS is an <strong>opinionated, TypeScript-first</strong> framework for building scalable server-side apps. It runs <em>on top of</em> Express (or optionally Fastify) and adds structure inspired by Angular: <strong>modules, controllers, providers</strong>, heavy use of <strong>decorators</strong> and <strong>dependency injection</strong>.</p>
+
+<h2>The three building blocks</h2>
+<ul>
+  <li><strong>Modules</strong> (<code>@Module</code>) — organize the app into cohesive feature units; the root module bootstraps everything.</li>
+  <li><strong>Controllers</strong> (<code>@Controller</code>) — handle incoming requests and return responses (the routing layer).</li>
+  <li><strong>Providers / Services</strong> (<code>@Injectable</code>) — business logic, injected via DI.</li>
+</ul>
+
+<h2>Why NestJS over plain Express?</h2>
+<ul>
+  <li><strong>Structure out of the box</strong> — Express is unopinionated; large Express apps drift into inconsistent folder layouts. Nest enforces a modular architecture.</li>
+  <li><strong>Dependency Injection</strong> — built-in IoC container → loosely coupled, highly testable code.</li>
+  <li><strong>TypeScript + decorators</strong> — strong typing, declarative routing/validation.</li>
+  <li><strong>Batteries included</strong> — validation pipes, guards (auth), interceptors, exception filters, config, testing utilities, Swagger, microservices, GraphQL, WebSockets.</li>
+  <li><strong>Platform-agnostic</strong> — swap Express for Fastify with one line for more throughput.</li>
+</ul>
+
+<div class="callout tip"><strong>One-liner:</strong> "Nest is to Express what Angular is to vanilla JS — an opinionated, DI-driven, modular layer that trades some flexibility for structure, testability, and scale."</div>
+
+<div class="callout warn"><strong>Trade-off:</strong> More boilerplate and a steeper learning curve (decorators, DI, modules). Overkill for a tiny API; excellent for large teams and long-lived enterprise apps.</div>
+
+<h2>Request flow at a glance</h2>
+<p><code>Request → Middleware → Guards → Interceptors(before) → Pipes → Controller → Service → Interceptors(after) → Response</code> (Exception Filters catch any error along the way).</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Is NestJS a replacement for Express?</summary><p>No — it sits on top of Express (default HTTP adapter) or Fastify. It adds architecture, DI, and features; the underlying HTTP server is still Express.</p></details>
+  <details><summary>What are the three core building blocks?</summary><p>Modules (organization), Controllers (routing), Providers/Services (business logic injected via DI).</p></details>
+  <details><summary>When would you choose Nest over Express?</summary><p>Large/long-lived apps, multiple teams, need for testability and consistency, or when you want built-in validation/auth/DI. For a tiny service, plain Express/Fastify is simpler.</p></details>
+  <details><summary>Express vs Fastify adapter in Nest?</summary><p>Nest is platform-agnostic; you can run on <code>@nestjs/platform-express</code> (default) or <code>@nestjs/platform-fastify</code> for higher throughput, with the same app code.</p></details>
+</div>

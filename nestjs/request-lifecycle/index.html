@@ -1,0 +1,40 @@
+<h1>Lifecycle: Middleware, Guards, Interceptors, Pipes <span class="tag express">NestJS</span></h1>
+<p>Nest decomposes cross-cutting concerns into four distinct, ordered hooks. Knowing the <strong>exact order</strong> and what each is for is a top NestJS interview question.</p>
+
+<h2>The order (memorize this)</h2>
+<p><code>Middleware → Guards → Interceptors(pre) → Pipes → Route Handler → Interceptors(post) → Exception Filters</code></p>
+
+<h2>1. Middleware</h2>
+<p>Runs first, like Express middleware (it <em>is</em> Express middleware). No access to the handler/class context. Use for logging, raw request tweaks, CORS, helmet.</p>
+
+<h2>2. Guards (<code>CanActivate</code>)</h2>
+<p>Decide <strong>if the request may proceed</strong> — authentication &amp; authorization. Return <code>true</code>/<code>false</code> (or throw). This is where JWT/roles checks live.</p>
+<div class="code-wrap"><pre><code>@Injectable()
+export class AuthGuard implements CanActivate {
+  canActivate(ctx: ExecutionContext): boolean {
+    const req = ctx.switchToHttp().getRequest();
+    return Boolean(req.headers.authorization);   // allow/deny
+  }
+}</code></pre></div>
+
+<h2>3. Interceptors (<code>NestInterceptor</code>)</h2>
+<p>Wrap the handler — run logic <strong>before and after</strong> it (AOP-style). Use for logging timing, transforming responses, caching, mapping to a standard envelope. Built on RxJS.</p>
+<div class="code-wrap"><pre><code>intercept(ctx, next) {
+  const start = Date.now();
+  return next.handle().pipe(tap(() => console.log(`${Date.now() - start}ms`)));
+}</code></pre></div>
+
+<h2>4. Pipes</h2>
+<p>Transform &amp; <strong>validate input</strong> just before the handler. The global <code>ValidationPipe</code> + <code>class-validator</code> DTOs is the standard pattern; <code>ParseIntPipe</code> coerces types.</p>
+
+<div class="callout tip"><strong>Mnemonic:</strong> Guards = "<em>can</em> you?" (auth). Pipes = "<em>is your input valid?</em>" (validation/transform). Interceptors = "<em>wrap around</em>" (before/after). Filters = "<em>something broke</em>" (errors).</div>
+
+<div class="callout warn"><strong>Binding scope:</strong> each can be applied method-, controller-, or global-scoped (<code>app.useGlobalGuards()</code>, <code>@UseGuards()</code>, etc.). Global validation + auth is the common setup.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What's the execution order?</summary><p>Middleware → Guards → Interceptors(before) → Pipes → Handler → Interceptors(after) → (Exception Filters on error).</p></details>
+  <details><summary>Guard vs Middleware?</summary><p>Middleware is generic Express-level pre-processing with no handler context. Guards run later, have the <code>ExecutionContext</code> (know the target handler/class), and exist specifically to allow/deny — i.e. auth.</p></details>
+  <details><summary>What are interceptors for?</summary><p>Wrapping the handler to run before/after logic: logging/timing, response transformation, caching, serialization — AOP via RxJS.</p></details>
+  <details><summary>How is validation done?</summary><p>Pipes — typically the global <code>ValidationPipe</code> with <code>class-validator</code>-decorated DTOs; <code>ParseIntPipe</code>/<code>ParseUUIDPipe</code> for param coercion.</p></details>
+</div>

@@ -15,6 +15,21 @@
 
 <div class="callout"><strong>This is the whole point:</strong> Express turns all of the above into one-liners (<code>app.get</code>, <code>res.json</code>, <code>express.json()</code>, middleware). See the "Why Express over Node?" page.</div>
 
+<h2>Reading a path param (no <code>req.params</code>!)</h2>
+<p>Raw <code>http</code> has <strong>no</strong> <code>req.params</code> — for a URL like <code>/users/42</code> you parse the id out of the pathname yourself. Two common ways:</p>
+<div class="code-wrap"><pre><code>const url = new URL(req.url, `http://${req.headers.host}`);
+
+// A) split the path into segments
+const seg = url.pathname.split('/').filter(Boolean);   // "/users/42" -> ["users","42"]
+if (req.method === 'GET' && seg[0] === 'users' && seg.length === 2) {
+  const id = seg[1];                                   // <-- the path param
+}
+
+// B) regex with a capture group (how routers really match)
+const m = url.pathname.match(/^\/orders\/(\w+)$/);
+if (m) { const orderId = m[1]; }</code></pre></div>
+<p>This manual segment/regex matching is exactly what Express's router does for you behind <code>app.get('/users/:id', ...)</code> → <code>req.params.id</code>.</p>
+
 <h2>Making requests</h2>
 <p><code>http.request()</code> / <code>http.get()</code> act as a client. Modern code often uses the global <code>fetch()</code> (stable since Node 18).</p>
 
@@ -22,5 +37,6 @@
   <h3>🎯 Interview questions</h3>
   <details><summary>What is <code>req</code> / <code>res</code> really?</summary><p><code>req</code> = <code>IncomingMessage</code>, a Readable stream. <code>res</code> = <code>ServerResponse</code>, a Writable stream. That's why you read the body via stream events.</p></details>
   <details><summary>How do you read a POST body in raw http?</summary><p>Accumulate <code>req.on('data', chunk =&gt; ...)</code> into a buffer/array, then on <code>req.on('end')</code> concat and parse. Guard against oversized bodies (DoS).</p></details>
+  <details><summary>How do you read a path param in raw http?</summary><p>There's no <code>req.params</code>. Parse <code>new URL(req.url, base).pathname</code> yourself — split into segments or match a regex with a capture group. Express's router automates this via <code>:id</code> → <code>req.params.id</code>.</p></details>
   <details><summary>Does createServer spawn a thread per request?</summary><p>No — one event loop handles all connections via non-blocking I/O. That's Node's core scalability model vs thread-per-request servers.</p></details>
 </div>

@@ -15,6 +15,21 @@
   <li><strong>Paused</strong> — you pull with <code>.read()</code>; <code>for await...of</code> is the modern way.</li>
 </ul>
 
+<h2>Duplex vs Transform</h2>
+<p>A <strong>Duplex</strong> stream is readable <em>and</em> writable, but the two sides are <strong>independent</strong> — what you write does not flow to what you read (think a TCP socket: you write a request, you read back a response, but they're separate channels). You implement both <code>_write</code> and <code>_read</code>.</p>
+<div class="code-wrap"><pre><code>const { Duplex } = require('stream');
+
+class EchoLogDuplex extends Duplex {
+  constructor() { super({ objectMode: true }); this.queue = ['a', 'b', null]; }
+  _write(chunk, enc, cb) { console.log('wrote:', chunk); cb(); }  // write side
+  _read() { this.push(this.queue.shift()); }                      // read side (independent)
+}
+
+const d = new EchoLogDuplex();
+d.write('ping');                 // uses the WRITE side
+d.on('data', x => console.log('read:', x));   // uses the READ side</code></pre></div>
+<p>A <strong>Transform</strong> is a special Duplex where the sides <em>are</em> connected: input is transformed into output (one <code>transform()</code> method) — e.g. gzip, encryption, parsing.</p>
+
 <h2>pipe &amp; backpressure</h2>
 <p><code>readable.pipe(writable)</code> connects them and automatically handles <strong>backpressure</strong>: if the writable is slower than the readable, pipe pauses the source until the sink drains. This is the killer feature — constant memory regardless of data size.</p>
 
@@ -27,5 +42,6 @@
   <details><summary>What problem do streams solve?</summary><p>Processing data larger than RAM and reducing latency (start processing the first byte before the last arrives) — constant memory, better throughput.</p></details>
   <details><summary>What is backpressure?</summary><p>When the consumer is slower than the producer. <code>pipe</code>/<code>pipeline</code> pause the source until <code>drain</code>, preventing unbounded memory growth.</p></details>
   <details><summary>pipe vs pipeline?</summary><p><code>pipeline</code> adds proper error propagation and resource cleanup across the whole chain; <code>pipe</code> does not forward errors, risking leaks.</p></details>
+  <details><summary>Duplex vs Transform?</summary><p>Both are readable+writable. In a Duplex the two sides are independent (e.g. a socket). A Transform connects them — output is a function of the input (gzip, crypto). Implement <code>_read</code>+<code>_write</code> for Duplex, just <code>transform()</code> for Transform.</p></details>
   <details><summary>Give a real example.</summary><p>Streaming a large file to an HTTP response gzipped: <code>pipeline(fs.createReadStream(f), zlib.createGzip(), res)</code>.</p></details>
 </div>

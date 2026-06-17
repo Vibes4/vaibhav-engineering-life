@@ -1,0 +1,32 @@
+<h1>Modules <span class="tag express">NestJS</span></h1>
+<p>A <strong>module</strong> (<code>@Module</code>) groups related controllers and providers into a cohesive feature unit. Every Nest app has at least a <strong>root module</strong> (<code>AppModule</code>); larger apps are a tree of feature modules.</p>
+
+<h2>The <code>@Module</code> metadata</h2>
+<div class="code-wrap"><pre><code>@Module({
+  imports:     [DatabaseModule, AuthModule],  // other modules this one depends on
+  controllers: [UsersController],             // request handlers
+  providers:   [UsersService],                // injectables, scoped to THIS module
+  exports:     [UsersService],                // make providers available to importers
+})
+export class UsersModule {}</code></pre></div>
+
+<h2>Encapsulation (key concept)</h2>
+<p>Providers are <strong>private to their module</strong> by default. If <code>UsersModule</code> wants <code>AuthModule</code>'s service, <code>AuthModule</code> must <code>exports</code> it <em>and</em> <code>UsersModule</code> must <code>imports</code> it. This explicit boundary is what keeps large apps decoupled.</p>
+
+<h2>Module types</h2>
+<ul>
+  <li><strong>Feature module</strong> — one per domain (users, orders, billing).</li>
+  <li><strong>Shared module</strong> — exports common providers reused across features.</li>
+  <li><strong>Global module</strong> (<code>@Global()</code>) — providers available everywhere without importing (use sparingly).</li>
+  <li><strong>Dynamic module</strong> — <code>forRoot()</code>/<code>forFeature()</code> pattern for configurable modules (e.g. <code>TypeOrmModule.forRoot(config)</code>).</li>
+</ul>
+
+<div class="callout tip"><strong>Senior signal:</strong> Mention the dynamic module <code>forRoot/forFeature</code> pattern — it's how config-driven modules (DB, JWT, config) pass options at import time.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What does a module encapsulate?</summary><p>Its providers — they're private unless explicitly listed in <code>exports</code>. Consumers must <code>imports</code> the module to use them.</p></details>
+  <details><summary>imports vs providers vs exports?</summary><p><code>providers</code>: injectables owned by this module. <code>exports</code>: which of those are visible to importers. <code>imports</code>: other modules whose exports you need.</p></details>
+  <details><summary>What is a dynamic module?</summary><p>A module configured at import time via static methods like <code>forRoot(options)</code> / <code>forFeature(...)</code> that return module metadata — used by DB, config, JWT modules.</p></details>
+  <details><summary>When use @Global()?</summary><p>For widely-needed providers (config, logging) to avoid re-importing everywhere. Overuse breaks encapsulation, so keep it minimal.</p></details>
+</div>

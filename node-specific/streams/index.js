@@ -1,5 +1,5 @@
 // Run:  node node-specific/streams/index.js
-const { Readable, Transform, pipeline } = require('stream');
+const { Readable, Writable, Duplex, Transform, pipeline } = require('stream');
 const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
@@ -46,6 +46,42 @@ function demoGzip() {
       console.log(`  ${orig} bytes -> ${zipped} bytes gzipped`);
       fs.rmSync(out);   // cleanup
       console.log('  cleaned up .gz');
+      demoDuplex();
     }
   );
+}
+
+// 4) DUPLEX: both readable AND writable, with two INDEPENDENT sides.
+//    (A TCP socket is the classic real example: you write requests out and
+//     read responses in — the two halves are not connected to each other.)
+function demoDuplex() {
+  console.log('\n--- duplex: independent read + write sides ---');
+
+  class EchoLogDuplex extends Duplex {
+    constructor() {
+      super({ objectMode: true });
+      this.queue = [];        // backing data for the READ side
+      this.queue.push('hello', 'from', 'read-side', null);  // null = end
+    }
+    // WRITE side: consume what callers write to us
+    _write(chunk, _enc, cb) {
+      console.log('  [write side] received:', JSON.stringify(chunk));
+      cb();
+    }
+    // READ side: produce data callers read from us (independent of writes)
+    _read() {
+      this.push(this.queue.shift());
+    }
+  }
+
+  const duplex = new EchoLogDuplex();
+
+  // Use the WRITE side
+  duplex.write('ping');
+  duplex.write('pong');
+  duplex.end();
+
+  // Use the READ side (separately)
+  duplex.on('data', (d) => console.log('  [read side]  produced:', JSON.stringify(d)));
+  duplex.on('end', () => console.log('  duplex read side finished (write side was separate).'));
 }

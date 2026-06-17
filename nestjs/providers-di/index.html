@@ -1,0 +1,48 @@
+<h1>Providers &amp; Dependency Injection <span class="tag express">NestJS</span></h1>
+<p>DI is the <strong>heart of NestJS</strong>. A <strong>provider</strong> is any class marked <code>@Injectable()</code> that the Nest <strong>IoC container</strong> creates and injects where needed — you never <code>new</code> a service yourself.</p>
+
+<h2>How injection works</h2>
+<div class="code-wrap"><pre><code>@Injectable()
+export class UsersService {
+  constructor(private readonly db: DatabaseService) {}   // db injected automatically
+  findOne(id: string) { return this.db.query('users', id); }
+}
+
+@Controller('users')
+export class UsersController {
+  constructor(private readonly users: UsersService) {}   // service injected automatically
+}</code></pre></div>
+<p>Nest reads the constructor parameter <strong>types</strong> (via TypeScript metadata), looks them up in the container, and supplies a single shared instance.</p>
+
+<h2>Why DI matters</h2>
+<ul>
+  <li><strong>Loose coupling</strong> — depend on an abstraction, not a concrete <code>new</code>.</li>
+  <li><strong>Testability</strong> — swap real providers for mocks in unit tests (<code>Test.createTestingModule</code> + <code>.overrideProvider()</code>).</li>
+  <li><strong>Singletons by default</strong> — one instance per app, reused everywhere (efficient).</li>
+</ul>
+
+<h2>Custom &amp; advanced providers</h2>
+<ul>
+  <li><strong>useClass</strong> — bind a token to an implementation (swap by environment).</li>
+  <li><strong>useValue</strong> — inject a constant/mock.</li>
+  <li><strong>useFactory</strong> — compute the provider (with its own injected deps) — e.g. a configured client.</li>
+  <li><strong>Injection tokens</strong> — inject interfaces/non-class values via a string/Symbol token + <code>@Inject(TOKEN)</code>.</li>
+</ul>
+
+<h2>Provider scopes</h2>
+<ul>
+  <li><strong>DEFAULT (singleton)</strong> — one instance shared app-wide.</li>
+  <li><strong>REQUEST</strong> — a new instance per request (carries per-request state; slower).</li>
+  <li><strong>TRANSIENT</strong> — a fresh instance for every consumer.</li>
+</ul>
+
+<div class="callout warn"><strong>Circular dependencies:</strong> two providers needing each other → use <code>forwardRef(() =&gt; X)</code>, but treat it as a smell to refactor.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is dependency injection here?</summary><p>The IoC container instantiates providers and injects them via the constructor based on types/tokens — you declare what you need, Nest supplies it.</p></details>
+  <details><summary>Default provider scope?</summary><p>Singleton — one instance per application, shared across the app. REQUEST and TRANSIENT scopes exist for per-request/per-consumer instances.</p></details>
+  <details><summary>useClass vs useValue vs useFactory?</summary><p><code>useClass</code> binds a token to an implementation; <code>useValue</code> injects a constant/mock; <code>useFactory</code> computes the provider (can inject deps) — e.g. configured clients.</p></details>
+  <details><summary>How does DI help testing?</summary><p>Replace real dependencies with mocks via the testing module's <code>overrideProvider</code>, so units are isolated.</p></details>
+  <details><summary>How do you inject something that isn't a class (e.g. config)?</summary><p>Use an injection token (string/Symbol) with a custom provider and <code>@Inject(TOKEN)</code>.</p></details>
+</div>

@@ -1,0 +1,43 @@
+<h1>Exception Filters <span class="tag express">NestJS</span></h1>
+<p>Exception filters are Nest's <strong>centralized error-handling</strong> layer — the equivalent of Express's 4-arg error middleware, but structured and type-aware.</p>
+
+<h2>Built-in HttpException</h2>
+<p>Throw an <code>HttpException</code> (or a subclass) from anywhere and Nest's default filter turns it into a proper HTTP response:</p>
+<div class="code-wrap"><pre><code>throw new NotFoundException('User not found');      // -> 404 { statusCode, message }
+throw new BadRequestException('Invalid payload');    // -> 400
+throw new UnauthorizedException();                   // -> 401
+throw new HttpException('Custom', HttpStatus.IM_A_TEAPOT); // -> 418</code></pre></div>
+
+<h2>Custom exception filter</h2>
+<div class="code-wrap"><pre><code>@Catch(HttpException)              // which exceptions this filter handles
+export class HttpErrorFilter implements ExceptionFilter {
+  catch(exception: HttpException, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const res = ctx.getResponse();
+    const status = exception.getStatus();
+    res.status(status).json({
+      statusCode: status,
+      message: exception.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+}</code></pre></div>
+
+<h2>Binding scope</h2>
+<ul>
+  <li><code>@UseFilters(HttpErrorFilter)</code> — method or controller scope.</li>
+  <li><code>app.useGlobalFilters(new AllExceptionsFilter())</code> — app-wide (the usual choice).</li>
+  <li><code>@Catch()</code> with no args catches <strong>everything</strong> — for a global catch-all that also handles non-HTTP errors → generic 500.</li>
+</ul>
+
+<div class="callout tip"><strong>Pattern:</strong> a global <code>AllExceptionsFilter</code> that maps known <code>HttpException</code>s to their status and unknown errors to a sanitized 500 — log the full error server-side, return a clean shape to the client.</div>
+
+<div class="callout warn"><strong>Don't leak internals:</strong> never return stack traces/DB errors to clients. Log them; respond with a safe message + correlation id.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Express error middleware vs Nest exception filter?</summary><p>Same goal (centralized error handling). Nest formalizes it: throw typed <code>HttpException</code>s, and <code>@Catch()</code> filters (method/controller/global) format responses with full DI and context.</p></details>
+  <details><summary>What does <code>@Catch()</code> with no argument do?</summary><p>Catches all exceptions (not just HttpException) — used for a global catch-all that maps unknown errors to 500.</p></details>
+  <details><summary>How do you return a 404 in Nest?</summary><p>Throw <code>new NotFoundException('msg')</code>; the built-in filter serializes it to a 404 JSON response.</p></details>
+  <details><summary>Where do validation errors end up?</summary><p>The ValidationPipe throws a <code>BadRequestException</code> (400) with the field errors, handled by the exception filter chain.</p></details>
+</div>

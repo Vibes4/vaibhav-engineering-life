@@ -165,5 +165,8 @@ pre { background: var(--code-bg); color: var(--code-text); padding: 16px; overfl
 .placeholder { color: var(--muted); text-align: center; margin-top: 100px; }
 .placeholder h2 { border: none; color: var(--heading); }
 
-.run-banner { background: var(--code-bg); color: #7ee787; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; padding: 10px 14px; border-radius: 6px; margin: 14px 0; display: inline-block; }
+.run-banner { background: var(--code-bg); color: #7ee787; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; padding: 10px 14px; border-radius: 6px; margin: 14px 0; display: inline-flex; align-items: center; gap: 10px; }
 .run-banner span { color: #8b949e; }
+.run-banner .cmd-text { color: #7ee787; }
+.run-banner .run-copy { background: var(--copy-bg); border: 1px solid var(--copy-border); color: #c9d1d9; border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.run-banner .run-copy:hover { filter: brightness(1.3); }

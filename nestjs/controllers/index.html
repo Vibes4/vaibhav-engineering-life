@@ -1,0 +1,43 @@
+<h1>Controllers <span class="tag express">NestJS</span></h1>
+<p>Controllers handle incoming requests and return responses — the routing layer. Routes are declared <strong>declaratively with decorators</strong> instead of <code>app.get(...)</code> calls.</p>
+
+<h2>Routing decorators</h2>
+<div class="code-wrap"><pre><code>@Controller('users')          // route prefix -> /users
+export class UsersController {
+  constructor(private readonly users: UsersService) {}
+
+  @Get()                       // GET /users
+  findAll(@Query('role') role: string) { return this.users.findAll(role); }
+
+  @Get(':id')                  // GET /users/:id
+  findOne(@Param('id') id: string) { return this.users.findOne(id); }
+
+  @Post()                      // POST /users
+  @HttpCode(201)
+  create(@Body() dto: CreateUserDto) { return this.users.create(dto); }
+
+  @Patch(':id')
+  update(@Param('id') id: string, @Body() dto: UpdateUserDto) { ... }
+
+  @Delete(':id')
+  remove(@Param('id') id: string) { ... }
+}</code></pre></div>
+
+<h2>Parameter decorators</h2>
+<ul>
+  <li><code>@Param('id')</code> — route params (Express <code>req.params</code>).</li>
+  <li><code>@Query('q')</code> — query string (<code>req.query</code>).</li>
+  <li><code>@Body()</code> — parsed request body (<code>req.body</code>).</li>
+  <li><code>@Headers()</code>, <code>@Req()</code>, <code>@Res()</code>, and custom decorators like <code>@CurrentUser()</code>.</li>
+</ul>
+
+<div class="callout tip"><strong>Return values become responses:</strong> just <code>return</code> an object/array and Nest serializes it to JSON with status 200 (201 for <code>@Post</code>). You rarely touch <code>res</code> directly — that keeps handlers testable.</div>
+
+<div class="callout warn"><strong>DTOs:</strong> Define request shapes as DTO classes and validate them with <code>class-validator</code> + the global <code>ValidationPipe</code>. Controllers stay thin; validation is declarative.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>How is routing different from Express?</summary><p>Declarative decorators (<code>@Get(':id')</code>) on controller methods instead of imperative <code>app.get()</code>. Nest builds the route table from metadata.</p></details>
+  <details><summary>How do you return a response?</summary><p>Just return a value — Nest serializes it (200, or 201 for POST). Use <code>@HttpCode()</code> to override. Avoid <code>@Res()</code> unless you need raw control (it disables Nest's response handling).</p></details>
+  <details><summary>What is a DTO?</summary><p>A Data Transfer Object class describing the request payload, used with <code>class-validator</code>/<code>class-transformer</code> and the ValidationPipe for declarative validation + typing.</p></details>
+</div>

@@ -42,6 +42,18 @@ const MODULES = {
       ["auth-jwt",        "Authentication (JWT)",   "sessions vs tokens, middleware"]
     ]
   },
+  "NestJS": {
+    folder: "nestjs",
+    items: [
+      ["overview",          "NestJS overview",         "what, why, architecture"],
+      ["modules",           "Modules",                 "@Module, encapsulation"],
+      ["controllers",       "Controllers",             "routing, decorators, params"],
+      ["providers-di",      "Providers & DI",          "@Injectable, injection, scopes"],
+      ["request-lifecycle", "Lifecycle features",      "middleware, guards, pipes, interceptors"],
+      ["exception-filters", "Exception filters",       "centralized error handling"],
+      ["features",          "Ecosystem & features",    "TypeORM, GraphQL, microservices"]
+    ]
+  },
   "MongoDB": {
     folder: "mongodb",
     items: [
@@ -124,11 +136,13 @@ async function loadModule(key) {
     const runCmd = `node ${base}/index.js`;
     const codeBlock = jsRes.ok ? `
       <h2>📄 Code — <code>${base}/index.js</code></h2>
-      <div class="run-banner"><span># run it:</span> ${runCmd}</div>
+      <div class="run-banner">
+        <span># run it:</span> <span class="cmd-text">${runCmd}</span>
+        <button class="copy-btn run-copy" onclick="copyRunCmd(this)" data-cmd="${runCmd}">Copy</button>
+      </div>
       <div class="code-wrap">
         <div class="code-head">
           <span class="run-cmd">$ ${runCmd}</span>
-          <button class="copy-btn" onclick="copyCode(this)">Copy</button>
         </div>
         <pre><code>${escapeHtml(code)}</code></pre>
       </div>` : "";
@@ -143,9 +157,8 @@ async function loadModule(key) {
   }
 }
 
-window.copyCode = function (btn) {
-  const code = btn.closest(".code-wrap").querySelector("code").innerText;
-  navigator.clipboard.writeText(code).then(() => {
+window.copyRunCmd = function (btn) {
+  navigator.clipboard.writeText(btn.dataset.cmd).then(() => {
     btn.textContent = "Copied!";
     setTimeout(() => (btn.textContent = "Copy"), 1200);
   });

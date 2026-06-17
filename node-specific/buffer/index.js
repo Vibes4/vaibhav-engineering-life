@@ -21,7 +21,7 @@ console.log('encoded:', encoded);
 console.log('decoded:', Buffer.from(encoded, 'base64').toString());
 
 // 4) Buffer is a Uint8Array
-console.log('\nis Uint8Array?', Buffer.alloc(1) instanceof Uint8Array);
+console.log('\nis Uint8Array?', Buffer.alloc(2) instanceof Uint8Array);
 
 // 5) The multi-byte split problem (why you concat buffers, not strings)
 const part1 = Buffer.from([0xC3]);   // first half of 'é'

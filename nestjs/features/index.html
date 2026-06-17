@@ -1,0 +1,49 @@
+<h1>Ecosystem &amp; Features <span class="tag express">NestJS</span></h1>
+<p>Beyond the core, NestJS ships first-party modules for almost everything you need in production. Naming these signals real-world Nest experience.</p>
+
+<h2>Data access</h2>
+<ul>
+  <li><strong>TypeORM</strong> (<code>@nestjs/typeorm</code>) — repositories, entities, migrations.</li>
+  <li><strong>Prisma</strong> — type-safe query client (very popular pairing).</li>
+  <li><strong>Mongoose</strong> (<code>@nestjs/mongoose</code>) — MongoDB schemas as injectable models.</li>
+</ul>
+
+<h2>Validation &amp; config</h2>
+<ul>
+  <li><strong>ValidationPipe + class-validator/class-transformer</strong> — declarative DTO validation.</li>
+  <li><strong>@nestjs/config</strong> — typed env config with <code>ConfigService</code> + schema validation.</li>
+</ul>
+
+<h2>Auth &amp; security</h2>
+<ul>
+  <li><strong>@nestjs/passport + @nestjs/jwt</strong> — strategies (JWT, OAuth, local) wired as guards.</li>
+  <li><strong>Guards + custom decorators</strong> (<code>@Roles()</code>, <code>@CurrentUser()</code>) for RBAC.</li>
+  <li><code>helmet</code>, <code>csurf</code>, rate limiting (<code>@nestjs/throttler</code>).</li>
+</ul>
+
+<h2>API styles &amp; transport</h2>
+<ul>
+  <li><strong>REST</strong> — controllers (default).</li>
+  <li><strong>GraphQL</strong> (<code>@nestjs/graphql</code>) — code-first or schema-first resolvers.</li>
+  <li><strong>Microservices</strong> (<code>@nestjs/microservices</code>) — TCP, Redis, NATS, Kafka, RabbitMQ, gRPC transports.</li>
+  <li><strong>WebSockets</strong> (<code>@nestjs/websockets</code>) — gateways for real-time.</li>
+</ul>
+
+<h2>Productivity</h2>
+<ul>
+  <li><strong>Swagger/OpenAPI</strong> (<code>@nestjs/swagger</code>) — auto-generated API docs from decorators.</li>
+  <li><strong>Testing</strong> (<code>@nestjs/testing</code>) — <code>Test.createTestingModule</code> with provider overrides for unit/e2e.</li>
+  <li><strong>Scheduling</strong> (<code>@nestjs/schedule</code>), <strong>queues</strong> (<code>@nestjs/bull</code>), <strong>caching</strong> (<code>@nestjs/cache-manager</code>).</li>
+  <li><strong>Lifecycle hooks</strong> — <code>OnModuleInit</code>, <code>OnApplicationShutdown</code> for setup/graceful shutdown.</li>
+  <li><strong>Nest CLI</strong> — scaffolding (<code>nest g resource users</code> generates module+controller+service+DTOs+tests).</li>
+</ul>
+
+<div class="callout tip"><strong>Why it scales:</strong> consistent structure + DI + first-party modules mean a new dev can navigate any Nest codebase, and features (auth, validation, docs, queues) are plug-in modules rather than bespoke glue.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>How do you build a GraphQL API in Nest?</summary><p><code>@nestjs/graphql</code> with resolvers (code-first via decorators or schema-first), reusing the same providers/DI as REST.</p></details>
+  <details><summary>How does Nest do microservices?</summary><p><code>@nestjs/microservices</code> with pluggable transporters (TCP/Redis/NATS/Kafka/gRPC) and message/event patterns (<code>@MessagePattern</code>, <code>@EventPattern</code>).</p></details>
+  <details><summary>How do you unit test a service?</summary><p><code>Test.createTestingModule({...}).overrideProvider(Dep).useValue(mock).compile()</code>, then resolve and assert — DI makes mocking trivial.</p></details>
+  <details><summary>How are API docs generated?</summary><p><code>@nestjs/swagger</code> reads controller/DTO decorators to produce an OpenAPI spec + Swagger UI automatically.</p></details>
+</div>
