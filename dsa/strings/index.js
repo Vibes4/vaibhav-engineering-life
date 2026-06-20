@@ -36,3 +36,39 @@ console.log('\nLongest Substring Without Repeating Chars:');
 console.log('  "abcabcbb" ->', lengthOfLongestSubstring('abcabcbb')); // 3 ("abc")
 console.log('  "bbbbb"    ->', lengthOfLongestSubstring('bbbbb'));    // 1 ("b")
 console.log('  "pwwkew"   ->', lengthOfLongestSubstring('pwwkew'));   // 3 ("wke")
+
+// ───────── More problems ─────────
+
+// Group Anagrams: bucket by sorted-key. O(n·k log k) time, O(n·k) space.
+function groupAnagrams(strs) {
+  const buckets = new Map();
+  for (const s of strs) {
+    const key = s.split('').sort().join('');   // anagrams share the sorted key
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(s);
+  }
+  return [...buckets.values()];
+}
+
+// Longest Palindromic Substring: expand around center. O(n²) time, O(1) space.
+function longestPalindrome(s) {
+  if (s.length < 2) return s;
+  let start = 0, maxLen = 1;
+  const expand = (l, r) => {
+    while (l >= 0 && r < s.length && s[l] === s[r]) { l--; r++; }
+    if (r - l - 1 > maxLen) { maxLen = r - l - 1; start = l + 1; } // window grew
+  };
+  for (let i = 0; i < s.length; i++) {
+    expand(i, i);       // odd-length center
+    expand(i, i + 1);   // even-length center
+  }
+  return s.slice(start, start + maxLen);
+}
+
+console.log('\nGroup Anagrams:');
+console.log('  ["eat","tea","tan","ate","nat","bat"] ->',
+  JSON.stringify(groupAnagrams(['eat', 'tea', 'tan', 'ate', 'nat', 'bat'])));
+
+console.log('\nLongest Palindromic Substring:');
+console.log('  "babad" ->', longestPalindrome('babad')); // "bab" or "aba"
+console.log('  "cbbd"  ->', longestPalindrome('cbbd'));   // "bb"

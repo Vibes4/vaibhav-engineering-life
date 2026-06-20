@@ -45,3 +45,20 @@ console.log('searchInsert(12)->', searchInsert(a, 12));  // 6
 const dups = [1, 2, 2, 2, 3, 4];
 console.log('\nfirstOccurrence(2) ->', firstOccurrence(dups, 2)); // 1
 console.log('firstOccurrence(5) ->', firstOccurrence(dups, 5));   // -1
+
+// ───────── More problems ─────────
+
+// Last occurrence (upper bound) with duplicates. O(log n) time, O(1) space. -1 if absent.
+function lastOccurrence(arr, target) {
+  let lo = 0, hi = arr.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = lo + ((hi - lo) >> 1);
+    if (arr[mid] === target) { ans = mid; lo = mid + 1; } // keep going right
+    else if (arr[mid] < target) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return ans;
+}
+
+console.log('\nlastOccurrence(2) ->', lastOccurrence(dups, 2)); // 3
+console.log('lastOccurrence(5) ->', lastOccurrence(dups, 5));   // -1

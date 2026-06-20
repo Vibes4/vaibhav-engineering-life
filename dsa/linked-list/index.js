@@ -52,3 +52,36 @@ tail.next = cyc.next.next;   // point tail back into the list
 console.log('\nDetect cycle:');
 console.log('  acyclic [1,2,3] ->', hasCycle(fromArray([1, 2, 3]))); // false
 console.log('  with cycle      ->', hasCycle(cyc));                   // true
+
+// ───────── More problems ─────────
+
+// Middle of the Linked List: fast/slow pointers. O(n) time, O(1) space.
+function middleNode(head) {
+  let slow = head, fast = head;
+  while (fast && fast.next) {            // fast moves 2x, slow lands on middle
+    slow = slow.next;
+    fast = fast.next.next;
+  }
+  return slow;                           // for even length, the second middle
+}
+
+// Merge Two Sorted Lists: dummy head, splice smaller node each step. O(n+m) time, O(1) space.
+function mergeTwoLists(l1, l2) {
+  const dummy = new Node(null);
+  let tail = dummy;
+  while (l1 && l2) {
+    if (l1.val <= l2.val) { tail.next = l1; l1 = l1.next; }
+    else { tail.next = l2; l2 = l2.next; }
+    tail = tail.next;
+  }
+  tail.next = l1 || l2;                  // attach the remaining tail
+  return dummy.next;
+}
+
+console.log('\nMiddle Node:');
+console.log('  [1,2,3,4,5] ->', middleNode(fromArray([1, 2, 3, 4, 5])).val); // 3
+console.log('  [1,2,3,4]   ->', middleNode(fromArray([1, 2, 3, 4])).val);    // 3
+
+console.log('\nMerge Two Sorted Lists:');
+console.log('  [1,2,4] + [1,3,4] ->',
+  toArray(mergeTwoLists(fromArray([1, 2, 4]), fromArray([1, 3, 4])))); // [1,1,2,3,4,4]
