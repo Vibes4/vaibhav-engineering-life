@@ -1,0 +1,105 @@
+<h1>How Apple AirTag Works <span class="tag express">Case Study</span></h1>
+<p>An AirTag is a coin-sized disc with no GPS, no Wi-Fi, no cellular, and a battery meant to last a year. Yet you can find it from the other side of the planet. The trick is one of the most elegant privacy-preserving designs in consumer tech: the AirTag piggybacks on the hundreds of millions of iPhones already out in the world, turning every stranger's phone into an anonymous relay — without letting Apple, the strangers, or a thief learn anything they shouldn't.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 240" role="img" aria-label="AirTag broadcasts a rotating public key over BLE to a nearby finder device, which encrypts its GPS and uploads to Apple's blind relay servers, where the owner's device later fetches and decrypts with its private key">
+    <defs>
+      <marker id="arr-airtag" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="20" y="96" width="128" height="60" rx="9"></rect>
+    <text class="lbl" x="84" y="120" text-anchor="middle">AirTag</text>
+    <text class="sub" x="84" y="136" text-anchor="middle">BLE beacon</text>
+    <text class="sub" x="84" y="150" text-anchor="middle">rotating pub key</text>
+
+    <rect class="box-accent" x="200" y="96" width="138" height="60" rx="9"></rect>
+    <text class="lbl" x="269" y="120" text-anchor="middle">Finder device</text>
+    <text class="sub" x="269" y="136" text-anchor="middle">encrypts its GPS</text>
+    <text class="accent-text" x="269" y="150" text-anchor="middle">to tag's pub key</text>
+
+    <rect class="box" x="390" y="96" width="138" height="60" rx="9"></rect>
+    <text class="lbl" x="459" y="120" text-anchor="middle">Apple relay</text>
+    <text class="sub" x="459" y="136" text-anchor="middle">blind dropbox</text>
+    <text class="cap" x="459" y="150" text-anchor="middle">stores ciphertext</text>
+
+    <rect class="box" x="580" y="96" width="128" height="60" rx="9"></rect>
+    <text class="lbl" x="644" y="120" text-anchor="middle">Owner device</text>
+    <text class="sub" x="644" y="136" text-anchor="middle">decrypts location</text>
+    <text class="sub" x="644" y="150" text-anchor="middle">private key</text>
+
+    <line class="edge-dash" x1="148" y1="126" x2="196" y2="126" marker-end="url(#arr-airtag)"></line>
+    <text class="cap" x="172" y="118" text-anchor="middle">BLE</text>
+
+    <line class="edge" x1="338" y1="126" x2="386" y2="126" marker-end="url(#arr-airtag)"></line>
+    <text class="cap" x="362" y="118" text-anchor="middle">upload blob</text>
+
+    <line class="edge" x1="528" y1="126" x2="576" y2="126" marker-end="url(#arr-airtag)"></line>
+    <text class="cap" x="552" y="118" text-anchor="middle">fetch by hash</text>
+
+    <text class="sub" x="84" y="200" text-anchor="middle">shared seed with owner</text>
+    <text class="cap" x="459" y="200" text-anchor="middle">no private keys held</text>
+    <text class="sub" x="644" y="200" text-anchor="middle">re-derives keys</text>
+  </svg>
+  <div class="diagram-cap">Figure: the tag beacons a rotating key over BLE; a passing finder encrypts its GPS to that key and uploads it to Apple's blind relay, where the owner later fetches and decrypts it.</div>
+</div>
+
+<h2>Requirements (functional & non-functional)</h2>
+<ul>
+  <li><strong>Functional:</strong> let an owner locate a lost tag that has no internet of its own; the location must reach only the owner.</li>
+  <li><strong>Non-functional:</strong> the tag's battery must last ~a year (so almost no compute/radio); a stranger must not be able to track the tag; Apple itself must not be able to read where any tag is; finders must relay locations without being identified.</li>
+</ul>
+<p>Two constraints dominate: <strong>almost zero power</strong> (so the tag can only do tiny Bluetooth broadcasts) and <strong>strong privacy on every side</strong> (owner, finder, Apple, and attacker all see as little as possible).</p>
+
+<h2>Step-by-step request flow</h2>
+<p>Reading the four boxes in the diagram left to right:</p>
+<ol>
+  <li><strong>AirTag:</strong> the battery-starved tag does the only cheap thing it can — broadcast a tiny BLE beacon carrying a <em>rotating public key</em> every couple of seconds (the dashed hop), with the key itself changing roughly every 15&nbsp;minutes.</li>
+  <li><strong>Finder device</strong> (the star relay step): any passing stranger's iPhone hears the beacon, reads its own GPS, and encrypts those coordinates <em>to the tag's broadcast public key</em>. It learns nothing about whose tag it is.</li>
+  <li><strong>Apple relay servers:</strong> the finder uploads {hash of beacon key, encrypted location}. Apple stores this blob indexed by the hash, holding no private keys — a blind dropbox that can't read or link anything.</li>
+  <li><strong>Owner device:</strong> using the seed it shares with the tag, the owner re-derives the same key sequence, asks Apple for any reports matching those hashes, downloads the ciphertext, and decrypts it locally with the private key.</li>
+</ol>
+
+<h2>The core hard problem: finding a device that can't talk to the internet</h2>
+<p>The AirTag can't phone home — it has no internet. So the design flips the problem: instead of the tag reporting its location, <em>other people's devices report it on the tag's behalf</em>. This is the <strong>crowdsourced "Find My" network</strong>.</p>
+<p>The tag does the only cheap thing it can: it shouts a tiny <strong>Bluetooth Low Energy (BLE) beacon</strong> into the air every couple of seconds. Any nearby Apple device (a stranger's iPhone walking by) hears it, notes its own GPS location, and uploads an encrypted "I saw this beacon here" report to Apple's servers. The owner later asks Apple's servers for reports about <em>their</em> tag and decrypts the location locally.</p>
+<div class="callout tip"><strong>Senior tip:</strong> The whole design is "make the dumb, battery-starved device do the absolute minimum (broadcast) and push all the work — GPS, internet, crypto upload — onto the abundant, powered devices around it." Recognising which node should bear the cost is the core systems insight.</div>
+
+<h2>Privacy problem #1: stop strangers tracking the tag</h2>
+<p>If the AirTag broadcast a fixed ID, a stalker could plant readers around a city and follow that ID everywhere. So the beacon <strong>must not be a stable identifier</strong>.</p>
+<p>The fix: the tag broadcasts a <strong>rotating public key</strong> that changes on a schedule (roughly every 15 minutes). The owner's phone and the tag share a secret seed, so the owner's phone can compute the same sequence of keys and know they all belong to its tag — but to anyone else, today's beacon and last hour's beacon look like two unrelated random values.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Rotating keys defeat <em>passive</em> tracking but create a new problem — a tag secretly slipped into your bag. Apple solved that separately with "unwanted tracking" alerts: your iPhone notices an unknown tag moving <em>with you over time</em> and warns you. Mention this in interviews; it shows you see the abuse case the elegant crypto introduced.</div>
+
+<h2>Privacy problem #2: keep the location secret from finders AND Apple</h2>
+<p>When a stranger's phone relays your tag's location, that stranger shouldn't learn anything, and Apple's servers (which store the report) must not be able to read the location either. <strong>Public-key encryption</strong> makes this clean:</p>
+<ul>
+  <li>The beacon <em>is</em> a public key. The finder encrypts its own GPS coordinates <em>to that public key</em>.</li>
+  <li>Only the holder of the matching <em>private key</em> — the owner — can decrypt it. The finder can't read what it just encrypted; Apple stores ciphertext it can't open.</li>
+</ul>
+<p>The finder uploads {hash of the beacon key, encrypted location}. Later the owner computes the same beacon keys, asks Apple "any reports for these hashes?", downloads the ciphertext, and decrypts locally with the private key.</p>
+<table>
+  <tr><th>Finder's phone</th><td>Sees a random beacon and its own GPS. Encrypts location to the beacon's public key. Learns nothing about whose tag it is.</td></tr>
+  <tr><th>Apple servers</th><td>Store {key-hash → encrypted blob}. A blind dropbox: they route reports but hold no private keys, so they can't read locations or link tags to owners.</td></tr>
+  <tr><th>Owner's phone</th><td>Re-derives the rotating keys from the shared seed, fetches matching reports, decrypts with the private key. Only it can read the location.</td></tr>
+</table>
+
+<h2>Putting the flow together</h2>
+<p>End to end: <strong>(1)</strong> tag and owner share a seed at pairing; <strong>(2)</strong> tag broadcasts a rotating public key every ~15 min; <strong>(3)</strong> a passing finder encrypts its GPS to that key and uploads it anonymously; <strong>(4)</strong> Apple stores the encrypted report indexed by the key's hash; <strong>(5)</strong> the owner re-derives the keys, fetches reports, and decrypts the location. No single party except the owner ever holds both the ciphertext and the private key.</p>
+
+<h2>Tradeoffs to discuss</h2>
+<ul>
+  <li><strong>Rotation interval:</strong> rotating faster gives better anti-tracking but means the owner must derive and query more keys; too slow and a stalker gets a stable-enough ID. ~15&nbsp;min balances this. The WHY shows up in the math: at one key every 15&nbsp;minutes that's <strong>96 keys per day, ~672 per week</strong>. When the owner opens Find My, their phone derives that whole window of public-key hashes and queries Apple in one batch — completely tractable for a week's lookback. Halve the interval and you double both the query size and the per-finder upload churn; that's the cost you trade against shrinking the window a passive tracker could correlate.</li>
+  <li><strong>Coverage vs. privacy:</strong> the network only works because hundreds of millions of iPhones relay by default. That density is the feature — and the reason a tiny, internet-less tag can be found anywhere people walk.</li>
+  <li><strong>Latency:</strong> location is only as fresh as the last time someone walked past the tag. In a crowded city, near real-time; in a desert, you may get nothing. There's no fix — it's inherent to crowdsourcing.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>How can an AirTag with no GPS or internet be located worldwide?</summary><p>It can't report itself, so it offloads the job. It broadcasts a tiny Bluetooth beacon; any nearby Apple device hears it, attaches its own GPS location, encrypts that, and uploads it to Apple on the tag's behalf. The owner later fetches and decrypts those reports. The crowd of powered, connected iPhones does the work the tag can't.</p></details>
+  <details><summary>Why does the tag broadcast a rotating key instead of a fixed ID?</summary><p>A fixed ID would let anyone with Bluetooth readers track the tag (and its owner) across a city. Rotating the broadcast key every ~15 minutes makes successive beacons look like unrelated random values to outsiders, while the owner — who shares the seed — can still recompute the whole sequence and recognise its own tag.</p></details>
+  <details><summary>How is the location hidden from the stranger's phone and from Apple?</summary><p>The beacon is a public key. The finder encrypts its GPS coordinates to that public key, so the finder can't read what it produced. Apple stores only the ciphertext indexed by the key's hash — it holds no private keys, so it's a blind dropbox. Only the owner's private key can decrypt, so only the owner ever sees the location.</p></details>
+  <details><summary>What new risk does the rotating-key design introduce, and how is it handled?</summary><p>It defeats passive tracking but enables covert tracking — someone planting a tag on you. Apple addresses this separately: your iPhone detects an unknown tag that keeps moving with you over time and alerts you. It's a reminder that an elegant crypto solution can create a behavioural abuse case needing its own mitigation.</p></details>
+  <details><summary>What's the fundamental limitation of a crowdsourced location network?</summary><p>Freshness depends on someone physically walking near the tag. In dense cities you get near real-time updates; in empty areas you may get nothing for days. It's inherent to the model — there's no relay where there are no devices — so you trade guaranteed coverage for the ability to work with a zero-power, internet-less tag.</p></details>
+  <details><summary>How does the owner query Apple efficiently given the keys keep rotating?</summary><p>The owner and tag share a seed, so the owner can recompute the entire sequence of rotating public keys offline. At one key per ~15&nbsp;minutes that's only ~96 hashes per day (~672 for a week), so when Find My opens, the phone derives the whole lookback window and asks Apple in a single batched query "any reports for these hashes?" Apple just does hash lookups and returns matching ciphertext blobs — cheap on both sides, and Apple never learns which tag the hashes belong to.</p></details>
+</div>

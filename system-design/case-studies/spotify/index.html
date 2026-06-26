@@ -1,0 +1,105 @@
+<h1>How Spotify Works <span class="tag express">Case Study</span></h1>
+<p>Spotify streams audio to hundreds of millions of users while keeping playback instant and gap-free on shaky mobile networks. The interesting system-design problems are three: delivering bytes fast via a <strong>CDN</strong>, smoothly adapting quality to changing bandwidth with <strong>adaptive bitrate (ABR)</strong>, and serving a massive <strong>catalog + recommendations</strong> read-heavy workload.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 250" role="img" aria-label="A client fetches track metadata from the API service backed by a catalog database, pulls audio chunks from CDN edge servers, and receives precomputed picks from the recommendation service">
+    <defs>
+      <marker id="arr-spotify" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <!-- client -->
+    <rect class="box" x="16" y="98" width="120" height="56" rx="9"></rect>
+    <text class="lbl" x="76" y="122" text-anchor="middle">Client</text>
+    <text class="sub" x="76" y="140" text-anchor="middle">player + buffer</text>
+
+    <!-- metadata API -->
+    <rect class="box" x="296" y="16" width="138" height="54" rx="9"></rect>
+    <text class="lbl" x="365" y="38" text-anchor="middle">Metadata / API</text>
+    <text class="sub" x="365" y="55" text-anchor="middle">tracks / playlists</text>
+
+    <!-- catalog DB -->
+    <rect class="box" x="540" y="16" width="156" height="54" rx="9"></rect>
+    <text class="lbl" x="618" y="38" text-anchor="middle">Catalog DB</text>
+    <text class="sub" x="618" y="55" text-anchor="middle">cached + replicated</text>
+
+    <!-- CDN (star) -->
+    <rect class="box-accent" x="296" y="96" width="138" height="68" rx="9"></rect>
+    <text class="lbl" x="365" y="122" text-anchor="middle">CDN Edge</text>
+    <text class="sub" x="365" y="140" text-anchor="middle">adaptive bitrate</text>
+    <text class="sub" x="365" y="155" text-anchor="middle">audio chunks</text>
+
+    <!-- recommendation -->
+    <rect class="box" x="296" y="186" width="138" height="50" rx="9"></rect>
+    <text class="lbl" x="365" y="207" text-anchor="middle">Recommendation</text>
+    <text class="sub" x="365" y="223" text-anchor="middle">precomputed (batch)</text>
+
+    <!-- edges from client -->
+    <line class="edge" x1="136" y1="116" x2="292" y2="46" marker-end="url(#arr-spotify)"></line>
+    <text class="cap" x="214" y="74" text-anchor="middle">metadata</text>
+    <line class="edge" x1="136" y1="126" x2="290" y2="126" marker-end="url(#arr-spotify)"></line>
+    <text class="cap" x="213" y="118" text-anchor="middle">audio chunks</text>
+    <line class="edge" x1="136" y1="138" x2="292" y2="208" marker-end="url(#arr-spotify)"></line>
+    <text class="cap" x="214" y="190" text-anchor="middle">picks</text>
+
+    <!-- API to catalog -->
+    <line class="edge" x1="434" y1="43" x2="536" y2="43" marker-end="url(#arr-spotify)"></line>
+    <text class="cap" x="485" y="35" text-anchor="middle">lookup</text>
+  </svg>
+  <div class="diagram-cap">Figure: metadata comes from the API service over the catalog DB, audio chunks stream from CDN edge servers (the star), and recommendations are served precomputed.</div>
+</div>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Client</strong> player opens a track; it first needs metadata and a set of chunk URLs.</li>
+  <li><strong>Metadata / API service</strong> returns track titles, artists, and playlist data, reading from the heavily cached, replicated <strong>Catalog DB</strong>.</li>
+  <li><strong>CDN Edge</strong> (the star) serves the actual <strong>audio chunks</strong> from a server physically near the user; the player runs <strong>adaptive bitrate</strong> selection per chunk against its buffer.</li>
+  <li><strong>Recommendation service</strong> supplies home-screen and "up next" picks as a fast lookup of results computed offline in batch/ML pipelines.</li>
+  <li>The player keeps requesting the next chunk just-in-time from the CDN, stepping bitrate up or down between chunks to avoid an empty buffer.</li>
+</ol>
+
+<h2>Requirements: it's a read-heavy media system</h2>
+<ul>
+  <li><strong>Functional:</strong> search/browse catalog, stream a track, build playlists, recommend music, work offline (download).</li>
+  <li><strong>Non-functional:</strong> low <em>startup latency</em> (music must begin in &lt;1s), no rebuffering/stutter, scale to huge concurrent listeners, and handle a read:write ratio that is overwhelmingly reads (you play tracks far more than you upload them).</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Recognize the shape of the problem: this is a <strong>read-heavy, latency-sensitive media-delivery</strong> system. That immediately points to caching everywhere (CDN for audio, caches for metadata) and pre-computation (recommendations computed offline, not per-request).</div>
+
+<h2>Audio delivery: why a CDN?</h2>
+<p>Audio files are large and the same popular tracks are requested by millions. Serving them all from one origin would saturate bandwidth and add latency for distant users. A <strong>CDN</strong> (Content Delivery Network) caches the audio on edge servers physically close to listeners.</p>
+<ul>
+  <li><strong>Edge caching:</strong> the first listener in a region pulls a track to the nearby edge; everyone after gets it from there. Popular tracks have near-100% cache hit rates.</li>
+  <li><strong>Segmentation:</strong> a track is split into small chunks (a few seconds each) so the player fetches just-in-time and can switch quality between chunks.</li>
+  <li><strong>Lower latency &amp; origin offload:</strong> shorter network path for users, and the origin is shielded from the read flood.</li>
+</ul>
+<p><strong>Putting numbers on it:</strong> the product target is <strong>startup latency under ~1 second</strong> and effectively zero rebuffers, so chunks are typically <strong>~5–10 seconds</strong> of audio (e.g. ~200 KB at 320 kbps) and the player keeps a <strong>~20–30 second buffer</strong> ahead. Because the head of the catalog is so skewed — a tiny fraction of tracks accounts for the bulk of plays — edge <strong>cache hit rates exceed ~95%</strong>, which is why a CDN is the right tool: it turns a hundreds-of-millions-of-concurrent-streams problem into mostly local reads, sparing the origin and shrinking the network round-trip to a nearby PoP (single-digit to low-tens of milliseconds). Metadata, by contrast, tolerates <strong>eventual consistency</strong> — a newly added track showing up a few seconds late is harmless — so it can be aggressively cached and replicated rather than held to the strict consistency a payment ledger would demand.</p>
+
+<h2>The core hard problem: adaptive bitrate (ABR)</h2>
+<p>Networks fluctuate — full bars then a tunnel. If you always streamed the highest quality, weak networks would constantly stall (rebuffer). If you always streamed the lowest, strong networks would waste their capacity on poor audio. <strong>ABR</strong> picks, per segment, the highest bitrate the current conditions can sustain.</p>
+<p>Each track is pre-encoded at several bitrates — a <strong>bitrate ladder</strong> (e.g. 96 / 160 / 320 kbps). For each upcoming segment the player asks: which rung can I afford right now?</p>
+<table>
+  <tr><th>Throughput-based ABR</th><td>Pick bitrate ≤ recently measured bandwidth. Reacts fast, but bandwidth estimates are noisy, so it can oscillate or stall on sudden drops.</td></tr>
+  <tr><th>Buffer-based ABR</th><td>Decide using how many seconds are buffered: lots of buffer → push quality up; low buffer → drop quality to avoid an empty buffer (a stall). More stable; the modern default (e.g. Netflix's BBA).</td></tr>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> An empty buffer = a <em>rebuffer</em> = the music stops — the single worst experience. So ABR is deliberately <strong>conservative</strong>: it would rather play a slightly lower bitrate than risk silence. Maximizing average quality is secondary to never stalling.</div>
+
+<h2>Buffer-aware selection (what the demo shows)</h2>
+<p>A robust rule combines both signals: estimate what bandwidth allows, but <em>gate</em> it by buffer health. If the buffer is dangerously low, drop to the safest rung regardless of a rosy bandwidth reading; if the buffer is healthy, allow the highest rung that fits. The demo implements exactly this.</p>
+
+<h2>Catalog metadata and recommendations</h2>
+<p>Separate from audio bytes is the <strong>metadata</strong> (track titles, artists, playlists) and <strong>recommendations</strong>.</p>
+<ul>
+  <li><strong>Metadata store:</strong> read-heavy, so it's heavily cached and replicated; users tolerate slightly stale catalog data, so eventual consistency is fine.</li>
+  <li><strong>Recommendations:</strong> computed <em>offline</em> in big batch/ML pipelines (collaborative filtering: "people who liked X also liked Y") and stored pre-computed, so a home-screen request is a fast cache lookup, not a live model run.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Split the system by <em>workload shape</em>: the audio path optimizes for raw byte throughput (CDN), the metadata path for fast key lookups (caches/replicas), and recommendations for heavy offline compute (batch pipelines). One size does not fit all three; designing them separately is the senior move.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why use a CDN for audio streaming?</summary><p>Popular tracks are requested by millions, and audio files are large. A CDN caches segments on edge servers near users, so most requests are served from a nearby cache instead of a distant origin. This cuts latency (shorter network path), prevents the origin from being overwhelmed, and saves bandwidth — exactly what a read-heavy media system needs.</p></details>
+  <details><summary>What is adaptive bitrate streaming and why is it needed?</summary><p>Each track is pre-encoded at several bitrates (a ladder). The player selects, per segment, the highest bitrate the current network and buffer can sustain. It's needed because real networks fluctuate: a fixed high bitrate would stall on weak networks, and a fixed low one would waste good networks. ABR keeps playback smooth while maximizing quality.</p></details>
+  <details><summary>Throughput-based vs buffer-based ABR — what's the difference?</summary><p>Throughput-based picks a bitrate at or below recently measured bandwidth; it reacts quickly but is sensitive to noisy estimates and can oscillate. Buffer-based decides from how many seconds are buffered — high buffer pushes quality up, low buffer drops it to avoid a stall. Buffer-based is more stable, so modern players favor it, often blending both.</p></details>
+  <details><summary>Why is never stalling more important than maximizing bitrate?</summary><p>An empty buffer stops the music — a rebuffer — which users hate far more than a momentary dip in audio quality. So ABR is intentionally conservative, prioritizing buffer safety over squeezing out the highest possible bitrate. Average quality is optimized only after the no-stall constraint is satisfied.</p></details>
+  <details><summary>How are recommendations served fast at Spotify's scale?</summary><p>They're pre-computed offline in batch/ML pipelines (e.g. collaborative filtering) rather than generated live per request. The results are stored, so when you open the app it's a quick cache lookup instead of an expensive on-the-fly model run. This trades freshness (recommendations update periodically) for very low read latency, which suits the use case.</p></details>
+  <details><summary>Why separate the metadata path from the audio path?</summary><p>They have completely different workload shapes. Audio is large, immutable, and highly skewed toward popular tracks, so it wants a CDN optimized for raw byte throughput and edge caching with 95%+ hit rates. Metadata is small, frequently queried by key, and only needs eventual consistency, so it wants in-memory caches and read replicas tuned for fast lookups. Forcing both through one tier would compromise each; splitting them lets you scale and cache each according to its own access pattern.</p></details>
+</div>

@@ -38,6 +38,9 @@
   --table-border: #e2e8f0;
 
   --scroll-track: #f1f5f9; --scroll-thumb: #cbd5e1; --scroll-thumb-hover: #94a3b8;
+
+  --diagram-box: #f3f6fa; --diagram-box-border: #c3cdd9;
+  --diagram-accent: #6639ba; --diagram-accent-bg: #ece7fb; --diagram-line: #8c98a8;
 }
 
 html.dark {
@@ -76,6 +79,9 @@ html.dark {
   --table-border: #334155;
 
   --scroll-track: #0b1020; --scroll-thumb: #334155; --scroll-thumb-hover: #475569;
+
+  --diagram-box: #1e293b; --diagram-box-border: #3a4759;
+  --diagram-accent: #c4b5fd; --diagram-accent-bg: #332a55; --diagram-line: #6b7686;
 }
 
 /* ---------- Smooth scrolling + themed scrollbars ---------- */
@@ -117,6 +123,23 @@ html { scroll-behavior: smooth; }
   color: var(--nav-muted);
   font-weight: 800;
 }
+
+/* Collapsible MEGA-section wrappers — the divider label is now a clickable
+   summary that opens/closes every group beneath it (e.g. "DSA Problems"). */
+details.nav-divider-group { margin-bottom: 4px; }
+details.nav-divider-group > summary.nav-section-divider {
+  cursor: pointer; list-style: none; user-select: none;
+  display: flex; align-items: center; gap: 7px; margin-bottom: 0;
+}
+details.nav-divider-group > summary.nav-section-divider::-webkit-details-marker { display: none; }
+details.nav-divider-group > summary.nav-section-divider::before {
+  content: "▸"; font-size: 9px; color: var(--nav-muted); transition: transform .15s ease;
+}
+details.nav-divider-group[open] > summary.nav-section-divider::before { transform: rotate(90deg); }
+details.nav-divider-group > summary.nav-section-divider:hover { color: var(--nav-text); }
+/* indent the groups / items that live inside a mega-section */
+.nav-divider-group .nav-group-title { padding-left: 24px; }
+.nav-divider-group > .nav-item { padding-left: 28px; }
 
 /* Collapsible sidebar groups (built by app.js) */
 summary.nav-group-title {
@@ -177,6 +200,31 @@ code:not(pre code) {
 .callout.warn { border-left-color: var(--callout-warn-border); background: var(--callout-warn-bg); }
 .callout.tip  { border-left-color: var(--callout-tip-border); background: var(--callout-tip-bg); }
 .callout strong { display: inline-block; margin-bottom: 2px; }
+
+/* ---------- "Collapse all / Expand all" toolbar (built by app.js) ---------- */
+.acc-toolbar { display: flex; justify-content: flex-end; margin: 6px 0 -4px; }
+.acc-toggle-all {
+  font-size: 12px; padding: 4px 11px; border-radius: 6px; cursor: pointer; font-weight: 600;
+  border: 1px solid var(--border-soft); background: var(--interview-bg); color: var(--muted);
+}
+.acc-toggle-all:hover { color: var(--accent); border-color: var(--accent); }
+
+/* ---------- Architecture diagrams (inline SVG inside case studies) ---------- */
+.diagram {
+  margin: 18px 0; padding: 16px; border: 1px solid var(--border-soft); border-radius: 10px;
+  background: var(--interview-bg); overflow-x: auto;
+}
+.diagram svg { width: 100%; height: auto; max-width: 760px; display: block; margin: 0 auto; }
+.diagram .box { fill: var(--diagram-box); stroke: var(--diagram-box-border); stroke-width: 1.5; }
+.diagram .box-accent { fill: var(--diagram-accent-bg); stroke: var(--diagram-accent); stroke-width: 1.5; }
+.diagram .lbl { fill: var(--heading); font-family: -apple-system, "Segoe UI", sans-serif; font-size: 13px; font-weight: 600; }
+.diagram .sub { fill: var(--muted); font-family: -apple-system, "Segoe UI", sans-serif; font-size: 10.5px; }
+.diagram .edge { stroke: var(--diagram-line); stroke-width: 1.6; fill: none; }
+.diagram .edge-dash { stroke: var(--diagram-line); stroke-width: 1.6; fill: none; stroke-dasharray: 5 4; }
+.diagram .edge-arrow { fill: var(--diagram-line); }
+.diagram .cap { fill: var(--muted); font-family: -apple-system, "Segoe UI", sans-serif; font-size: 10px; }
+.diagram .accent-text { fill: var(--diagram-accent); font-family: -apple-system, "Segoe UI", sans-serif; font-size: 11px; font-weight: 600; }
+.diagram-cap { color: var(--muted); font-size: 11.5px; text-align: center; margin-top: 10px; font-style: italic; }
 
 /* ---------- Collapsible concept panels (built by app.js) ---------- */
 details.acc { border: 1px solid var(--border-soft); border-radius: 8px; margin: 14px 0; overflow: hidden; }

@@ -1,0 +1,103 @@
+<h1>How AWS S3 Works <span class="tag express">Case Study</span></h1>
+<p>S3 stores trillions of objects and serves millions of requests per second, yet the interface is dead simple: <code>PUT key, GET key</code>. The interesting system-design problem is everything hidden behind that simplicity — how do you spread trillions of objects across thousands of machines so that any key is found instantly, no single machine is a bottleneck, data survives disk and datacentre failures, and you can add capacity without re-shuffling everything?</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 270" role="img" aria-label="A client calls the API load balancer, which uses a consistent-hash ring router to place the key on storage nodes holding replicas or erasure-coded shards, while a metadata service tracks key locations">
+    <defs>
+      <marker id="arr-s3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <!-- Client -->
+    <rect class="box" x="18" y="104" width="110" height="54" rx="9"></rect>
+    <text class="lbl" x="73" y="128" text-anchor="middle">Client</text>
+    <text class="sub" x="73" y="145" text-anchor="middle">PUT / GET key</text>
+    <!-- API / LB -->
+    <rect class="box" x="170" y="104" width="120" height="54" rx="9"></rect>
+    <text class="lbl" x="230" y="128" text-anchor="middle">API / LB</text>
+    <text class="sub" x="230" y="145" text-anchor="middle">front door</text>
+    <!-- Consistent-hash ring router (star) -->
+    <rect class="box-accent" x="332" y="96" width="150" height="70" rx="9"></rect>
+    <text class="lbl" x="407" y="124" text-anchor="middle">Consistent-hash</text>
+    <text class="lbl" x="407" y="140" text-anchor="middle">ring router</text>
+    <text class="sub" x="407" y="156" text-anchor="middle">+ virtual nodes</text>
+    <!-- Storage nodes -->
+    <rect class="box" x="552" y="22" width="148" height="48" rx="9"></rect>
+    <text class="lbl" x="626" y="42" text-anchor="middle">Storage node A</text>
+    <text class="sub" x="626" y="58" text-anchor="middle">shards / replicas</text>
+    <rect class="box" x="552" y="106" width="148" height="48" rx="9"></rect>
+    <text class="lbl" x="626" y="126" text-anchor="middle">Storage node B</text>
+    <text class="sub" x="626" y="142" text-anchor="middle">shards / replicas</text>
+    <rect class="box" x="552" y="190" width="148" height="48" rx="9"></rect>
+    <text class="lbl" x="626" y="210" text-anchor="middle">Storage node C</text>
+    <text class="sub" x="626" y="226" text-anchor="middle">shards / replicas</text>
+    <!-- Metadata service -->
+    <rect class="box" x="332" y="200" width="150" height="50" rx="9"></rect>
+    <text class="lbl" x="407" y="222" text-anchor="middle">Metadata / index</text>
+    <text class="sub" x="407" y="238" text-anchor="middle">key &#8594; placement</text>
+    <!-- Edges -->
+    <line class="edge" x1="128" y1="131" x2="164" y2="131" marker-end="url(#arr-s3)"></line>
+    <line class="edge" x1="290" y1="131" x2="326" y2="131" marker-end="url(#arr-s3)"></line>
+    <text class="cap" x="308" y="123" text-anchor="middle">route</text>
+    <line class="edge" x1="482" y1="118" x2="548" y2="50" marker-end="url(#arr-s3)"></line>
+    <line class="edge" x1="482" y1="131" x2="548" y2="130" marker-end="url(#arr-s3)"></line>
+    <line class="edge" x1="482" y1="144" x2="548" y2="210" marker-end="url(#arr-s3)"></line>
+    <text class="cap" x="520" y="100" text-anchor="middle">walk clockwise</text>
+    <line class="edge-dash" x1="407" y1="166" x2="407" y2="196" marker-end="url(#arr-s3)"></line>
+    <text class="cap" x="452" y="184" text-anchor="middle">record location</text>
+  </svg>
+  <div class="diagram-cap">Figure: the consistent-hash ring decides which nodes hold a key's replicas/shards; metadata records the mapping.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<ul>
+  <li><strong>Functional:</strong> store an object under a key, retrieve it by key, delete it, list keys by prefix. Objects range from a few bytes to terabytes.</li>
+  <li><strong>Non-functional:</strong> effectively unlimited scale, extreme durability (S3 advertises 99.999999999% — eleven nines), high availability, low latency, and the ability to grow the cluster without downtime.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> "Eleven nines of durability" is the headline non-functional requirement. It is achieved not by trusting any one disk but by storing redundant copies (or erasure-coded fragments) across many independent failure domains, so multiple things must fail simultaneously to lose data.</div>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li>A <strong>Client</strong> issues <code>PUT key</code> (or <code>GET key</code>) over HTTP.</li>
+  <li>The <strong>API / Load Balancer</strong> is the stateless front door; it spreads requests across many identical request-routing servers.</li>
+  <li>The <strong>Consistent-hash ring router</strong> (the star) hashes the key onto the ring and walks clockwise to find the node(s) that own it — using virtual nodes so load spreads evenly.</li>
+  <li>The object is written to several consecutive <strong>Storage nodes</strong> as full replicas or erasure-coded shards, placed in different racks and availability zones.</li>
+  <li>The <strong>Metadata / index</strong> service records the key &#8594; placement mapping (and supports prefix listing), so later GETs and LISTs resolve quickly.</li>
+</ol>
+
+<h2>A flat key namespace, not a filesystem</h2>
+<p>S3 looks like folders, but that is an illusion. There are no directories — just a giant flat map from a <strong>key string</strong> to an object. The slashes in <code>photos/2024/cat.jpg</code> are ordinary characters in the key; "listing a folder" is really "list keys with this prefix". This matters enormously: a real filesystem tree has hot directory nodes that become bottlenecks and limit how wide you can scale. A flat key space has no such central node — keys can be distributed by hashing them, and any key is independent of any other.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Treating S3 like a filesystem leads to bad assumptions — e.g. expecting "rename folder" to be cheap. It isn't; there are no folders to rename, so it means copying every matching object under a new key. Designing key names well (and understanding listing is a prefix scan) avoids painful surprises.</div>
+
+<h2>The core hard problem: which machine holds this key?</h2>
+<p>With thousands of storage nodes, you need a function <code>key -&gt; node</code>. The naive choice is <code>node = hash(key) % N</code> where N is the number of nodes. It works perfectly... until you add or remove a node. Then N changes, and <em>almost every key</em> remaps to a different node. For S3 that would mean shuffling trillions of objects across the network whenever you add a server. Unacceptable.</p>
+<div class="callout warn"><strong>Gotcha:</strong> <code>hash(key) % N</code> is the classic trap. Changing N from 100 to 101 doesn't move ~1% of keys — it moves roughly <em>99%</em> of them, because the modulus of nearly every hash changes. Never use plain modulo hashing for a cluster whose size will change.</div>
+
+<h2>The fix: consistent hashing</h2>
+<p>Consistent hashing places both nodes and keys on the same circular hash space (a "ring" from 0 to some max, wrapping around). To find a key's home, you hash the key to a point on the ring and walk <strong>clockwise to the next node</strong>. The beauty: when you add a node, it only steals the keys in the arc between it and its predecessor — roughly <code>1/N</code> of all keys move, and only from one neighbour. Every other key stays put.</p>
+<table>
+  <tr><th>Plain modulo (hash % N)</th><td>O(1) lookup, but adding/removing a node remaps almost all keys. Catastrophic for large stateful clusters.</td></tr>
+  <tr><th>Consistent hashing (ring)</th><td>Adding/removing a node remaps only ~1/N of keys, from one neighbour. Real systems add many "virtual nodes" per physical node so load spreads evenly and no one node owns a giant arc.</td></tr>
+</table>
+<div class="callout tip"><strong>Senior tip:</strong> Mention <em>virtual nodes</em>. Placing each physical server at many points on the ring smooths out the otherwise lumpy arc sizes and means that when a node leaves, its load is redistributed across many neighbours instead of dumped on one.</div>
+
+<h2>Durability via replication &amp; erasure coding</h2>
+<p>Once a key maps to a position on the ring, S3 stores it on not one but several consecutive nodes — ideally in different racks and availability zones so a single failure can't take out all copies.</p>
+<table>
+  <tr><th>Replication (N copies)</th><td>Store 3 full copies. Simple, fast reads (read any copy), but uses 3x the storage.</td></tr>
+  <tr><th>Erasure coding</th><td>Split the object into k data fragments + m parity fragments; any k of the (k+m) fragments can rebuild it. Far less storage overhead for the same durability — the standard for large objects.</td></tr>
+</table>
+<p>Put numbers on the tradeoff. Three full replicas survive 2 simultaneous failures but cost <strong>3x</strong> the raw storage (200% overhead). A typical erasure code like <strong>10+4</strong> (10 data + 4 parity fragments) survives any 4 of 14 fragments being lost yet costs only <strong>1.4x</strong> storage — a 60%+ saving for comparable or better fault tolerance. That is why S3 erasure-codes large objects. The reason this all adds up to <strong>eleven nines</strong> (99.999999999% — losing one object in 100 billion per year) is independence: fragments are spread across separate disks, racks, and at least three availability zones, so the failures must be statistically independent and simultaneous. A continuous background process also scrubs and re-replicates fragments the moment a disk dies, so the system is constantly racing back to full redundancy rather than waiting for the next failure.</p>
+
+<h2>Consistency model</h2>
+<p>S3 now offers <strong>strong read-after-write consistency</strong>: once a PUT returns success, every subsequent GET sees the new data. Historically it was eventually consistent for overwrites, which surprised many engineers whose code read a key immediately after writing and got the old value. The lesson: always know your store's consistency guarantees, because they directly shape what your application code can safely assume.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Even with strong consistency, listing (the prefix scan) and replication across regions can still lag. "Read-after-write on a single object key" is not the same as "the whole bucket index is instantly globally consistent". Don't over-generalise the guarantee.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why is S3's key namespace flat instead of a directory tree?</summary><p>A tree has central directory nodes that become hotspots and limit horizontal scale. A flat key-to-object map has no central node, so keys can be hashed and spread across thousands of machines independently. Folders are just an illusion created by slashes in key names; listing a folder is a prefix scan.</p></details>
+  <details><summary>What's wrong with using hash(key) % N to pick a storage node?</summary><p>When N changes (you add or remove a node), the modulus of nearly every key changes, so roughly all keys remap and must be moved. For a cluster storing trillions of objects, that means shuffling almost everything on every scaling event — completely impractical.</p></details>
+  <details><summary>How does consistent hashing fix that?</summary><p>Nodes and keys sit on the same circular hash ring; a key belongs to the next node clockwise. Adding a node only captures the arc between it and its predecessor — about 1/N of keys, taken from one neighbour. All other keys stay where they are, so scaling moves minimal data.</p></details>
+  <details><summary>What are virtual nodes and why do they matter?</summary><p>Each physical server is placed at many points on the ring instead of one. This evens out the otherwise random, lumpy arc sizes so load is balanced, and when a node leaves its keys are spread across many neighbours rather than dumped entirely on one successor.</p></details>
+  <details><summary>How does S3 achieve eleven nines of durability?</summary><p>It never trusts one disk. Each object is redundantly stored across many independent failure domains (different disks, racks, availability zones) via replication or erasure coding, where any k of k+m fragments can rebuild the object. Losing data requires many independent failures at once.</p></details>
+</div>

@@ -1,0 +1,114 @@
+<h1>How Reddit Works <span class="tag express">Case Study</span></h1>
+<p>Reddit is a giant collection of communities ("subreddits") where users post links and text, and then <em>vote</em> on them. The interesting system-design problem is ranking: how do you decide which of millions of posts shows up at the top of "Hot" right now? It must feel fresh, reward popular content, and be cheap to compute for a hugely read-heavy workload.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 260" role="img" aria-label="Reddit request flow: client through load balancer to app servers, which read the Redis hot-rankings cache and the Post and Comment database, while votes flow through a queue to a hot-score recompute worker that updates the cache">
+    <defs>
+      <marker id="arr-reddit" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <rect class="box" x="16" y="100" width="120" height="56" rx="9"></rect>
+    <text class="lbl" x="76" y="124" text-anchor="middle">Client</text>
+    <text class="sub" x="76" y="142" text-anchor="middle">web / mobile</text>
+    <rect class="box" x="176" y="100" width="120" height="56" rx="9"></rect>
+    <text class="lbl" x="236" y="124" text-anchor="middle">Load Balancer</text>
+    <text class="sub" x="236" y="142" text-anchor="middle">TLS, routing</text>
+    <rect class="box-accent" x="336" y="100" width="130" height="56" rx="9"></rect>
+    <text class="lbl" x="401" y="118" text-anchor="middle">Ranking / Feed</text>
+    <text class="sub" x="401" y="134" text-anchor="middle">app servers</text>
+    <text class="sub" x="401" y="148" text-anchor="middle">(stateless)</text>
+    <rect class="box" x="556" y="20" width="148" height="52" rx="9"></rect>
+    <text class="lbl" x="630" y="42" text-anchor="middle">Redis cache</text>
+    <text class="sub" x="630" y="58" text-anchor="middle">Hot sorted sets</text>
+    <rect class="box" x="556" y="100" width="148" height="56" rx="9"></rect>
+    <text class="lbl" x="630" y="124" text-anchor="middle">Post / Comment DB</text>
+    <text class="sub" x="630" y="142" text-anchor="middle">Postgres (truth)</text>
+    <rect class="box" x="336" y="196" width="130" height="50" rx="9"></rect>
+    <text class="lbl" x="401" y="218" text-anchor="middle">Vote queue</text>
+    <text class="sub" x="401" y="234" text-anchor="middle">async (Kafka)</text>
+    <rect class="box" x="556" y="196" width="148" height="50" rx="9"></rect>
+    <text class="lbl" x="630" y="216" text-anchor="middle">Hot-score</text>
+    <text class="sub" x="630" y="232" text-anchor="middle">recompute worker</text>
+    <line class="edge" x1="136" y1="128" x2="170" y2="128" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="153" y="120" text-anchor="middle">HTTPS</text>
+    <line class="edge" x1="296" y1="128" x2="330" y2="128" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="313" y="120" text-anchor="middle">HTTP</text>
+    <line class="edge" x1="466" y1="116" x2="550" y2="58" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="512" y="78" text-anchor="middle">ZRANGE</text>
+    <line class="edge" x1="466" y1="128" x2="550" y2="128" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="510" y="120" text-anchor="middle">read post/comments</text>
+    <line class="edge" x1="401" y1="156" x2="401" y2="190" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="430" y="176" text-anchor="middle">vote event</text>
+    <line class="edge" x1="466" y1="221" x2="550" y2="221" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="508" y="213" text-anchor="middle">consume</text>
+    <line class="edge-dash" x1="630" y1="196" x2="630" y2="74" marker-end="url(#arr-reddit)"></line>
+    <text class="cap" x="668" y="138" text-anchor="middle">ZADD new score</text>
+  </svg>
+  <div class="diagram-cap">Figure: read path (client &rarr; LB &rarr; ranking service &rarr; Redis hot ranks + post DB) and async vote path (queue &rarr; recompute worker &rarr; cache).</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<p>Before designing anything, pin down what the system must do (functional) and how well it must do it (non-functional). Mixing these up is the classic fresher mistake.</p>
+<ul>
+  <li><strong>Functional:</strong> submit posts, upvote/downvote, view feeds (Hot, New, Top), nested comments.</li>
+  <li><strong>Non-functional:</strong> read-heavy (reads vastly outnumber votes), low-latency feed loads (&lt;200ms), eventual consistency on vote counts is acceptable, high availability.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> The phrase "read-heavy" is the single most important fact here. It tells you to precompute and cache the expensive work (ranking) ahead of time, so a feed read is just a lookup, not a calculation over millions of rows.</div>
+
+<h2>The core hard problem: ranking "Hot"</h2>
+<p>"Top of all time" is easy (sort by votes). "Hot" is hard because it must blend <em>two</em> things: how good a post is (votes) and how fresh it is (time). If you only used votes, the front page would freeze forever on old viral posts. If you only used time, "Hot" would equal "New".</p>
+<p>Reddit's classic trick: use the <strong>logarithm of the vote score</strong> so the first 10 votes matter far more than going from 9,000 to 9,010, then add a <strong>time term</strong> measured in seconds since a fixed epoch. Because time only ever increases, newer posts get a built-in head start that older posts can never catch.</p>
+<div class="callout warn"><strong>Gotcha:</strong> A naive "votes minus age-in-hours" formula breaks badly. Linear vote weight lets a brigade of votes dominate, and linear time decay makes the score swing wildly. The log + epoch-seconds design is what keeps it smooth and stable.</div>
+
+<h2>Step-by-step request flow</h2>
+<p>Follow what happens when a user upvotes a post and then someone else loads the "Hot" feed, referencing the diagram above.</p>
+<ol>
+  <li><strong>Vote arrives:</strong> the <em>Client</em> sends the upvote over <strong>HTTPS</strong> to the <em>Load Balancer</em>, which forwards it to a stateless <em>Ranking / Feed</em> app server.</li>
+  <li><strong>Persist + enqueue:</strong> the app server writes the raw vote to the <em>Post / Comment DB</em> (source of truth) and publishes a lightweight <em>vote event</em> onto the <em>Vote queue</em>. It returns <code>200 OK</code> immediately — the user does not wait for the ranking to update.</li>
+  <li><strong>Recompute asynchronously:</strong> the <em>Hot-score recompute worker</em> consumes the event, reads the post's current vote total, applies the log + epoch-seconds hot formula, and issues a <code>ZADD</code> to update that post's score in the subreddit's <em>Redis</em> sorted set.</li>
+  <li><strong>Feed read:</strong> later, a different client requests <code>/r/aww/hot</code>. The Load Balancer routes to any app server, which runs a single <code>ZRANGE</code> against the Redis sorted set to get the top N post ids in rank order — no sorting over the database.</li>
+  <li><strong>Hydrate + return:</strong> the app server fetches the post bodies for just those ~25 ids from the Post DB (or a row cache), assembles the page, and returns it. Total work per read: one cache range query plus a small batched lookup.</li>
+</ol>
+<div class="callout tip"><strong>Why this shape?</strong> The expensive part (re-ranking) is moved <em>off</em> the read path and <em>off</em> the user's request, onto an async worker. A vote is a fast write + enqueue; a feed load is a cheap lookup. The queue also absorbs vote spikes so a viral thread can't overload the recompute logic.</div>
+
+<h2>Data model / storage choice</h2>
+<p>Posts, votes, and comments have very different access patterns, so they often live in different stores.</p>
+<table>
+  <tr><th>Posts (relational, e.g. Postgres)</th><td>Structured rows, strong consistency on creation, indexed by subreddit + created_at. Source of truth.</td></tr>
+  <tr><th>Vote counts (cache / KV like Redis)</th><td>Counters incremented on every vote; can lag slightly. Hot data, written constantly.</td></tr>
+  <tr><th>Precomputed rankings (sorted set in Redis)</th><td>Each subreddit's "Hot" order stored as a sorted set scored by the hot formula; reading the feed is just a range query.</td></tr>
+</table>
+<p><strong>Why split them?</strong> A single SQL "ORDER BY hot_score" over millions of rows on every page load would melt the database. Precomputing the order into a sorted set turns each feed read into an O(log n) range scan.</p>
+
+<h2>Comment trees</h2>
+<p>Comments are a tree: replies to replies to replies. Two common storage strategies:</p>
+<table>
+  <tr><th>Adjacency list (parent_id column)</th><td>Simple to write. Reading a deep thread needs many queries or recursion — slow for big threads.</td></tr>
+  <tr><th>Materialized path (e.g. "3.7.12")</th><td>One indexed column encodes the full ancestry. A single prefix query fetches an entire subtree fast.</td></tr>
+</table>
+<div class="callout tip"><strong>Senior tip:</strong> Reddit famously paginates and lazy-loads deep comment branches ("load more comments"). You almost never need the <em>whole</em> tree at once — only the top slice. Designing for partial loads is cheaper than trying to render thousands of nested nodes.</div>
+
+<h2>Scaling the read path</h2>
+<p>Put concrete numbers on it. Suppose ~50M daily active users each load a handful of feeds: that is on the order of <strong>50,000–100,000 feed reads/sec</strong> at peak, against maybe <strong>2,000–5,000 votes/sec</strong> — reads outnumber writes ~20:1. Each feed read has a tight latency budget of <strong>&lt;200ms end-to-end</strong>, of which the data layer should consume only a few milliseconds. That budget is why ranking <em>cannot</em> be computed live.</p>
+<ul>
+  <li><strong>Precompute feeds:</strong> recompute a post's hot score only when its votes change, not on every read. A <code>ZRANGE</code> for the top 25 is <strong>O(log n)</strong> and returns in well under 1ms from in-memory Redis, versus an <code>ORDER BY hot_score</code> scan over millions of rows that could take seconds.</li>
+  <li><strong>Cache rendered feeds:</strong> the first page of a popular subreddit is the same for everyone — cache it for a few seconds. A 5s TTL on a subreddit getting 10,000 reads/sec collapses ~50,000 reads into a single recompute: a 99.998% cache hit rate.</li>
+  <li><strong>CDN for static assets:</strong> images, thumbnails, and JS/CSS sit on a CDN close to users, never touching the app servers. These are often 90%+ of the bytes on a page, so offloading them frees app-server CPU for the dynamic feed work.</li>
+</ul>
+<p><strong>Storage sizing intuition:</strong> a post id is ~8 bytes and a Redis sorted-set entry costs ~50–100 bytes with overhead. Capping each subreddit's Hot set to its top few thousand posts keeps even millions of subreddits within a few hundred GB of RAM — cheap enough to shard across a Redis cluster.</p>
+
+<h2>Tradeoffs</h2>
+<p>Reddit deliberately accepts <strong>eventual consistency</strong> on vote counts. You might see 1,201 votes while a friend sees 1,203 for a second. That is fine — vote counts are not money. Trading perfect accuracy for speed and availability is the right call here, and recognizing when consistency can be relaxed is a hallmark of good system design.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Don't recompute every subreddit's full ranking on a fixed timer — most posts' scores barely change. Event-driven recomputation (on vote) plus the time term naturally decaying is far cheaper than brute-force periodic sorts.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why use the logarithm of the vote score instead of the raw count?</summary><p>To give diminishing returns. The jump from 1 to 10 votes is a strong signal a post is good; the jump from 9,000 to 9,010 is noise. Log compresses large counts so a few mega-posts don't permanently dominate, keeping the feed lively.</p></details>
+  <details><summary>How does a newer post ever beat an older, more-upvoted post?</summary><p>The score adds a time term (seconds since an epoch) that grows with submission time. A newer post starts with a higher time component, so it only needs enough votes to close the gap created by log-compressed vote weight — not match the old post's raw total.</p></details>
+  <details><summary>Why is Reddit's workload called "read-heavy", and how does that shape the design?</summary><p>Far more people browse than vote or post. That pushes you toward precomputing rankings, caching feeds, and serving via CDN, so the common operation (reading) is a cheap lookup rather than an expensive live computation.</p></details>
+  <details><summary>How would you store and fetch a deep comment thread efficiently?</summary><p>Use a materialized path so each comment carries its ancestry in one indexed column; a prefix query fetches a whole subtree. Then paginate/lazy-load deep branches instead of loading the entire tree at once.</p></details>
+  <details><summary>Is it acceptable for vote counts to be slightly stale across users?</summary><p>Yes. Votes are not financial data, so eventual consistency is fine. Relaxing consistency lets you use fast in-memory counters and stay highly available, which matters far more than a perfectly synchronized count.</p></details>
+  <details><summary>Why route votes through a queue instead of recomputing the rank inside the request?</summary><p>To keep the write path fast and decoupled. The app server just persists the vote and enqueues an event, returning instantly; the recompute worker updates the Redis sorted set asynchronously. The queue also buffers vote spikes (a viral thread) so the recompute logic is never overwhelmed, at the cost of brief staleness in the ranking.</p></details>
+  <details><summary>Roughly what read:write ratio would you assume, and how does it justify caching?</summary><p>On the order of 20:1 reads to writes (e.g. ~50–100k feed reads/sec vs a few thousand votes/sec). With reads dominating and a sub-200ms latency budget, caching the precomputed order in Redis and rendering popular first pages behind a short TTL turns almost every read into a near-free lookup, which is where the design has to spend its effort.</p></details>
+</div>

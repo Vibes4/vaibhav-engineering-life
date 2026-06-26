@@ -1,0 +1,143 @@
+<h1>How Tinder Works <span class="tag express">Case Study</span></h1>
+<p>Tinder is a location-based dating app: it shows you a deck of nearby people, you swipe right (interested) or left (pass), and when two people swipe right on each other, it's a <strong>match</strong> and they can chat. The interesting system-design problems hiding behind that simple UI are <em>geo-proximity search</em> (find people near me, fast, at planet scale) and <em>mutual-match detection</em> (a write on my side has to be checked against a write on your side).</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 250" role="img" aria-label="Tinder flow: client to API to geo index and recommendation service, swipes to match service to push notification">
+    <defs>
+      <marker id="arr-tinder" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <!-- Client -->
+    <rect class="box" x="14" y="100" width="120" height="50" rx="9"></rect>
+    <text class="lbl" x="74" y="121" text-anchor="middle">Client</text>
+    <text class="sub" x="74" y="137" text-anchor="middle">swipe deck</text>
+
+    <!-- API -->
+    <rect class="box" x="178" y="100" width="120" height="50" rx="9"></rect>
+    <text class="lbl" x="238" y="121" text-anchor="middle">API gateway</text>
+    <text class="sub" x="238" y="137" text-anchor="middle">auth / route</text>
+
+    <!-- Geo index (top) -->
+    <rect class="box" x="340" y="26" width="160" height="52" rx="9"></rect>
+    <text class="lbl" x="420" y="47" text-anchor="middle">Geo index</text>
+    <text class="sub" x="420" y="63" text-anchor="middle">geohash cells, sharded</text>
+
+    <!-- Recommendation (bottom) -->
+    <rect class="box" x="340" y="172" width="160" height="52" rx="9"></rect>
+    <text class="lbl" x="420" y="193" text-anchor="middle">Recommendation</text>
+    <text class="sub" x="420" y="209" text-anchor="middle">rank candidates</text>
+
+    <!-- Swipe store (middle) -->
+    <rect class="box" x="356" y="100" width="128" height="50" rx="9"></rect>
+    <text class="lbl" x="420" y="121" text-anchor="middle">Swipe store</text>
+    <text class="sub" x="420" y="137" text-anchor="middle">likes:A:B KV</text>
+
+    <!-- Match service (STAR) -->
+    <rect class="box-accent" x="536" y="100" width="120" height="50" rx="9"></rect>
+    <text class="lbl" x="596" y="120" text-anchor="middle">Match</text>
+    <text class="accent-text" x="596" y="138" text-anchor="middle">mutual detect</text>
+
+    <!-- Push -->
+    <rect class="box" x="536" y="190" width="120" height="46" rx="9"></rect>
+    <text class="lbl" x="596" y="217" text-anchor="middle">Push notify</text>
+
+    <!-- Edges -->
+    <line class="edge" x1="134" y1="125" x2="172" y2="125" marker-end="url(#arr-tinder)"></line>
+
+    <!-- API -> Geo -->
+    <path class="edge" d="M298,118 C320,118 322,52 334,52" marker-end="url(#arr-tinder)"></path>
+    <text class="cap" x="320" y="80" text-anchor="middle">near me</text>
+    <!-- API -> Recommendation -->
+    <path class="edge" d="M298,132 C320,132 322,198 334,198" marker-end="url(#arr-tinder)"></path>
+    <text class="cap" x="320" y="172" text-anchor="middle">build deck</text>
+    <!-- API -> Swipe store -->
+    <line class="edge" x1="298" y1="125" x2="350" y2="125" marker-end="url(#arr-tinder)"></line>
+    <text class="cap" x="324" y="118" text-anchor="middle">record</text>
+
+    <!-- Swipe store -> Match -->
+    <line class="edge" x1="484" y1="125" x2="530" y2="125" marker-end="url(#arr-tinder)"></line>
+    <text class="cap" x="507" y="118" text-anchor="middle">right swipe</text>
+    <!-- Match -> Push -->
+    <line class="edge" x1="596" y1="150" x2="596" y2="184" marker-end="url(#arr-tinder)"></line>
+    <text class="cap" x="630" y="170" text-anchor="middle">match!</text>
+  </svg>
+  <div class="diagram-cap">Figure: a swipe enters via the API, candidates come from the geo index + recommendation service, the swipe is stored, and the match service does an O(1) reverse-lookup that fires a push on a mutual right-swipe.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<p>Before designing anything, pin down what the system must actually do. Mixing up "must-have" and "nice-to-have" is the classic way to over-engineer.</p>
+<ul>
+  <li><strong>Functional:</strong> store user profiles; given my location + preferences, return a deck of nearby candidates; record swipes; detect a mutual match and notify both users; let matched users chat.</li>
+  <li><strong>Non-functional:</strong> low latency for the deck (the app must feel instant, &lt;200ms); very high read volume (people swipe a LOT — billions of swipes/day); eventual consistency is fine for the deck, but match detection should feel real-time.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Tinder is a read-heavy, write-heavy, but <em>not</em> strongly-consistent system. Nobody is harmed if you briefly see a profile that just went offline. Recognising where you can relax consistency is what lets the system scale.</div>
+
+<h2>Step-by-step request flow</h2>
+<p>Following the components in the diagram above, here is what happens from a right-swipe to a match notification:</p>
+<ol>
+  <li><strong>Client → API gateway:</strong> the app sends the swipe event (and, when the deck runs low, a request for more candidates). The gateway authenticates the user and routes the call.</li>
+  <li><strong>API → Geo index:</strong> to build a deck, the service converts your (lat, lng) to a geohash prefix and range-scans the matching, region-sharded cells to gather a few thousand nearby user IDs.</li>
+  <li><strong>API → Recommendation service:</strong> those candidates are filtered by age/gender/preferences, de-duplicated against your "seen" set, ranked, and returned as a batch so you can swipe several cards without a round-trip per card.</li>
+  <li><strong>API → Swipe store:</strong> each swipe is written as a directed key <code>likes:A:B</code> in a fast KV store. Left swipes can be fire-and-forget.</li>
+  <li><strong>Swipe store → Match service (★):</strong> on a <em>right</em> swipe, the match service does a single O(1) reverse-lookup of <code>likes:B:A</code>.</li>
+  <li><strong>Match service → Push notification:</strong> if the reverse edge exists, both edges now point at each other, so a match event fans out a push to both devices and opens a chat thread.</li>
+</ol>
+
+<h2>The core hard problem: "find people near me"</h2>
+<p>Naively, "find users within 10km of (lat, lng)" means scanning every user on Earth and computing distance. That's O(all users) per request — impossible at scale. The trick is to <strong>turn 2D geography into a 1D sortable key</strong> so a database index can do the work.</p>
+<ul>
+  <li><strong>Geohash:</strong> recursively divide the world map into a grid of cells, each labelled with a short string (e.g. <code>9q8yy</code>). Nearby points share a prefix. So "find people near me" becomes "find users whose geohash starts with <code>9q8yy</code>" — a cheap prefix/range scan on an indexed column.</li>
+  <li><strong>Geosharding:</strong> partition users across servers <em>by region</em>. A request only ever hits the few shards covering your area, not the whole fleet. This is how you narrow billions of users down to a few thousand candidates <em>before</em> any expensive filtering.</li>
+</ul>
+
+<table>
+  <tr><th>Geohash / quadtree</th><td>Simple prefix lookups, indexable in any DB, easy to shard. Cells have fixed sizes, so a dense city packs millions into one cell — needs sub-division.</td></tr>
+  <tr><th>S2 cells (Google)</th><td>More uniform cell areas on a sphere, better for global accuracy. More complex to reason about and implement.</td></tr>
+  <tr><th>PostGIS / native geo index (R-tree)</th><td>Exact distance queries, rich geo operators. Harder to shard horizontally across regions at extreme scale.</td></tr>
+</table>
+
+<h2>The swipe pipeline</h2>
+<p>A swipe is a tiny but enormously frequent event. The flow:</p>
+<ul>
+  <li><strong>1. Fetch deck:</strong> client asks the recommendation service; it uses your geohash to pull nearby candidates, filters by age/gender/preferences, ranks them, and returns a batch (so you can keep swiping offline without a round-trip per card).</li>
+  <li><strong>2. Record swipe:</strong> each swipe writes <code>(swiper, swipee, direction)</code> to a fast key-value store. Left swipes can even be fire-and-forget.</li>
+  <li><strong>3. Check for match:</strong> on a <em>right</em> swipe, the service checks "has the other person already swiped right on me?" If yes → match.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> don't re-show profiles the user already swiped on. You need a fast "have I seen this person?" check — often a Bloom filter or a per-user seen-set in Redis — applied while building the deck, or the experience feels broken.</div>
+
+<h2>Detecting a mutual match</h2>
+<p>This is the heart of the demo. Store each right-swipe as a directed edge. A match exists when both directed edges exist:</p>
+<ul>
+  <li>A swipes right on B → store key <code>likes:A:B = true</code>.</li>
+  <li>On that write, look up the reverse key <code>likes:B:A</code>. If it exists, both like each other → emit a <strong>match</strong> event.</li>
+</ul>
+<p>Because the check happens at write time on a single key lookup, match detection is O(1) and feels instant — no scanning, no batch job required. The match event then fans out a push notification to both devices.</p>
+<div class="callout tip"><strong>Senior tip:</strong> model "who likes whom" as a directed graph and a match as a bidirectional edge. Doing the reverse-lookup synchronously on the right-swipe write is what makes matches real-time without a separate matching job.</div>
+
+<h2>Data model &amp; storage choices</h2>
+<p>Different sub-systems have different access patterns, so they use different stores — a key senior insight is that one database rarely fits everything.</p>
+<table>
+  <tr><th>Swipes / likes</th><td>Key-value store (e.g. DynamoDB/Redis) keyed by <code>swiper:swipee</code>. Huge write volume, simple point lookups for match detection.</td></tr>
+  <tr><th>Geo index</th><td>Geohash column on an indexed/sharded store for fast prefix range scans by location.</td></tr>
+  <tr><th>Profiles</th><td>Document store — flexible schema (bios, photos, prompts) read on deck-build.</td></tr>
+  <tr><th>Matches &amp; messages</th><td>Stored with a chat service; matches list is read often, messages need ordering.</td></tr>
+</table>
+
+<h2>Scaling &amp; tradeoffs</h2>
+<p>The deck is read far more than anything is written, so cache aggressively. Pre-compute candidate lists per geohash cell and refresh them periodically rather than recomputing on every request. Hot cities (cells with millions of active users) need to be sub-divided into smaller geohash cells so no single shard is overwhelmed.</p>
+<p>To put real numbers on it: Tinder has reported on the order of <strong>1.6+ billion swipes per day</strong> (~18k+/sec average, with peaks several times higher in the evening "prime swipe" window). Reads dominate — building a deck touches profiles, the geo index, and the seen-set, so a single deck request can fan out to dozens of point lookups, while a swipe is one tiny KV write. The deck target is <strong>&lt;200ms p99</strong> end-to-end, which is only achievable if the geohash range scan returns a pre-narrowed candidate set (a few thousand, not billions) and the rest is served from cache. <strong>Why pre-compute?</strong> Recomputing a ranked deck on every request would multiply that fan-out by the swipe rate; refreshing a per-cell candidate list every few minutes instead trades a little freshness for one to two orders of magnitude less read work per swipe.</p>
+<ul>
+  <li><strong>Stale decks:</strong> trading freshness for speed means you might briefly recommend someone who just left town — acceptable.</li>
+  <li><strong>Asymmetric load:</strong> a few extremely popular profiles get a disproportionate share of right-swipes (celebrity problem); rate-limit and fan-out carefully.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why use a geohash instead of computing distance directly?</summary><p>Computing distance to every user is O(N) and can't use an index. A geohash maps 2D location to a 1D string where nearby points share a prefix, so "near me" becomes an indexed prefix/range scan that returns a small candidate set in milliseconds.</p></details>
+  <details><summary>How do you detect a mutual match efficiently?</summary><p>Store each right-swipe as a directed key <code>likes:A:B</code>. On the write, do a single O(1) lookup of the reverse key <code>likes:B:A</code>. If it exists, both like each other → emit a match event. No scanning or batch job needed.</p></details>
+  <details><summary>How do you avoid showing the same profile twice?</summary><p>Keep a per-user "seen" set (Redis set or a Bloom filter) and filter it out while building the deck. A Bloom filter is space-efficient and fast, at the cost of rare false positives (occasionally hiding someone you haven't seen).</p></details>
+  <details><summary>What happens in a very dense city where one geohash cell holds millions of users?</summary><p>Fixed-size cells become hotspots. You sub-divide hot cells into finer geohash precision (longer prefix) so each shard handles a manageable population, and you load-balance those sub-cells across servers.</p></details>
+  <details><summary>Where is it safe to relax consistency, and where is it not?</summary><p>The deck can be eventually consistent — briefly stale recommendations are harmless. Match detection and the resulting notification should feel real-time, so the reverse-lookup is done synchronously on the swipe write rather than in a delayed batch.</p></details>
+</div>

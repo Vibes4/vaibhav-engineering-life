@@ -1,0 +1,105 @@
+<h1>How Apache Kafka Works <span class="tag express">Case Study</span></h1>
+<p>Kafka looks like a message queue, but at heart it is something simpler and more powerful: a <strong>distributed, durable, append-only commit log</strong>. Producers write records to the end of a log; consumers read forward through it at their own pace. The interesting system-design problem is how to make that log scale horizontally, survive machine failures, preserve ordering where it matters, and let many independent consumers read the same data without stepping on each other.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 280" role="img" aria-label="Producers append to a broker holding a topic split into three partitioned commit logs, each with a leader and replicas, read by a consumer group whose consumers track offsets">
+    <defs>
+      <marker id="arr-kafka" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <!-- Producers -->
+    <rect class="box" x="18" y="106" width="120" height="54" rx="9"></rect>
+    <text class="lbl" x="78" y="130" text-anchor="middle">Producers</text>
+    <text class="sub" x="78" y="147" text-anchor="middle">publish by key</text>
+    <!-- Broker container with partitioned log (star) -->
+    <rect class="box-accent" x="240" y="20" width="248" height="240" rx="11"></rect>
+    <text class="accent-text" x="364" y="40" text-anchor="middle">Broker — Topic (partitioned log)</text>
+    <!-- Partitions stacked -->
+    <rect class="box" x="262" y="56" width="204" height="48" rx="7"></rect>
+    <text class="lbl" x="290" y="84" text-anchor="middle">P0</text>
+    <text class="sub" x="392" y="78" text-anchor="middle">leader + 2 replicas</text>
+    <text class="sub" x="392" y="92" text-anchor="middle">offsets 0,1,2,3...</text>
+    <rect class="box" x="262" y="116" width="204" height="48" rx="7"></rect>
+    <text class="lbl" x="290" y="144" text-anchor="middle">P1</text>
+    <text class="sub" x="392" y="138" text-anchor="middle">leader + 2 replicas</text>
+    <text class="sub" x="392" y="152" text-anchor="middle">append-only</text>
+    <rect class="box" x="262" y="176" width="204" height="48" rx="7"></rect>
+    <text class="lbl" x="290" y="204" text-anchor="middle">P2</text>
+    <text class="sub" x="392" y="198" text-anchor="middle">leader + 2 replicas</text>
+    <text class="sub" x="392" y="212" text-anchor="middle">sequential write</text>
+    <!-- Consumer group -->
+    <rect class="box" x="582" y="56" width="120" height="48" rx="9"></rect>
+    <text class="lbl" x="642" y="80" text-anchor="middle">C1</text>
+    <text class="sub" x="642" y="95" text-anchor="middle">offset: P0,P1</text>
+    <rect class="box" x="582" y="176" width="120" height="48" rx="9"></rect>
+    <text class="lbl" x="642" y="200" text-anchor="middle">C2</text>
+    <text class="sub" x="642" y="215" text-anchor="middle">offset: P2</text>
+    <!-- Edges in -->
+    <line class="edge" x1="138" y1="133" x2="256" y2="133" marker-end="url(#arr-kafka)"></line>
+    <text class="cap" x="197" y="125" text-anchor="middle">append (acks=all)</text>
+    <!-- Edges out (consumer group reads) -->
+    <line class="edge" x1="466" y1="80" x2="582" y2="80" marker-end="url(#arr-kafka)"></line>
+    <text class="cap" x="524" y="72" text-anchor="middle">poll</text>
+    <line class="edge" x1="466" y1="200" x2="582" y2="200" marker-end="url(#arr-kafka)"></line>
+    <text class="cap" x="524" y="192" text-anchor="middle">poll</text>
+    <text class="accent-text" x="642" y="148" text-anchor="middle">Consumer group</text>
+  </svg>
+  <div class="diagram-cap">Figure: each partition is an independent ordered log; one consumer per partition within a group.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<ul>
+  <li><strong>Functional:</strong> producers publish records to a named <em>topic</em>; consumers subscribe and read records; consumers can replay from any past position; multiple independent consumer applications can read the same topic.</li>
+  <li><strong>Non-functional:</strong> very high throughput (millions of records/sec), durability (a written record is not lost if a broker dies), horizontal scalability, and ordering guarantees at least within a related stream of events.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> The mental unlock is "Kafka is a log, not a queue". In a traditional queue, reading a message removes it. In Kafka, reading does not delete anything — the consumer just advances a bookmark (an offset). That one difference is why replay, multiple consumers, and durability all become easy.</div>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Producers</strong> publish a record, choosing a partition by hashing the record's key (or round-robin if keyless).</li>
+  <li>The <strong>Broker</strong> receives the record into the leader of the target partition (P0/P1/P2) — the partitioned commit log that is the heart of Kafka.</li>
+  <li>The leader appends the record to its log, assigning the next <strong>offset</strong>, and the <strong>replicas</strong> copy it. With <code>acks=all</code> the write is acknowledged only once every in-sync replica has it.</li>
+  <li>Each consumer in the <strong>Consumer group</strong> (C1, C2) is assigned a disjoint set of partitions, so no two consumers in the group read the same partition.</li>
+  <li>Consumers <strong>poll</strong> their partitions, process records in offset order, and periodically <strong>commit</strong> their position back to Kafka so a restart resumes cleanly.</li>
+</ol>
+
+<h2>The core abstraction: an append-only log</h2>
+<p>A log is the simplest possible storage structure: you can only add to the end, and every record gets a monotonically increasing number (its <strong>offset</strong>) — 0, 1, 2, 3.... Appending is just a sequential disk write, which is astonishingly fast (disks are great at sequential I/O, terrible at random). Because records are never modified in place, there are no locks, no in-place updates, and reads never block writes.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Freshers often assume Kafka deletes a message once it's consumed. It does not. Records live until a retention policy (time- or size-based) expires them, completely independent of whether anyone has read them. This is exactly what lets a brand-new consumer start reading from offset 0 — last week's data is still there.</div>
+
+<h2>Partitions: how the log scales</h2>
+<p>A single log on a single machine has a ceiling — one disk, one CPU. So Kafka splits each topic into <strong>partitions</strong>, and each partition is an independent log that can live on a different broker (server). Throughput now scales with partition count: 10 partitions = 10 logs being written in parallel.</p>
+<p>But there's a cost. <strong>Ordering is guaranteed only within a single partition</strong>, never across the whole topic. Offsets are per-partition. So how do you keep related events in order? You route them to the same partition using a <strong>key</strong>.</p>
+<table>
+  <tr><th>Partition by key (hash the key)</th><td>All records with the same key (e.g. <code>user_42</code>) hash to the same partition, so that user's events stay strictly ordered. This is the common choice when order-per-entity matters.</td></tr>
+  <tr><th>Round-robin (no key)</th><td>Records spread evenly across partitions for maximum parallelism, but you lose any ordering guarantee between them. Fine for independent events like raw metrics.</td></tr>
+</table>
+
+<h2>Consumer groups &amp; offsets</h2>
+<p>A <strong>consumer group</strong> is how Kafka shares work. Within one group, each partition is read by exactly one consumer, so adding consumers (up to the partition count) splits the load. Crucially, <em>different</em> groups are completely independent — the same topic can feed a billing service and an analytics service, each tracking its own position.</p>
+<p>That position is the <strong>committed offset</strong>: "consumer group G has processed partition P up to offset N". The consumer periodically commits this back to Kafka. If a consumer crashes and restarts, it resumes from the last committed offset — nothing is lost, nothing skipped.</p>
+<div class="callout warn"><strong>Gotcha:</strong> When you commit matters. Commit <em>before</em> you finish processing and a crash loses the record (at-most-once). Commit <em>after</em> and a crash reprocesses it (at-least-once). There is no free lunch — you choose your failure mode, which is why idempotent consumers are so valued.</div>
+
+<h2>Durability via replication</h2>
+<p>A log on one disk is one disk failure away from data loss. Kafka replicates each partition to several brokers: one is the <strong>leader</strong> (handles all reads/writes) and the others are <strong>followers</strong> that copy the leader's log. If the leader dies, a follower that was fully caught up (an "in-sync replica") is promoted to leader.</p>
+<p>Concretely, the standard production setting is <strong>replication factor 3</strong> with <code>min.insync.replicas=2</code>. That means a partition tolerates the loss of one broker with zero data loss and zero downtime: a write needs 2 of the 3 replicas to acknowledge, so even if one replica is down, writes still succeed, and if the leader dies an in-sync follower already has every acknowledged record. Why 3 and not 2? With factor 2 and <code>min.insync.replicas=2</code>, a single broker failure halts writes entirely — you cannot satisfy "2 in sync" with only one survivor. Factor 3 is the smallest setup that survives one failure while staying available. A single well-tuned partition sustains on the order of tens of MB/s, and because partitions write in parallel, a cluster scales to <strong>millions of records/second</strong> simply by adding partitions and brokers.</p>
+<ul>
+  <li><strong>acks=all:</strong> the producer waits until all in-sync replicas have the record before considering the write successful — strongest durability, higher latency.</li>
+  <li><strong>acks=1:</strong> only the leader must confirm — faster, but a leader crash before replication loses the record.</li>
+</ul>
+
+<h2>Why decoupling producers from consumers matters</h2>
+<p>Because the log persists and consumers track their own offsets, producers and consumers never talk directly and never need to be online at the same time. A producer can fire records at full speed even if a consumer is slow, down, or hasn't been built yet. New consumers can be added later and replay history. This <strong>decoupling</strong> is Kafka's real architectural value: it turns a tangle of point-to-point integrations into a single shared, durable stream that any number of systems can tap.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Frame Kafka as "the central nervous system" of a company's data. One source of truth (the log), many independent readers, each at their own speed. That framing — not "a faster queue" — is what signals you actually understand it.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What's the difference between Kafka and a traditional message queue?</summary><p>A queue deletes a message when it's consumed and typically delivers each message to one consumer. Kafka is an append-only log: reading doesn't delete anything, consumers track their own offset (bookmark), records persist by retention policy, and many independent consumer groups can read the same data and replay history.</p></details>
+  <details><summary>Why does Kafka only guarantee ordering within a partition, not across a topic?</summary><p>Each partition is an independent log on possibly different brokers, written in parallel for throughput. There is no global clock across partitions, so a total order would require coordination that kills scalability. To keep related events ordered, route them to the same partition via a key.</p></details>
+  <details><summary>How do you make sure all events for one user stay in order?</summary><p>Use the user's ID as the record key. Kafka hashes the key to pick a partition, so every event for that user lands in the same partition, where offsets are strictly ordered. Different users may land in different partitions, which is fine.</p></details>
+  <details><summary>What happens to offsets when a consumer crashes and restarts?</summary><p>It resumes from the last committed offset for its consumer group. Records after that are re-read. Whether a crash causes reprocessing or loss depends on whether you commit before or after processing — the classic at-least-once vs at-most-once tradeoff.</p></details>
+  <details><summary>How does Kafka avoid data loss when a broker dies?</summary><p>Each partition is replicated to multiple brokers with one leader and several follower replicas. With acks=all, a write is acknowledged only after all in-sync replicas have it; if the leader fails, an in-sync follower is promoted, so no acknowledged record is lost.</p></details>
+  <details><summary>Why is replication factor 3 with min.insync.replicas=2 the common default?</summary><p>It is the smallest configuration that survives one broker failure while staying both durable and available. A write needs 2 of 3 replicas, so one broker can be down and writes still succeed with no data loss. Replication factor 2 would block writes entirely on a single failure (you can't meet "2 in sync" with one survivor).</p></details>
+  <details><summary>How does a single topic reach millions of records per second?</summary><p>By partitioning. Each partition is an independent log on a (possibly different) broker writing sequentially, which disks handle extremely fast. Throughput scales roughly linearly with partition count, so you add partitions and brokers until you hit the target rate.</p></details>
+</div>

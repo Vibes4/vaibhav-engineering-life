@@ -1,0 +1,103 @@
+<h1>How Uber Finds Nearby Drivers <span class="tag express">Case Study</span></h1>
+<p>When you open Uber, the app must answer one deceptively simple question in a few milliseconds: "which drivers are within a couple of kilometres of me, right now?" The hard part is that drivers are <em>moving</em> — millions of them — each pinging their GPS location every few seconds. This is a real-time geospatial proximity search problem at massive scale, and a naive solution falls over instantly.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 250" role="img" aria-label="Drivers send location pings to a location-update service that maintains an in-memory geo index, which a matching service queries for a rider's cell plus eight neighbours">
+    <defs>
+      <marker id="arr-uber" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <!-- Drivers -->
+    <rect class="box" x="20" y="24" width="130" height="50" rx="9"></rect>
+    <text class="lbl" x="85" y="45" text-anchor="middle">Drivers</text>
+    <text class="sub" x="85" y="62" text-anchor="middle">GPS ping / 4-5s</text>
+    <!-- Location-update service -->
+    <rect class="box" x="240" y="24" width="150" height="50" rx="9"></rect>
+    <text class="lbl" x="315" y="45" text-anchor="middle">Location-update</text>
+    <text class="sub" x="315" y="62" text-anchor="middle">service</text>
+    <!-- Geo Index (star) -->
+    <rect class="box-accent" x="475" y="86" width="170" height="78" rx="9"></rect>
+    <text class="lbl" x="560" y="116" text-anchor="middle">Geo Index</text>
+    <text class="sub" x="560" y="134" text-anchor="middle">geohash / H3 cells</text>
+    <text class="sub" x="560" y="150" text-anchor="middle">in memory (Redis)</text>
+    <!-- Rider -->
+    <rect class="box" x="20" y="176" width="130" height="50" rx="9"></rect>
+    <text class="lbl" x="85" y="197" text-anchor="middle">Rider app</text>
+    <text class="sub" x="85" y="214" text-anchor="middle">"nearby?"</text>
+    <!-- Matching service -->
+    <rect class="box" x="240" y="176" width="150" height="50" rx="9"></rect>
+    <text class="lbl" x="315" y="197" text-anchor="middle">Matching</text>
+    <text class="sub" x="315" y="214" text-anchor="middle">service</text>
+    <!-- Edges: write path -->
+    <line class="edge" x1="150" y1="49" x2="234" y2="49" marker-end="url(#arr-uber)"></line>
+    <text class="cap" x="192" y="41" text-anchor="middle">location</text>
+    <line class="edge" x1="390" y1="56" x2="475" y2="100" marker-end="url(#arr-uber)"></line>
+    <text class="cap" x="430" y="70" text-anchor="middle">O(1) upsert cell</text>
+    <!-- Edges: read path -->
+    <line class="edge" x1="150" y1="201" x2="234" y2="201" marker-end="url(#arr-uber)"></line>
+    <text class="cap" x="192" y="193" text-anchor="middle">(lat,lng)</text>
+    <line class="edge" x1="390" y1="194" x2="475" y2="150" marker-end="url(#arr-uber)"></line>
+    <text class="cap" x="440" y="186" text-anchor="middle">cell + 8 neighbours</text>
+    <line class="edge-dash" x1="560" y1="164" x2="360" y2="226" marker-end="url(#arr-uber)"></line>
+    <text class="cap" x="470" y="208" text-anchor="middle">candidate list</text>
+  </svg>
+  <div class="diagram-cap">Figure: a write-heavy update path feeds the in-memory geo index; the rider's query reads a 3x3 block of cells.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<p>Pin down what the system must do (functional) versus how well it must do it (non-functional) before touching any data structure.</p>
+<ul>
+  <li><strong>Functional:</strong> drivers continuously publish their location; a rider can query "drivers within X km of (lat, lng)"; the system returns a short list of candidate drivers to dispatch.</li>
+  <li><strong>Non-functional:</strong> very low query latency (&lt;100ms), an enormous write rate (every driver updates location every 4-5s), eventual consistency is fine (a driver one second stale is acceptable), high availability over perfect accuracy.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Notice the write rate dwarfs anything else — millions of location updates per second. That single fact tells you the location index must be cheap to update and must <em>not</em> require re-sorting the entire world on every ping.</div>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Drivers</strong> emit a GPS ping every 4-5 seconds. At ~5M active drivers that is roughly 1M location writes per second — the dominant load on the whole system.</li>
+  <li>The <strong>Location-update service</strong> receives each ping, computes the driver's grid cell (geohash/H3) and forwards the upsert.</li>
+  <li>The <strong>Geo Index</strong> (the star) does an O(1) update: move the driver from their old cell bucket to the new one. No global re-sort, which is the only way to absorb the write firehose.</li>
+  <li>A <strong>Rider app</strong> issues a "drivers near (lat,lng)" query to the <strong>Matching service</strong>.</li>
+  <li>The <strong>Matching service</strong> computes the rider's cell and reads that cell <strong>plus its 8 neighbours</strong> from the Geo Index, getting a few dozen candidates.</li>
+  <li>It returns a ranked <strong>candidate list</strong> after the fine step (exact distance/ETA), and dispatch proceeds.</li>
+</ol>
+
+<h2>The core hard problem: proximity search on moving points</h2>
+<p>The intuitive approach — store every driver's lat/lng and, for each rider query, compute the distance to <em>all</em> drivers and keep the close ones — is O(N) per query. With millions of drivers that is millions of distance calculations per request. It is hopeless.</p>
+<p>The key insight: <strong>you don't need exact distance to find candidates</strong>. You first need a cheap way to throw away the 99.99% of drivers who are obviously far away (different city, different neighbourhood), and only then do precise math on the handful that remain. That "throw away the far ones cheaply" step is what a spatial index does.</p>
+<div class="callout warn"><strong>Gotcha:</strong> A plain database index on <code>lat</code> and <code>lng</code> as two separate columns does <em>not</em> solve this. A range query like "lat between A and B AND lng between C and D" can only use one column index efficiently; the other becomes a scan. Geospatial proximity needs an index that combines both dimensions into one sortable key.</div>
+
+<h2>Spatial indexing options</h2>
+<p>The whole game is mapping 2D coordinates onto a 1D key (or a grid) so that "near in space" becomes "near in the index". Three popular approaches:</p>
+<table>
+  <tr><th>Geohash (grid cells)</th><td>Interleave the bits of lat and lng into one string. Each character refines the cell. Nearby points usually share a prefix, so a prefix scan finds neighbours. Simple, but rectangular cells distort near the poles and the 8 neighbours must be computed explicitly.</td></tr>
+  <tr><th>QuadTree</th><td>Recursively split a region into 4 quadrants, splitting further only where drivers are dense. Adapts to population density (dense downtown vs empty desert), but the tree must be rebalanced as drivers move, which is extra bookkeeping.</td></tr>
+  <tr><th>H3 (hexagons, used by Uber)</th><td>Tile the globe in hexagons. Every neighbour is exactly the same distance away (hexagons have uniform adjacency, unlike squares whose diagonal neighbours are farther). Cleanest "ring of neighbours" math, which is why Uber built and open-sourced it.</td></tr>
+</table>
+
+<h2>Geohash-style bucketing (the demo)</h2>
+<p>The simplest version, which our demo implements: quantize each driver's position into a fixed grid cell, keyed by something like <code>"cellX:cellY"</code>. To handle a location update, you just recompute one cell key and move the driver between buckets — cheap, O(1), no global re-sort. That directly answers the brutal write-rate requirement.</p>
+<p>To answer "nearby", you compute the rider's cell, then scan that cell <strong>plus its 8 surrounding cells</strong> (a 3x3 block). Why the neighbours? Because a driver just across a cell boundary is physically close to the rider but sits in an adjacent bucket. Checking only the rider's own cell would miss them.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Cell size is a real tradeoff. Make cells too big and each query returns thousands of candidates (you're back to scanning a lot). Make them too small and a "nearby" radius spans many cells, so you must scan far more than 9 of them. Tune cell size to roughly the query radius.</div>
+
+<h2>Storage &amp; scaling the write path</h2>
+<p>Driver locations are hot, ephemeral, and written constantly — a perfect fit for an in-memory store like Redis (which has native geo commands) rather than a disk-backed relational database. Put concrete numbers on it: ~5M concurrent drivers each pinging every 4-5s is on the order of <strong>1M writes/second</strong>. A disk-backed B-tree simply cannot sustain that, and it does not need to — the data is disposable. If the whole index were lost, every driver re-reports its position within 5 seconds and the index self-heals. <em>That</em> is the why behind keeping it in memory: durability is irrelevant, so you trade it away for raw write speed and pay nothing.</p>
+<ul>
+  <li><strong>Shard by region:</strong> partition the index by city or geographic region. A rider in Mumbai never needs the Tokyo index, so those shards live on different servers and scale independently.</li>
+  <li><strong>Keep the source of truth small:</strong> the location index only needs <em>current</em> position. Historical trails go to a separate analytics pipeline, not the live index.</li>
+  <li><strong>Absorb updates with a queue:</strong> location pings can flow through a stream (e.g. Kafka) so a burst of updates doesn't overwhelm the index directly.</li>
+</ul>
+
+<h2>Tradeoffs &amp; consistency</h2>
+<p>Uber happily accepts <strong>eventual consistency</strong> on driver positions. If a driver's shown location is one second old, the rider is unaffected — the candidate list is still correct enough to dispatch. Trading perfect freshness for a cheap, fast index is the right call. The candidate set from the spatial index is also deliberately <em>approximate</em>: it returns "drivers in nearby cells", and a second precise step (real distance + ETA + driver availability) ranks them.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Always describe this as two phases — a cheap "coarse filter" (spatial index narrows millions to dozens) followed by an expensive "fine rank" (exact distance/ETA on the survivors). Conflating them is the mistake; separating them is what makes the system fast.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why can't we just compute the distance from the rider to every driver?</summary><p>That is O(N) per query over millions of moving drivers — millions of distance calculations per request. It cannot meet a sub-100ms latency target. You need a spatial index to cheaply discard the far-away majority first, then do precise math only on the survivors.</p></details>
+  <details><summary>Why scan the 8 neighbouring cells and not just the rider's own cell?</summary><p>A driver standing just across a cell boundary is physically close to the rider but lives in an adjacent bucket. Querying only the rider's cell would miss those nearby drivers. Scanning the 3x3 block around the rider covers all drivers who could be within roughly one cell's distance.</p></details>
+  <details><summary>How do you choose the grid cell size?</summary><p>Match it to your typical query radius. Too large and each query returns too many candidates (you're back to scanning lots). Too small and a single radius spans many cells, so you scan far more than 9. The cell should be about the size of the search radius.</p></details>
+  <details><summary>Why does a plain two-column (lat, lng) database index not work?</summary><p>A B-tree index can only efficiently use one column for a range scan; the second dimension degrades to a scan. Proximity needs both dimensions folded into a single sortable key — that's what geohash bit-interleaving (or a quadtree/H3) achieves.</p></details>
+  <details><summary>How does the system handle millions of location updates per second?</summary><p>Updating the index is O(1): recompute one cell key and move the driver between buckets — no global re-sort. Store it in memory (Redis), shard by region so cities scale independently, and optionally buffer the firehose of pings through a stream before applying them.</p></details>
+</div>
