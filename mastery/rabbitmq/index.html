@@ -1,0 +1,392 @@
+<h1>RabbitMQ <span class="tag express">Mastery</span></h1>
+<p>RabbitMQ is a mature, broker-centric message queue implementing AMQP 0-9-1: a <em>smart broker / dumb consumer</em> system that routes individual messages through exchanges to queues based on routing keys and bindings, with per-message acknowledgements, TTLs, dead-lettering, and — since 3.8 — Raft-backed quorum queues for HA. This page is the deep dive: the model, the internals, the failure modes, and how to survive it in production.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "RabbitMQ is an AMQP message broker where <em>publishers never talk to queues directly</em> — they publish to an <strong>exchange</strong> with a routing key, and the broker matches that against <strong>bindings</strong> to fan the message into one or more <strong>queues</strong>. Consumers pull from queues over long-lived channels and <strong>acknowledge</strong> each message; unacked messages are redelivered on consumer death. It's a smart broker: it does per-message routing, TTLs, dead-lettering and priority. Trade-off vs Kafka — RabbitMQ deletes a message once acked (no long retention/replay) and gives you rich routing and per-message control instead of a durable log."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The full SDE2/SDE3 framing walks the AMQP object graph and the delivery contract:</p>
+<ul>
+<li><strong>Connection → Channel:</strong> one TCP connection per app, multiplexed into many lightweight <strong>channels</strong> (virtual connections). Channels are not thread-safe — one channel per thread/consumer.</li>
+<li><strong>Exchange → Binding → Queue:</strong> publishers send to an exchange with a routing key. The exchange type (<code>direct</code>, <code>topic</code>, <code>fanout</code>, <code>headers</code>) decides how the routing key is matched against bindings. Matching bindings deliver a copy into each bound queue.</li>
+<li><strong>Consumer + ack:</strong> a consumer subscribes (<code>basic.consume</code>) or polls (<code>basic.get</code>). With <strong>manual ack</strong>, the broker keeps the message in an "unacked" state until <code>basic.ack</code>; if the channel/connection drops first, the message is requeued. <code>basic.nack</code>/<code>basic.reject</code> with <code>requeue=false</code> routes it to a <strong>dead-letter exchange</strong>.</li>
+<li><strong>QoS / prefetch:</strong> <code>basic.qos(prefetch_count=N)</code> bounds in-flight unacked messages per consumer — the single most important knob for fairness and backpressure.</li>
+<li><strong>Durability for no-loss:</strong> you need <em>all three</em> — durable queue + persistent message (<code>delivery_mode=2</code>) + <strong>publisher confirms</strong>. Miss any one and you can lose messages on a broker crash.</li>
+<li><strong>HA:</strong> clustering replicates metadata but <em>not queue contents</em> by default. Use <strong>quorum queues</strong> (Raft, majority acks) for HA; classic mirrored queues are deprecated.</li>
+</ul>
+<div class="callout tip"><strong>Say this:</strong> "The mental model is 'publishers throw messages at exchanges, the broker does the routing, consumers ack what they finished.' Everything else — DLX, TTL, confirms, quorum queues — is bolted onto that delivery contract."</div>
+
+<h2>Internal Working</h2>
+<p>End-to-end path of one published message on a modern (3.9+/4.x, quorum-queue) broker:</p>
+<ol>
+<li><strong>Connection handshake.</strong> Client opens TCP (5672, or 5671 for TLS), sends the AMQP protocol header, negotiates <code>connection.start/tune/open</code> — frame max, heartbeat interval, and the vhost. Everything after runs inside a <strong>vhost</strong> namespace.</li>
+<li><strong>Channel open.</strong> Client sends <code>channel.open</code>. Channels are multiplexed over the single TCP connection; each carries an independent stream of method/content frames tagged with a channel number.</li>
+<li><strong>Publish.</strong> Client sends <code>basic.publish(exchange, routing_key, mandatory)</code> + a content header frame (properties: <code>delivery_mode</code>, <code>expiration</code>, <code>priority</code>, headers) + one or more body frames (split at <code>frame_max</code>, default 128KB).</li>
+<li><strong>Exchange routing.</strong> The broker looks up the exchange, then evaluates bindings. Internally this is a per-exchange data structure: direct/fanout use a hash index on the binding key; <strong>topic uses a trie</strong> over the dot-separated words to match <code>*</code> (one word) and <code>#</code> (zero+ words); headers walks an x-match arg table.</li>
+<li><strong>Fan into queues.</strong> Each matching binding yields a target queue; the message is enqueued into every one. If no binding matches and <code>mandatory=true</code>, the broker returns it via <code>basic.return</code>; else it's silently dropped (or sent to an <strong>alternate exchange</strong> if configured).</li>
+<li><strong>Persistence.</strong> If the message is persistent and the queue durable, the broker writes it to the message store on disk. Classic queues use a per-vhost <em>message store</em> (large msgs) + <em>queue index</em> (small msgs, positions); quorum queues append to a per-queue <strong>Raft write-ahead log</strong> and replicate to followers.</li>
+<li><strong>Confirm.</strong> With publisher confirms on, the broker sends <code>basic.ack</code> to the publisher <em>after</em> the message is safely enqueued on all target queues (and, for persistent, fsync'd / for quorum, replicated to a majority).</li>
+<li><strong>Dispatch to consumer.</strong> For each queue, the broker pushes messages to subscribed consumers up to their <code>prefetch_count</code> unacked limit, round-robin across consumers on the channel. Message moves to the <strong>unacked</strong> set keyed by delivery tag.</li>
+<li><strong>Consumer ack.</strong> Consumer processes, then <code>basic.ack(delivery_tag)</code> → broker removes it from the queue/store. <code>basic.nack(requeue=true)</code> puts it back at (near) head; <code>requeue=false</code> triggers dead-lettering.</li>
+<li><strong>Redelivery on failure.</strong> If the consumer's channel closes with messages still unacked, the broker requeues them (marked <code>redelivered=true</code>) for another consumer.</li>
+</ol>
+<div class="callout warn"><strong>Watch out:</strong> A message that is nacked-with-requeue by a consumer that always fails (a <strong>poison message</strong>) will loop forever, pegging CPU and blocking the queue. You need a DLX + a delivery-count cap (quorum queues expose <code>x-delivery-limit</code>) to break the loop.</div>
+
+<h2>Why was this built?</h2>
+<p>RabbitMQ (2007, Rabbit Technologies, later VMware/Pivotal/Broadcom) implemented AMQP 0-9-1 — a standard born from JPMorgan wanting an <em>open, interoperable</em> messaging wire protocol to replace expensive proprietary middleware (TIBCO Rendezvous, IBM MQSeries). Before it, teams either:</p>
+<ul>
+<li>Paid for IBM MQ / TIBCO — reliable but costly and vendor-locked.</li>
+<li>Hand-rolled queues on a database table (<code>SELECT ... FOR UPDATE SKIP LOCKED</code>) — works but couples to DB load, poor fan-out, polling latency.</li>
+<li>Used raw sockets / RPC with no buffering — tight coupling, no backpressure, cascading failures when a downstream slowed.</li>
+</ul>
+<p>RabbitMQ gave a free, protocol-standard broker with rich routing, decoupling producers from consumers, absorbing bursts, and enabling async work distribution (task queues), pub/sub, and RPC — all with per-message reliability semantics that a log-based system didn't offer at the time.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>System</th><th>Model</th><th>When it wins over RabbitMQ</th></tr>
+<tr><td><strong>Kafka</strong></td><td>Distributed commit log, dumb broker, consumer tracks offset</td><td>High-throughput event streaming, long retention + <strong>replay</strong>, event sourcing, many consumer groups reading the same data. Millions of msgs/s.</td></tr>
+<tr><td><strong>Redis Streams / Lists</strong></td><td>In-memory log / list, optional AOF</td><td>Ultra-low latency, you already run Redis, small payloads, can tolerate weaker durability. Simpler ops.</td></tr>
+<tr><td><strong>AWS SQS</strong></td><td>Managed pull queue, at-least-once</td><td>Zero ops, elastic, no capacity planning. Lose rich routing, ordering only in FIFO queues (300 msg/s/group).</td></tr>
+<tr><td><strong>NATS / JetStream</strong></td><td>Lightweight pub/sub + optional stream</td><td>Edge/IoT, huge subject fan-out, tiny footprint, sub-ms latency.</td></tr>
+<tr><td><strong>DB table queue</strong></td><td>Transactional row + SKIP LOCKED</td><td>You need the enqueue to be in the <em>same transaction</em> as a DB write (outbox pattern), low volume.</td></tr>
+<tr><td><strong>RabbitMQ</strong></td><td>AMQP broker, smart routing, per-msg ack</td><td>Complex routing (topic/headers), per-message TTL/priority/DLX, request-reply RPC, moderate throughput (tens of k/s), work-queue task distribution.</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "Kafka is a log you re-read; RabbitMQ is a queue you drain. If the interviewer says 'replay last week's events' → Kafka. If they say 'route this order to the right of 40 worker pools based on region and priority, retry with backoff, dead-letter after 3 tries' → RabbitMQ."</div>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Flexible routing</strong> — topic/headers exchanges do content-based routing the broker evaluates; consumers stay dumb.</li>
+<li><strong>Per-message control</strong> — TTL, priority (0-255 via <code>x-max-priority</code>), expiration, DLX per message.</li>
+<li><strong>Fine-grained reliability</strong> — manual acks + publisher confirms give an at-least-once contract you tune precisely.</li>
+<li><strong>Backpressure built in</strong> — prefetch bounds in-flight work; memory/disk high-watermark flow control protects the broker.</li>
+<li><strong>Protocol breadth</strong> — AMQP 0-9-1, plus plugins for MQTT, STOMP, AMQP 1.0, WebSocket.</li>
+<li><strong>Mature tooling</strong> — management UI, <code>rabbitmqctl</code>, Prometheus plugin, shovel/federation for WAN links.</li>
+<li><strong>Low end-to-end latency</strong> — sub-millisecond broker hop for in-memory delivery.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>No replay / short-lived data</strong> — once acked, a message is gone. Not an event store.</li>
+<li><strong>Throughput ceiling</strong> — tens of thousands of msgs/s per queue; a single queue is a single Erlang process (one core). Kafka scales an order of magnitude higher.</li>
+<li><strong>Queues don't shard automatically</strong> — one queue = one master process; hot queues bottleneck. You partition manually (sharding plugin / app-level).</li>
+<li><strong>HA is hard-won</strong> — classic mirrored queues had split-brain and sync-storm problems (now deprecated); quorum queues fix correctness but cost ~3x writes and don't support all features (no priority, no per-message TTL historically).</li>
+<li><strong>Memory pressure</strong> — deep backlogs of non-lazy queues live in RAM; hitting the memory watermark blocks <em>all</em> publishers.</li>
+<li><strong>Erlang operational skill</strong> — debugging the BEAM VM, mnesia metadata, and network partitions requires specialised knowledge.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+<li><strong>Durability vs latency:</strong> persistent + confirms + quorum majority replication ≈ 2-3x latency and lower throughput vs transient in-memory. You buy no-loss with fsync/replication cost.</li>
+<li><strong>Ack safety vs throughput:</strong> autoack (no ack) is fastest but loses in-flight messages on crash; manual ack per message is safe but adds a round trip — batch with multiple-flag acks to recover throughput.</li>
+<li><strong>Prefetch high vs low:</strong> high prefetch = better throughput but unfair distribution and big redelivery bursts on crash; low prefetch = fair, responsive, but consumers can starve on network RTT.</li>
+<li><strong>Availability vs consistency (partitions):</strong> quorum queues choose consistency (minority side rejects); <code>pause_minority</code> partition mode sacrifices availability of the minority to avoid split-brain.</li>
+<li><strong>Routing richness vs simplicity:</strong> topic exchanges are powerful but a sprawling binding graph is hard to reason about and audit.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out — reach for something else when:</strong>
+<ul>
+<li>You need <strong>event replay / long retention / event sourcing</strong> — use Kafka/Pulsar. RabbitMQ streams (3.9+) partially address this but it's not the sweet spot.</li>
+<li>You need <strong>millions of msgs/sec</strong> on a topic — Kafka's partitioned log scales far better.</li>
+<li>You need <strong>strict global ordering across high volume</strong> — a single RabbitMQ queue orders, but that's a single-core bottleneck; Kafka partitions give per-key ordering at scale.</li>
+<li>The enqueue must be <strong>transactional with a DB write</strong> — use the outbox pattern in your DB, then relay to Rabbit.</li>
+<li>You want <strong>zero ops</strong> — a managed SQS/PubSub is less to run.</li>
+<li>Payloads are <strong>large blobs</strong> (&gt;128KB routinely) — put them in object storage and queue a pointer.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical HA deployment: a 3-node cluster behind a load balancer, quorum queues replicated across nodes, producers using confirms, consumers scaled horizontally per queue, and a DLX topology for retries.</p>
+<pre class="mermaid">
+flowchart TD
+  P["Producers with confirms"] --> LB["Load Balancer 5671"]
+  LB --> N1["Rabbit node 1 leader"]
+  LB --> N2["Rabbit node 2 follower"]
+  LB --> N3["Rabbit node 3 follower"]
+  N1 -. raft replication .-> N2
+  N1 -. raft replication .-> N3
+  N1 --> QW["Work queue quorum"]
+  QW --> C1["Consumer pool A"]
+  QW --> C2["Consumer pool B"]
+  C1 -->|nack no requeue| DLX["Dead letter exchange"]
+  DLX --> DLQ["Dead letter queue"]
+</pre>
+<p>Key points of this topology:</p>
+<ul>
+<li><strong>Odd cluster size (3 or 5)</strong> so Raft quorum queues can form a majority and survive one (or two) node loss.</li>
+<li><strong>Quorum queue leader</strong> lives on one node; all writes go through it and replicate to followers' WAL. Clients can connect to any node — it proxies to the leader.</li>
+<li><strong>DLX for retries:</strong> failed messages nack'd without requeue land in a DLQ; a separate delayed/TTL requeue path implements exponential backoff.</li>
+<li><strong>Connections spread</strong> across nodes via LB; but for a given queue all traffic funnels through the leader node — watch that node's CPU.</li>
+</ul>
+<pre class="mermaid">
+sequenceDiagram
+  participant Pub as Publisher
+  participant Ex as Exchange
+  participant Q as Queue
+  participant Con as Consumer
+  Pub->>Ex: basic.publish routing_key mandatory
+  Ex->>Q: match binding then enqueue
+  Ex-->>Pub: basic.ack confirm
+  Q->>Con: deliver up to prefetch
+  Con->>Q: basic.ack delivery_tag
+  Note over Q,Con: unacked on crash is requeued
+</pre>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>Memory alarm blocks all publishers.</strong> A slow/absent consumer lets a queue grow until the node hits <code>vm_memory_high_watermark</code> (default 0.4 of RAM); the broker throttles/blocks every publishing connection cluster-wide. Symptom: producers hang on publish.</li>
+<li><strong>Unacked messages pile up.</strong> A consumer with high prefetch that stops acking (deadlock, blocked on downstream) holds thousands of messages in the unacked state — they're neither redelivered nor processed. Queue shows high "unacked" count.</li>
+<li><strong>Poison message loop.</strong> A message that always throws is nacked with requeue and re-delivered forever, spiking CPU.</li>
+<li><strong>Network partition / split-brain</strong> in classic mirrored queues: both sides accept writes, then diverge; on heal one side's messages are dropped.</li>
+<li><strong>Queue as single-core bottleneck.</strong> One hot queue saturates one Erlang scheduler while other cores idle.</li>
+<li><strong>Connection/channel churn.</strong> Apps opening a connection per message exhaust file descriptors and hammer the broker with handshakes.</li>
+<li><strong>Lazy vs default queue surprises.</strong> Non-lazy queues page to disk under memory pressure in bursts, causing latency spikes; lazy queues keep messages on disk always (steadier, higher per-msg latency).</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<p>Signals and commands when things misbehave:</p>
+<pre><code># Overview: connections, queues, memory, alarms
+rabbitmqctl status
+rabbitmqctl list_queues name messages messages_ready messages_unacknowledged consumers memory --vhost /
+
+# Who is (not) consuming — check consumer count and unacked
+rabbitmqctl list_consumers
+
+# Connections / channels churn and blocked publishers
+rabbitmqctl list_connections name state channels
+rabbitmqctl list_channels name messages_unacknowledged prefetch_count
+
+# Is a memory / disk alarm firing (this blocks publishers)?
+rabbitmqctl list_alarms
+rabbitmqctl status | grep -A5 alarms
+
+# Quorum queue health — who is leader, are followers in sync?
+rabbitmqctl list_queues name leader members online type
+rabbitmq-diagnostics check_if_node_is_quorum_critical
+
+# Cluster / partition state
+rabbitmqctl cluster_status
+
+# Runtime / scheduler / process info
+rabbitmq-diagnostics observer          # top-like BEAM view
+rabbitmq-diagnostics memory_breakdown  # where RAM went</code></pre>
+<ul>
+<li><strong>Backlog growing, ready climbing:</strong> too few/slow consumers, or prefetch too low causing RTT-bound starvation. Check <code>consumers</code> and consumer utilisation in the UI.</li>
+<li><strong>Unacked high, ready low:</strong> consumers took work but aren't acking — a bug or a downstream hang. Look at the consuming service's threads.</li>
+<li><strong>Publishers blocked:</strong> check <code>list_alarms</code> — memory or disk watermark. Free consumers or raise watermark, then fix the leak.</li>
+<li><strong>Redelivered=true storm:</strong> poison message or flapping consumers. Trace by enabling the firehose (<code>rabbitmq_tracing</code> plugin) on a test vhost.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>What it means</th><th>Healthy / alert threshold</th></tr>
+<tr><td><code>queue_messages_ready</code></td><td>Backlog waiting for a consumer</td><td>Near flat; alert if growing over 5–10 min or &gt; expected burst</td></tr>
+<tr><td><code>queue_messages_unacked</code></td><td>Delivered but not yet acked (in-flight)</td><td>≈ consumers × prefetch; alert if pinned high with low throughput</td></tr>
+<tr><td><code>consumer count / utilisation</code></td><td>Consumers attached; % time they had work vs waiting</td><td>&gt;0 consumers; utilisation &lt;100% means broker/prefetch-bound</td></tr>
+<tr><td><code>rabbitmq_resident_memory / watermark</code></td><td>Node RAM vs high-watermark</td><td>Alert at 0.8× watermark; blocking at 1.0×</td></tr>
+<tr><td><code>disk_free vs disk_free_limit</code></td><td>Free disk vs alarm floor (default 50MB)</td><td>Alert well above limit; blocking at limit</td></tr>
+<tr><td><code>message_publish_rate / deliver_ack_rate</code></td><td>In vs out throughput</td><td>Deliver should track publish; sustained gap = backlog growth</td></tr>
+<tr><td><code>unroutable / returned</code></td><td>Messages with no binding (mandatory returns / dropped)</td><td>Should be ~0; spikes mean broken bindings/routing keys</td></tr>
+<tr><td><code>quorum_queue followers online / commit lag</code></td><td>Raft replication health</td><td>All members online; alert if a queue is quorum-critical (one node from losing majority)</td></tr>
+<tr><td><code>connection_churn / channel_max</code></td><td>Open/close rate, channel leaks</td><td>Low churn; alert on rising channel count (leak)</td></tr>
+<tr><td><code>file_descriptors / sockets used</code></td><td>FD usage vs limit</td><td>Alert &gt;80% of ulimit</td></tr>
+</table>
+<p>Enable the <code>rabbitmq_prometheus</code> plugin and scrape <code>:15692/metrics</code>; the per-queue and per-node dashboards ship for Grafana.</p>
+
+<h2>Scaling</h2>
+<p>RabbitMQ scales horizontally at the cluster and consumer level, but a single queue is a single-core bottleneck, so <strong>partition the workload across many queues</strong>.</p>
+<ul>
+<li><strong>Vertical:</strong> more cores help only if you have many queues (each queue = one Erlang process on one scheduler). Faster disk (NVMe) helps persistent/quorum throughput.</li>
+<li><strong>Horizontal — consumers:</strong> add consumers to a queue; the broker round-robins deliveries bounded by prefetch. This scales <em>processing</em> but not the single queue's dispatch ceiling.</li>
+<li><strong>Horizontal — queues:</strong> shard a logical stream across N queues (consistent-hash exchange plugin, or the sharding plugin) so N leader processes use N cores.</li>
+<li><strong>Federation / Shovel:</strong> link brokers across regions/DCs; shovel drains from a remote queue, federation forwards exchange/queue traffic over WAN.</li>
+<li><strong>Streams (3.9+):</strong> for high-throughput append-and-replay workloads, RabbitMQ Streams use a log abstraction with much higher per-second rates than classic queues.</li>
+</ul>
+<pre class="mermaid">
+flowchart LR
+  P["Publisher"] --> CHX["Consistent hash exchange"]
+  CHX --> Q1["Shard queue 1"]
+  CHX --> Q2["Shard queue 2"]
+  CHX --> Q3["Shard queue 3"]
+  Q1 --> W1["Worker set 1"]
+  Q2 --> W2["Worker set 2"]
+  Q3 --> W3["Worker set 3"]
+</pre>
+<div class="callout warn"><strong>Watch out:</strong> Adding cluster nodes does NOT speed up an existing hot queue — its leader lives on one node/one core. You must shard the queue to use more cores. This surprises people who "just add a node" and see no improvement.</div>
+
+<h2>Security</h2>
+<ul>
+<li><strong>AuthN:</strong> username/password (PLAIN over TLS), x509 client certs, or external (LDAP, OAuth2/JWT via plugins). Disable the default <code>guest/guest</code> (it only works on localhost by default — never expose it).</li>
+<li><strong>AuthZ:</strong> per-<strong>vhost</strong> isolation plus per-user <strong>permissions</strong> as regexes over configure/write/read on resources, and topic-level authorisation for topic exchanges. Grant least privilege: producers get write-only, consumers read-only.</li>
+<li><strong>Encryption in transit:</strong> TLS on 5671 (AMQPS) and 15671 (management). Terminate at the broker, not just the LB, for end-to-end. Enforce TLS 1.2+ and strong ciphers.</li>
+<li><strong>Encryption at rest:</strong> RabbitMQ doesn't encrypt the message store itself — use disk-level encryption (LUKS/dm-crypt, EBS encryption). Credentials in config can be obfuscated with the <code>credentials_obfuscation</code> mechanism.</li>
+<li><strong>Network isolation:</strong> put the cluster in a private subnet/security group; only 5671 (clients), 15671 (mgmt, restricted), 4369/25672 (inter-node — cluster-only) open. The Erlang distribution port and cookie are a big attack surface.</li>
+<li><strong>Erlang cookie:</strong> the shared <code>.erlang.cookie</code> authenticates cluster nodes — treat it as a secret; a leaked cookie = full node RCE via Erlang distribution.</li>
+<li><strong>Common CVEs / mistakes:</strong> exposed management UI (15672) to the internet, default guest exposed via a misconfigured listener, unpatched brokers, and running the Erlang distribution port unfirewalled.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>Ballparks:</strong> transient in-memory single queue ≈ 20k–50k msgs/s; persistent + confirms drops to ≈ 5k–20k; quorum queues lower still due to Raft. Latency: sub-ms in-memory hop, single-digit ms with persistence.</li>
+<li><strong>Single-queue ceiling:</strong> one queue = one core. Beyond ~a few tens of k/s on one queue, shard.</li>
+<li><strong>Prefetch tuning:</strong> too low = consumers idle on network RTT (throughput = prefetch / RTT); too high = unfair + huge redelivery on crash. Start around <code>prefetch = ceil(processing_rate × RTT)</code>, often 20–200.</li>
+<li><strong>Batch acks:</strong> use <code>multiple=true</code> on <code>basic.ack</code> to ack a range in one frame, cutting ack round trips.</li>
+<li><strong>Persistence cost:</strong> fsync dominates persistent throughput; group commit and fast disks matter. Lazy queues trade latency for stable memory.</li>
+<li><strong>Connection reuse:</strong> reuse one connection with many channels; opening connections per message can cut throughput 10x and exhaust FDs.</li>
+<li><strong>Message size:</strong> keep bodies small; large bodies get split into 128KB frames and bloat memory. Offload blobs to object storage.</li>
+<li><strong>Publisher confirms async:</strong> don't wait synchronously per message; pipeline publishes and track confirms by sequence number (delivery tag) for high throughput + safety.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Autoack in a work queue</strong> → lost messages on crash. Fix: manual ack after processing succeeds.</li>
+<li><strong>Durable queue but non-persistent messages</strong> (or vice versa) → messages vanish on restart. Fix: durable queue + <code>delivery_mode=2</code> + confirms, all three.</li>
+<li><strong>No publisher confirms</strong> → publish returns before the broker persisted; a crash loses it silently. Fix: enable confirms and handle nacks.</li>
+<li><strong>Unbounded prefetch</strong> → one consumer grabs everything, others idle; crash requeues thousands. Fix: set a sane <code>basic.qos</code>.</li>
+<li><strong>No DLX / no delivery limit</strong> → poison messages loop forever. Fix: DLX + <code>x-delivery-limit</code> (quorum) or a retry-count header.</li>
+<li><strong>Requeue=true on a permanent failure</strong> → hot loop. Fix: requeue=false → dead-letter it.</li>
+<li><strong>Connection/channel per operation</strong> → FD exhaustion, handshake storm. Fix: long-lived connection, channel per thread.</li>
+<li><strong>Sharing a channel across threads</strong> → protocol corruption/races. Fix: one channel per thread; channels aren't thread-safe.</li>
+<li><strong>Relying on clustering for HA</strong> → cluster replicates metadata, not classic queue data; a node loss loses that queue's messages. Fix: quorum queues.</li>
+<li><strong>Ignoring the memory alarm</strong> → a single deep queue blocks all publishers cluster-wide. Fix: alert on watermark, use lazy/quorum queues, bound queue length with <code>x-max-length</code> + DLX overflow.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>Plausible RabbitMQ usage</th></tr>
+<tr><td><strong>Google</strong></td><td>Not core infra (they use internal Pub/Sub / Borg messaging), but GCP offers managed messaging; internal teams likely use RabbitMQ inside acquired products or Kubernetes app stacks (likely).</td></tr>
+<tr><td><strong>Amazon</strong></td><td>Runs <strong>Amazon MQ for RabbitMQ</strong> as a managed offering; internal high-scale is SQS/Kinesis, but customer-facing managed Rabbit is a real product they operate.</td></tr>
+<tr><td><strong>Netflix</strong></td><td>Predominantly Kafka for streaming; RabbitMQ likely used in specific microservices needing request/reply or complex routing rather than the streaming backbone (likely).</td></tr>
+<tr><td><strong>Uber</strong></td><td>Built Cherami/derivatives and heavily uses Kafka; RabbitMQ plausibly present in older or acquired services for task queues (likely).</td></tr>
+<tr><td><strong>Swiggy</strong></td><td>Order/delivery events fan-out — dispatching an order to restaurant, rider-matching, and notification pools via topic exchanges fits RabbitMQ's routing model well (likely).</td></tr>
+<tr><td><strong>PhonePe</strong></td><td>Payment-flow async steps (ledger updates, notifications, reconciliation) as work queues with retries + DLX; strong durability needs favour quorum queues (likely).</td></tr>
+<tr><td><strong>Razorpay</strong></td><td>Payment webhooks, settlement jobs, and retry-with-backoff pipelines are a classic RabbitMQ DLX/TTL use case; they've publicly discussed queue-based async processing (likely for parts).</td></tr>
+<tr><td><strong>Atlassian</strong></td><td>Jira/Confluence background jobs, indexing, and notification fan-out; async task distribution across worker pools maps to Rabbit work queues (likely).</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What are the AMQP entities and how does a message flow through them?
+  <ol><li><em>Answer pointer:</em> connection → channel → publish to exchange → binding match → queue → consumer ack.</li></ol></li>
+<li>How does a topic exchange match routing keys internally?
+  <ol><li><em>Answer pointer:</em> a trie over dot-delimited words; <code>*</code> matches one word, <code>#</code> matches zero or more.</li></ol></li>
+<li>Manual vs automatic ack — what exactly do you lose with autoack?
+  <ol><li><em>Answer pointer:</em> autoack acks on delivery; a crash mid-processing drops the in-flight message — no redelivery.</li></ol></li>
+<li>What's the difference between nack-requeue-true and reject-requeue-false?
+  <ol><li><em>Answer pointer:</em> requeue puts it back for retry; requeue=false dead-letters (or drops) it.</li></ol></li>
+<li>What does <code>basic.qos</code> / prefetch actually bound, and how do you pick a value?
+  <ol><li><em>Answer pointer:</em> bounds unacked in-flight per consumer; ≈ processing_rate × RTT, balancing fairness vs throughput.</li></ol></li>
+<li>Walk me through guaranteeing zero message loss end to end.
+  <ol><li><em>Answer pointer:</em> durable queue + persistent message + publisher confirms + quorum queue + consumer manual ack.</li></ol></li>
+<li>What do publisher confirms guarantee, and how do you use them at high throughput?
+  <ol><li><em>Answer pointer:</em> broker acks after safe enqueue; pipeline publishes, track by delivery tag async, handle nacks.</li></ol></li>
+<li>What does the <code>mandatory</code> flag do, and what's an alternate exchange?
+  <ol><li><em>Answer pointer:</em> mandatory returns unroutable messages via basic.return; alternate exchange catches unroutables instead.</li></ol></li>
+<li>How do you implement retry-with-exponential-backoff?
+  <ol><li><em>Answer pointer:</em> DLX + per-message/queue TTL in retry queues, or the delayed-message exchange plugin; cap with delivery-limit.</li></ol></li>
+<li>Does clustering replicate queue data? What actually replicates?
+  <ol><li><em>Answer pointer:</em> only metadata (exchanges, bindings, users) replicates; classic queue contents live on one node unless mirrored/quorum.</li></ol></li>
+<li>Classic mirrored vs quorum queues — why the shift?
+  <ol><li><em>Answer pointer:</em> mirrored had split-brain/sync-storm bugs; quorum uses Raft majority for correctness and predictable failover.</li></ol></li>
+<li>Explain quorum-queue behaviour under a network partition.
+  <ol><li><em>Answer pointer:</em> majority side stays writable, minority rejects; committed once replicated to a majority of members.</li></ol></li>
+<li>What happens when the memory high-watermark is hit?
+  <ol><li><em>Answer pointer:</em> broker blocks/throttles all publishing connections cluster-wide until memory drops.</li></ol></li>
+<li>How does RabbitMQ apply backpressure to a fast publisher?
+  <ol><li><em>Answer pointer:</em> TCP flow control + credit flow between internal processes + connection blocking at watermarks.</li></ol></li>
+<li>What ordering guarantees can you actually promise?
+  <ol><li><em>Answer pointer:</em> FIFO only with a single queue, single consumer, no requeue and no priority — anything else can reorder.</li></ol></li>
+<li>A queue's backlog is growing but consumers show 100% idle — diagnose.
+  <ol><li><em>Answer pointer:</em> check unacked vs ready, prefetch, blocked connections/alarms, and consumer downstream hangs.</li></ol></li>
+<li>How do you handle a poison message that keeps requeueing?
+  <ol><li><em>Answer pointer:</em> delivery-count cap → DLX; inspect/repair in DLQ; never requeue a deterministic failure.</li></ol></li>
+<li>Your single queue tops out at one core — how do you scale past it?
+  <ol><li><em>Answer pointer:</em> shard with consistent-hash/sharding exchange into N queues across nodes; or use streams.</li></ol></li>
+<li>When would you pick Kafka over RabbitMQ and vice versa?
+  <ol><li><em>Answer pointer:</em> Kafka for replay/retention/huge throughput; Rabbit for routing/per-message control/RPC.</li></ol></li>
+<li>How do lazy queues change memory and latency behaviour?
+  <ol><li><em>Answer pointer:</em> lazy keeps messages on disk always — stable memory, higher per-message latency, no paging spikes.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>After exchanges/routing → they pivot to Kafka:</strong> "How's this different from a Kafka topic?" Angle: smart broker vs dumb broker, per-message routing/ack vs offset-based log, deletion vs retention/replay.</li>
+<li><strong>After acks → delivery semantics:</strong> "At-least-once vs exactly-once?" Angle: Rabbit is at-least-once; exactly-once needs idempotent consumers / dedup keys — the broker can't give true EOS.</li>
+<li><strong>After durability → distributed consensus:</strong> "How does Raft work in quorum queues?" Angle: leader election, log replication, majority commit, term numbers.</li>
+<li><strong>After HA → CAP:</strong> "Where does Rabbit sit on CAP under partition?" Angle: quorum queues favour CP; partition handling modes (pause_minority) trade availability.</li>
+<li><strong>After prefetch → backpressure design:</strong> "How do you stop a fast producer overwhelming slow consumers?" Angle: prefetch, queue length limits, TCP flow control, watermarks, rate limiting upstream.</li>
+<li><strong>After DLX → idempotency & retries:</strong> "How do you make retries safe?" Angle: idempotency keys, dedup store, bounded backoff, poison isolation.</li>
+<li><strong>After scaling → sharding/partitioning:</strong> "How do you keep per-key ordering while sharding?" Angle: consistent-hash exchange on the key so one key always lands on one queue.</li>
+<li><strong>After ordering → outbox pattern:</strong> "How do you publish atomically with a DB commit?" Angle: transactional outbox table + relay, since publish and DB write aren't in one transaction.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Incident 1 — Publishers hang cluster-wide</h3>
+<table>
+<tr><th>Symptoms</th><td>All producing services block on publish; latency spikes; no obvious consumer error.</td></tr>
+<tr><td>Investigation</td><td><code>rabbitmqctl list_alarms</code> shows a memory alarm; one queue has millions of ready messages; a consumer group had crashed.</td></tr>
+<tr><td>Root Cause</td><td>Dead consumers let a non-lazy queue grow past <code>vm_memory_high_watermark</code>; broker blocked every publishing connection.</td></tr>
+<tr><td>Solution</td><td>Restart/scale consumers to drain; temporarily raise watermark to unblock; convert the queue to lazy/quorum and add <code>x-max-length</code> with DLX overflow.</td></tr>
+<tr><td>Prevention</td><td>Alert on ready-message growth and watermark at 0.8×; bound queue length; health-check consumers.</td></tr>
+<tr><td>Interview Answer</td><td>"A stalled consumer let a queue balloon into the memory watermark, which is a cluster-wide publisher block. We drained consumers, capped queue length with DLX overflow, and moved to lazy queues so backlog lives on disk, not RAM."</td></tr>
+</table>
+
+<h3>Incident 2 — Messages silently lost after a broker restart</h3>
+<table>
+<tr><th>Symptoms</th><td>Post-deploy node restart; a batch of orders never processed; no error logged.</td></tr>
+<tr><td>Investigation</td><td>Queue was durable but messages were published with default <code>delivery_mode=1</code> (transient) and no publisher confirms.</td></tr>
+<tr><td>Root Cause</td><td>Transient messages aren't written to disk; the restart dropped everything in RAM, and without confirms publishers thought they succeeded.</td></tr>
+<tr><td>Solution</td><td>Set <code>delivery_mode=2</code>, enable publisher confirms, use a quorum queue; add reconciliation to replay from source-of-truth.</td></tr>
+<tr><td>Prevention</td><td>Enforce the durability triad in a shared library; test with chaos node kills; monitor confirm nacks.</td></tr>
+<tr><td>Interview Answer</td><td>"Classic no-loss trap: durable queue but transient messages and no confirms. Durability needs all three — durable queue, persistent messages, publisher confirms — plus a quorum queue for node loss."</td></tr>
+</table>
+
+<h3>Incident 3 — One consumer hogs, others starve, crash causes redelivery flood</h3>
+<table>
+<tr><th>Symptoms</th><td>Uneven CPU across consumers; when the busy one crashes, thousands of messages redeliver at once.</td></tr>
+<tr><td>Investigation</td><td><code>list_channels</code> shows one channel with a huge <code>messages_unacknowledged</code>; prefetch was unlimited.</td></tr>
+<tr><td>Root Cause</td><td>No <code>basic.qos</code>, so the first consumer buffered the whole queue; on its crash all unacked messages requeued in a burst.</td></tr>
+<tr><td>Solution</td><td>Set prefetch (e.g. 50) so work spreads evenly and crash redelivery is bounded.</td></tr>
+<tr><td>Prevention</td><td>Default prefetch in the client wrapper; alert on skewed per-consumer unacked counts.</td></tr>
+<tr><td>Interview Answer</td><td>"Unbounded prefetch let one consumer grab everything — unfair and a redelivery bomb on crash. Setting prefetch to a small bound fixed distribution and capped the blast radius."</td></tr>
+</table>
+
+<h3>Incident 4 — Poison message pins CPU at 100%</h3>
+<table>
+<tr><th>Symptoms</th><td>One node's CPU saturated; logs show the same message id processed thousands of times; throughput collapses.</td></tr>
+<tr><td>Investigation</td><td>A malformed payload throws in the consumer, which nacks with <code>requeue=true</code>; the broker immediately redelivers, forming a hot loop.</td></tr>
+<tr><td>Root Cause</td><td>Deterministic failure combined with requeue-on-error and no delivery-count cap.</td></tr>
+<tr><td>Solution</td><td>nack with <code>requeue=false</code> to dead-letter; add <code>x-delivery-limit</code> on the quorum queue; inspect/fix in the DLQ.</td></tr>
+<tr><td>Prevention</td><td>Never requeue on a permanent error; always have a DLX + delivery limit; validate payloads early.</td></tr>
+<tr><td>Interview Answer</td><td>"A poison message with requeue-true is an infinite loop. We route permanent failures to a DLX and cap redeliveries with x-delivery-limit so bad messages are quarantined, not looped."</td></tr>
+</table>
+
+<h3>Incident 5 — Split-brain on classic mirrored queues after a partition</h3>
+<table>
+<tr><th>Symptoms</th><td>After a network blip, some acknowledged messages vanished; duplicate processing on both sides.</td></tr>
+<tr><td>Investigation</td><td><code>cluster_status</code> shows a prior partition; mirrored queue had accepted writes on both sides, then discarded one on heal.</td></tr>
+<tr><td>Root Cause</td><td>Classic mirrored queues + <code>ignore</code> partition mode allowed split-brain; the losing side's messages were dropped.</td></tr>
+<tr><td>Solution</td><td>Migrate to quorum queues (Raft majority prevents divergence); set partition handling to <code>pause_minority</code>.</td></tr>
+<tr><td>Prevention</td><td>Odd cluster size, quorum queues everywhere, pause_minority, and alerting on partition events.</td></tr>
+<tr><td>Interview Answer</td><td>"Classic mirrored queues could split-brain under partition and silently drop messages on heal. Quorum queues use Raft so only a majority can commit — no divergence — and pause_minority stops the minority accepting writes."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Why is a channel, not a connection, the unit of concurrency — and why aren't channels thread-safe?</summary><p>A TCP connection is expensive (handshake, FD, heartbeats), so AMQP multiplexes many <strong>channels</strong> over one connection; each channel is a lightweight virtual session with its own frame stream tagged by channel number. Concurrency comes from opening N channels. They aren't thread-safe because the client serialises method+content+body frames per channel; two threads interleaving frames on one channel corrupts the frame sequence (a content header must be followed by its body frames uninterrupted). Rule: one channel per thread/consumer, reuse the connection.</p></details>
+  <details><summary>Explain exactly what publisher confirms guarantee and how to pipeline them without blocking.</summary><p>With confirms enabled (<code>confirm.select</code>), the broker sends <code>basic.ack</code> for a message's <strong>delivery tag</strong> only after it's safely enqueued on <em>all</em> target queues — for persistent messages that means written to disk, for quorum queues replicated to a majority. If it can't, you get <code>basic.nack</code>. For throughput, don't wait synchronously per message; publish continuously, keep an ordered map of outstanding delivery tags, and on ack (with <code>multiple=true</code> meaning "all up to this tag") clear the range. On nack, resend. This gives at-least-once with near-max throughput.</p></details>
+  <details><summary>What are the three things needed for no message loss, and what does each protect against?</summary><p>(1) <strong>Durable queue</strong> — the queue definition survives broker restart. (2) <strong>Persistent message</strong> (<code>delivery_mode=2</code>) — the message body is written to the message store, surviving restart. (3) <strong>Publisher confirms</strong> — the publisher learns the message actually reached durable storage, so it can resend on failure. Miss the queue durability and the queue vanishes; miss persistence and messages evaporate on restart; miss confirms and the publisher can't know a crash swallowed the message. Add a <strong>quorum queue</strong> to survive losing a whole node, and <strong>consumer manual ack</strong> so processing failures don't lose work.</p></details>
+  <details><summary>How does the topic exchange scale binding matching, and what's the cost of a huge binding set?</summary><p>Topic routing keys are dot-delimited words; RabbitMQ builds a <strong>trie</strong> where each edge is a word and special nodes handle <code>*</code> (exactly one word) and <code>#</code> (zero or more words). Matching a routing key walks the trie, so it's roughly O(words) not O(bindings). But a very large or pathological binding set (many <code>#</code> patterns) explodes the match set and memory, and every matching binding means a queue fan-out copy. Keep routing hierarchies shallow and audit bindings; unroutable spikes usually mean a typo'd routing key or a deleted binding.</p></details>
+  <details><summary>Walk through quorum queue mechanics — leader, followers, commit, and failover.</summary><p>A quorum queue is a Raft group across an odd number of members. One member is <strong>leader</strong>; all enqueues/acks go through it. The leader appends the operation to its Raft log (WAL) and replicates to followers; once a <strong>majority</strong> has persisted the entry, it's committed and the leader confirms to the publisher. Followers apply committed entries to their copy of the queue. If the leader dies, followers detect missing heartbeats, start an election with incremented term, and a new leader with the most up-to-date log wins. Because commit requires a majority, a minority partition can't commit — no split-brain, at the cost of ~3x write amplification and no support for some classic features (historically priorities, per-message TTL nuances).</p></details>
+  <details><summary>Prefetch is set to 1 and throughput is terrible — why, and how do you fix it without breaking fairness?</summary><p>With prefetch=1, a consumer can hold only one unacked message; after acking it waits a full network round trip (RTT) before the next delivery arrives. Throughput ≈ 1/RTT — over a 1ms link that's ~1000 msgs/s regardless of CPU. Raise prefetch so several messages are in flight, hiding the RTT: prefetch ≈ processing_rate × RTT. Fairness is preserved as long as prefetch is modest (say 20–100) rather than unbounded, so no single consumer hoards the queue and crash redelivery stays bounded.</p></details>
+  <details><summary>How do you implement retry with exponential backoff purely with RabbitMQ primitives?</summary><p>Two common patterns. (1) <strong>TTL + DLX ladder:</strong> on failure, nack (requeue=false) into a "retry-30s" queue whose <code>x-message-ttl=30000</code> and whose DLX points back at the work exchange; when the TTL expires the message dead-letters back for another attempt. Use several retry queues (30s, 5m, 30m) for increasing backoff, carrying an attempt counter in headers. (2) <strong>Delayed message exchange plugin:</strong> publish with an <code>x-delay</code> header and the exchange holds it that long. Always cap attempts (quorum <code>x-delivery-limit</code> or a header counter) and dead-letter permanently after the cap.</p></details>
+  <details><summary>What happens internally when the memory high-watermark is crossed, and why does it block publishers on OTHER queues too?</summary><p>Each node tracks total memory; when it exceeds <code>vm_memory_high_watermark</code> (fraction of RAM or an absolute value), the node raises a <strong>memory alarm</strong>. RabbitMQ then applies <strong>connection blocking</strong>: it stops reading from the sockets of all connections that have published (sends <code>connection.blocked</code>), which via TCP backpressure stalls those publishers — regardless of which queue they target — because the goal is to stop <em>all</em> new memory pressure until consumers drain enough to clear the alarm. Consumers keep working. This is why one runaway queue can freeze publishing across the whole cluster.</p></details>
+  <details><summary>Describe RabbitMQ's internal flow control between processes (credit flow).</summary><p>Inside the broker, each connection/channel/queue is an Erlang process passing messages. To stop a fast upstream process flooding a slow downstream one, RabbitMQ uses <strong>credit flow</strong>: a sender starts with a credit budget and spends credit per message; the receiver grants more credit as it processes. When credit hits zero the sender blocks, which propagates backward up the chain — eventually to the TCP socket, applying backpressure to the client. This is separate from the coarse memory-alarm blocking and gives smooth, per-path throttling.</p></details>
+  <details><summary>Under exactly what conditions does RabbitMQ preserve message order, and where does it break?</summary><p>Order is guaranteed only within a <strong>single queue</strong> delivered to a <strong>single consumer</strong> with <strong>no requeue</strong> and <strong>no priorities</strong>. It breaks when: (a) multiple consumers on the queue process at different speeds; (b) a message is requeued (it re-enters near the head, jumping ahead of newer ones or being reprocessed after later ones already ran); (c) priority queues reorder by priority; (d) messages are sharded across multiple queues. For per-key ordering at scale, route by a consistent hash so each key maps to one queue, and use one consumer per queue with prefetch discipline.</p></details>
+  <details><summary>Clustering replicates metadata but not queue data — spell out the failure this creates and the fix.</summary><p>In a cluster, exchanges, bindings, vhosts, users (mnesia metadata) are replicated to every node, but a <strong>classic queue lives entirely on the node that declared it</strong>. If that node dies, the queue and its messages are unavailable/lost until the node returns (and transient messages are gone for good). Clients connecting to other nodes get proxied to the home node; if it's down, operations on that queue fail. The fix is <strong>quorum queues</strong> (or, historically, mirrored queues) which replicate the queue contents across members so a node loss doesn't lose the queue.</p></details>
+  <details><summary>How is RabbitMQ fundamentally different from Kafka, beyond "queue vs log"?</summary><p>RabbitMQ is a <strong>smart broker</strong>: it evaluates routing (exchanges/bindings), tracks per-message state (unacked, redelivered), enforces TTL/priority/DLX, and <strong>deletes a message once acked</strong>. Consumers are dumb — they just ack. Kafka is a <strong>dumb broker</strong>: it's an append-only partitioned log that stores everything for a retention window; <strong>consumers are smart</strong> — they track their own offset and can re-read/replay. So Rabbit excels at complex routing + per-message workflow control at moderate throughput; Kafka excels at high-throughput streaming, multiple independent consumer groups, and replay. Rabbit can't replay acked messages; Kafka can't cheaply route one message to a specific worker based on content.</p></details>
+  <details><summary>You need at-most-once, at-least-once, and (as close as possible to) exactly-once — how do you configure each?</summary><p><strong>At-most-once:</strong> autoack (or ack-then-process) — fast, may drop on crash, never duplicates. <strong>At-least-once:</strong> manual ack after successful processing + publisher confirms + persistence — the default safe mode; duplicates possible on redelivery. <strong>Exactly-once:</strong> RabbitMQ has no native EOS; you approximate it with at-least-once plus <strong>idempotent consumers</strong> — carry a unique message/business id, check a dedup store (Redis/DB unique constraint) before applying the effect, so redeliveries are no-ops. True end-to-end EOS also needs idempotent publishing (dedup on producer side).</p></details>
+  <details><summary>Lazy queues vs default queues — what changes and when do you choose lazy?</summary><p>Default (non-lazy) queues keep messages in memory and only <strong>page to disk</strong> under memory pressure, in bursts, which causes latency spikes and can still push the node toward the watermark on deep backlogs. <strong>Lazy queues</strong> write messages to disk as soon as possible and load them to RAM only when about to deliver — memory stays flat and predictable even with millions of messages, at the cost of higher per-message latency (disk read on delivery). Choose lazy for large, bursty, or backlog-prone queues where memory stability matters more than raw latency. Quorum queues behave lazily by design.</p></details>
+  <details><summary>A queue is maxed at one CPU core — architecturally, how do you get past it?</summary><p>Each queue is one Erlang process pinned to one scheduler, so a single queue can't use more than one core for its dispatch/routing. To scale, <strong>partition the stream across many queues</strong>: put a <strong>consistent-hash exchange</strong> (or the sharding plugin) in front, hashing on a partition key so each key deterministically maps to one of N queues, and run a consumer set per queue. Now N queues run on N cores and you keep per-key ordering. Alternatively use <strong>RabbitMQ Streams</strong> for high-throughput append/replay workloads that a classic queue can't sustain.</p></details>
+  <details><summary>What are the security landmines specific to an Erlang-clustered RabbitMQ?</summary><p>The big ones: (1) the <strong>Erlang cookie</strong> — a shared secret in <code>.erlang.cookie</code> that authenticates inter-node distribution; a leaked cookie plus reachable distribution port (25672/4369) equals remote code execution on the node. Firewall those ports to the cluster only. (2) The default <strong>guest/guest</strong> account — works on localhost by default; a misconfigured listener can expose it. (3) The <strong>management UI (15672)</strong> exposed to the internet. (4) No TLS on 5672 leaks credentials/messages. (5) No at-rest encryption — rely on disk encryption. Mitigate with vhost isolation, least-privilege permission regexes, TLS on 5671/15671, and network segmentation.</p></details>
+</div>

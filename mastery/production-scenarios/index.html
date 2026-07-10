@@ -1,0 +1,520 @@
+<h1>Production Scenarios <span class="tag express">Mastery</span></h1>
+<p>This page is a battle-tested incident-response reference: for every failure mode an interviewer can throw at you ("the database is at 100% CPU — what do you do?"), you get the exact symptoms, the exact command to run, the real root cause, the fast mitigation, the durable prevention, and a crisp way to narrate it. The meta-skill under all of it is the same: <strong>stabilize first, diagnose second, root-cause third, prevent fourth</strong> — and always mitigate before you fully understand.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Every incident I run the same loop. <strong>Symptoms</strong> — what's the customer-facing pain and which SLO is burning. <strong>Hypothesize</strong> — what changed (deploy, traffic spike, dependency). <strong>Verify with data</strong> — confirm the hypothesis against metrics, logs, and traces before touching anything. <strong>Mitigate fast</strong> — roll back the last deploy, scale out, shed load, or fail over; restore the customer first even if I don't yet know the root cause. <strong>Root-cause</strong> — blameless 5-whys once the bleeding stops. <strong>Prevent</strong> — a runbook entry, an alert on the leading indicator, and a regression test so it never pages me twice for the same reason."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The full lifecycle an interviewer wants to hear is <strong>detect → triage → mitigate → diagnose → RCA → prevent</strong>:</p>
+<ul>
+<li><strong>Detect:</strong> A page fires from an SLO burn-rate alert (e.g. "2% error budget burned in 1 hour" — a fast-burn multi-window alert), not from a raw threshold. Detection should be on <em>symptoms</em> (elevated error rate / p99 latency), not causes.</li>
+<li><strong>Triage &amp; severity:</strong> Assign a SEV. <strong>SEV1</strong> = major outage / data loss / payments down, all-hands, exec comms. <strong>SEV2</strong> = significant degradation, key feature broken. <strong>SEV3</strong> = minor/partial, single tenant. <strong>SEV4</strong> = cosmetic. Declare the incident, open a channel/bridge, name an <strong>Incident Commander</strong> (drives), a <strong>Comms lead</strong>, and an <strong>Ops/scribe</strong>.</li>
+<li><strong>Mitigate:</strong> Fastest lever wins — <em>roll back</em> the last deploy (usually the cause), <em>scale out</em> replicas, <em>shed load</em> (rate-limit / drop non-critical traffic), <em>fail over</em> to a healthy replica/region, flip a <em>feature flag</em>. Time-to-mitigate matters more than elegance.</li>
+<li><strong>Diagnose:</strong> Use the <strong>four golden signals</strong> — latency, traffic, errors, saturation — plus the RED (Rate/Errors/Duration) and USE (Utilization/Saturation/Errors) methods. Metrics tell you <em>where</em>, traces tell you <em>which hop</em>, logs tell you <em>why</em>.</li>
+<li><strong>RCA:</strong> Blameless post-mortem, <strong>5 whys</strong>, timeline with UTC timestamps, contributing factors, and action items with owners and due dates.</li>
+<li><strong>Prevent:</strong> Runbook, alert on the leading indicator, chaos/load test, and a guardrail (constraint, circuit breaker, quota).</li>
+</ul>
+<div class="callout warn"><strong>Watch out:</strong> Don't diagnose before you mitigate. Interviewers love the candidate who says "I'd roll back first and investigate from logs afterward" over the one who wants to attach a debugger to prod while customers are down.</div>
+
+<h2>The First 5 Minutes</h2>
+<p>A concrete on-call playbook the moment the pager goes off:</p>
+<ol>
+<li><strong>0:00 — Ack the page.</strong> Silence the alarm so it stops re-paging. Read the alert: which SLO, what threshold, which service.</li>
+<li><strong>0:30 — Open the service dashboard.</strong> Look at the four golden signals for the last 1h and 24h. Is it errors, latency, or saturation? Is it one endpoint or all?</li>
+<li><strong>1:00 — "What changed?"</strong> Check the deploy timeline. <code>kubectl rollout history deploy/api</code>, the CI/CD dashboard, feature-flag changes, config/infra changes, and any dependency's status page. 70%+ of incidents correlate with a recent change.</li>
+<li><strong>2:00 — Decide: mitigate now.</strong> If a deploy correlates, roll it back: <code>kubectl rollout undo deploy/api</code> or flip the flag off. Don't wait for full understanding.</li>
+<li><strong>3:00 — Declare if needed.</strong> If customer impact is real and mitigation isn't instant, declare a SEV, open the incident channel, and post the first status: "Investigating elevated 5xx on checkout, started 14:32 UTC, IC is me."</li>
+<li><strong>4:00 — Comms cadence.</strong> Post updates every 15-30 min even if "still investigating." Internal stakeholders + status page for customers. Silence during an incident is the real failure.</li>
+</ol>
+<div class="callout tip"><strong>Say this:</strong> "My first question is always 'what changed in the last hour?' — deploy, flag, config, traffic, or a dependency. Then I mitigate against that hypothesis before I fully diagnose."</div>
+
+<h2>Golden Signals &amp; Where to Look</h2>
+<p>The four golden signals (Google SRE) and the tool I reach for each:</p>
+<table>
+<tr><th>Signal</th><th>What it tells you</th><th>Key metric</th><th>Tool</th></tr>
+<tr><td>Latency</td><td>How slow — split success vs error latency</td><td>p50/p95/p99 request duration</td><td>Prometheus histograms + Grafana, distributed traces (Jaeger/Tempo)</td></tr>
+<tr><td>Traffic</td><td>How much demand</td><td>requests/sec, QPS per endpoint</td><td>Prometheus <code>rate(http_requests_total[1m])</code></td></tr>
+<tr><td>Errors</td><td>Rate of failure, explicit + implicit</td><td>5xx rate, error ratio</td><td>Grafana error panel, log aggregation (Loki/ELK/Datadog)</td></tr>
+<tr><td>Saturation</td><td>How full the system is</td><td>CPU %, memory %, connection pool used, queue depth, event-loop lag</td><td><code>top</code>/<code>htop</code>, node_exporter, cAdvisor, DB pool metrics</td></tr>
+</table>
+<p><strong>RED</strong> (Rate, Errors, Duration) for request-driven services; <strong>USE</strong> (Utilization, Saturation, Errors) for resources like DB/disk/CPU. Start at the edge (load balancer 5xx), then walk inward with traces to find the slow/failing hop, then open logs on that hop.</p>
+
+<h2>Database Incidents</h2>
+
+<h3>Database CPU reaches 100%</h3>
+<table>
+<tr><th>Symptoms</th><td>API p99 latency spikes, query timeouts, connection pool waits, error rate climbing. DB host CPU pinned at 100%.</td></tr>
+<tr><th>Investigation</th><td>Postgres: <code>SELECT pid, now()-query_start AS dur, state, query FROM pg_stat_activity WHERE state!='idle' ORDER BY dur DESC;</code> and <code>pg_stat_statements</code> ordered by <code>total_exec_time</code>. MySQL: <code>SHOW FULL PROCESSLIST;</code>, <code>pt-query-digest</code> on the slow log, <code>SHOW ENGINE INNODB STATUS</code>. On the host: <code>top</code> to confirm it's the DB process, not a neighbor. Run <code>EXPLAIN ANALYZE</code> on the top offender.</td></tr>
+<tr><th>Root Cause</th><td>Usually a missing index causing a sequential scan on a large table, a bad plan after stats went stale, a new N+1 from a recent deploy, or a runaway analytics query on the primary. Sometimes a lock storm / autovacuum contention.</td></tr>
+<tr><th>Solution</th><td>Kill the runaway: <code>SELECT pg_terminate_backend(pid);</code>. Add the missing index (<code>CREATE INDEX CONCURRENTLY</code> in Postgres to avoid a table lock). Roll back the offending deploy. If a report is hammering the primary, move it to a read replica. Short term: scale up the instance / add read replicas.</td></tr>
+<tr><th>Prevention</th><td>Slow-query alerts (queries &gt; 500ms), <code>pg_stat_statements</code> in CI perf tests, index review on new queries, mandatory <code>EXPLAIN</code> on migrations, separate OLAP replica, statement timeout (<code>statement_timeout=5s</code>).</td></tr>
+<tr><th>Interview Answer</th><td>"First I confirm it's the DB and not a noisy neighbor with <code>top</code>. Then <code>pg_stat_activity</code> ordered by duration to find the hog, <code>EXPLAIN ANALYZE</code> to see the seq scan. I kill the query to restore service, add a concurrent index or route reports to a replica, then add a slow-query alert so it's caught in staging next time."</td></tr>
+</table>
+
+<h3>Dashboard query taking 30 seconds</h3>
+<table>
+<tr><th>Symptoms</th><td>One analytics/dashboard endpoint is slow while the rest of the app is fine. Gateway 504s on that route.</td></tr>
+<tr><th>Investigation</th><td><code>EXPLAIN (ANALYZE, BUFFERS)</code> — look for <em>Seq Scan</em>, huge <em>rows removed by filter</em>, nested loops over millions of rows, or a sort spilling to disk (<code>external merge Disk</code>). Check if it aggregates over unbounded date ranges.</td></tr>
+<tr><th>Root Cause</th><td>Aggregation over raw rows with no covering index, no date-range bound, or joins producing a cross-product. Real-time GROUP BY over months of events.</td></tr>
+<tr><th>Solution</th><td>Add composite/covering index on the filter+sort columns; pre-aggregate into a materialized view or rollup table refreshed on a schedule; paginate; cap the date range. Cache the result in Redis with a short TTL.</td></tr>
+<tr><th>Prevention</th><td>Materialized views / summary tables for dashboards, query budget per endpoint, async report generation for heavy exports.</td></tr>
+<tr><th>Interview Answer</th><td>"Dashboards should never run a live aggregate over raw event tables. I'd EXPLAIN it, confirm the seq scan, then move it to a materialized rollup refreshed every few minutes and cache the response — turning 30s into single-digit ms."</td></tr>
+</table>
+
+<h3>Connection pool exhausted</h3>
+<table>
+<tr><th>Symptoms</th><td>Errors like <code>timeout acquiring a connection from the pool</code> / <code>remaining connection slots are reserved</code>. Requests queue and time out even though DB CPU is low.</td></tr>
+<tr><th>Investigation</th><td>Compare app pool size × replica count vs DB <code>max_connections</code>. Postgres: <code>SELECT count(*), state FROM pg_stat_activity GROUP BY state;</code> — lots of <code>idle in transaction</code> is the smoking gun. Check for a leaked connection (missing release in a code path) or long transactions holding connections.</td></tr>
+<tr><th>Root Cause</th><td>Pool too small for load, connections leaked (not released on error paths), <code>idle in transaction</code> holding connections, or too many app replicas × pool size overwhelming the DB. A slow query holding connections longer under load = cascading exhaustion.</td></tr>
+<tr><th>Solution</th><td>Immediate: bounce the app to reset the pool, kill idle-in-transaction sessions. Add <strong>PgBouncer</strong> (transaction pooling) so many app connections share few DB connections. Set <code>idle_in_transaction_session_timeout</code>. Fix the leak. Right-size the pool (total connections ≤ DB max with headroom).</td></tr>
+<tr><th>Prevention</th><td>Metric + alert on pool utilization &gt; 80%; connection lifetime cap; PgBouncer in front; ensure every acquire has a finally-release; statement timeout.</td></tr>
+<tr><th>Interview Answer</th><td>"Pool exhaustion with low DB CPU means connections are held, not busy — usually idle-in-transaction or a leak. I check pg_stat_activity by state, kill the idle transactions, and put PgBouncer in front so app-side pool size decouples from DB max_connections."</td></tr>
+</table>
+
+<h3>Replication lag</h3>
+<table>
+<tr><th>Symptoms</th><td>Reads return stale data ("I updated my profile but it shows the old one"), read replicas fall behind. In queues, downstream sees old state.</td></tr>
+<tr><th>Investigation</th><td>Postgres: <code>SELECT now()-pg_last_xact_replay_timestamp() AS lag;</code> or compare <code>pg_current_wal_lsn()</code> vs <code>pg_last_wal_replay_lsn()</code>. MySQL: <code>SHOW SLAVE STATUS\G</code> → <code>Seconds_Behind_Master</code>. Check replica CPU/IO and long-running queries blocking WAL replay on the replica.</td></tr>
+<tr><th>Root Cause</th><td>Write burst outpacing replica apply, a big batch/migration flooding WAL, replica underpowered, or a long read query on the replica blocking replay (Postgres single-threaded replay conflict).</td></tr>
+<tr><th>Solution</th><td>Route critical reads to the primary temporarily (read-your-writes), throttle the write batch, scale up the replica, kill blocking queries on the replica. For consistency-sensitive reads, use "read from primary within N seconds of a write."</td></tr>
+<tr><th>Prevention</th><td>Alert on lag &gt; 5-10s; batch writes in chunks; monotonic-read / sticky routing after writes; separate replicas for heavy reporting.</td></tr>
+<tr><th>Interview Answer</th><td>"I measure lag directly with pg_last_xact_replay_timestamp. If it's a write burst, I throttle the batch; if it's a blocking read on the replica, I kill it. For correctness I route read-your-writes traffic to the primary for a short window after each write."</td></tr>
+</table>
+
+<h3>MongoDB primary crashes</h3>
+<table>
+<tr><th>Symptoms</th><td>Writes fail with <code>not master</code> / <code>NotWritablePrimary</code> for a few seconds, brief write unavailability, then recovery.</td></tr>
+<tr><th>Investigation</th><td><code>rs.status()</code> to see member states and who's PRIMARY now; <code>rs.printReplicationInfo()</code> for oplog window; check <code>mongod</code> logs for the crash cause (OOM, disk full, segfault). Confirm the driver reconnected.</td></tr>
+<tr><th>Root Cause</th><td>Host OOM (WiredTiger cache too large), disk full, hardware failure, or a network partition. Election takes a few seconds during which writes to the old primary fail.</td></tr>
+<tr><th>Solution</th><td>Replica set auto-elects a new primary (needs majority). Ensure the app uses <code>retryWrites=true</code> and <code>w:majority</code> so a single failover is transparent. Fix the crashed node's root cause and rejoin. Restore the failed member from a healthy secondary if data is corrupt.</td></tr>
+<tr><th>Prevention</th><td>Odd number of voting members (3/5), an arbiter or hidden member for quorum, <code>retryWrites</code>, memory limits sized below host RAM, disk-usage alerts, oplog window &gt; peak downtime.</td></tr>
+<tr><th>Interview Answer</th><td>"A single primary crash should be a non-event: with a 3-node replica set, retryWrites=true, and w:majority, the driver retries the write against the newly elected primary. My job is to fix the crashed node's root cause — usually OOM or disk — and rejoin it."</td></tr>
+</table>
+
+<h3>Replica-set election / failover</h3>
+<table>
+<tr><th>Symptoms</th><td>Elevated write errors during a ~2-12s window, temporary read-preference confusion, apps logging "topology changed."</td></tr>
+<tr><th>Investigation</th><td><code>rs.status()</code> during/after; check for repeated elections (flapping) — a sign of network instability or an overloaded primary failing heartbeats. Review <code>electionMetrics</code>.</td></tr>
+<tr><th>Root Cause</th><td>Primary lost majority heartbeat (network blip, GC/IO pause, CPU saturation), or planned maintenance stepdown. Flapping = heartbeat timeouts too tight or a struggling node.</td></tr>
+<tr><th>Solution</th><td>Let the election complete; ensure clients use majority write concern + retryable writes. For flapping, isolate the unhealthy member (<code>rs.freeze()</code>), fix the network/resource issue, tune <code>settings.electionTimeoutMillis</code> if truly needed.</td></tr>
+<tr><th>Prevention</th><td>Deploy members across AZs, stable low-latency links, priority settings to prefer a strong node, avoid arbiters in split-brain-prone topologies, monitor election count.</td></tr>
+<tr><th>Interview Answer</th><td>"An election is expected during failover; the concern is <em>repeated</em> elections. I look at rs.status for flapping, which almost always traces to network latency between AZs or a resource-starved primary missing heartbeats, and I stabilize that node."</td></tr>
+</table>
+
+<h2>Cache Incidents</h2>
+
+<h3>Redis memory full (OOM / eviction)</h3>
+<table>
+<tr><th>Symptoms</th><td><code>OOM command not allowed when used memory &gt; 'maxmemory'</code> on writes, sudden cache-miss surge, DB load spikes as cache stops absorbing reads.</td></tr>
+<tr><th>Investigation</th><td><code>redis-cli INFO memory</code> → <code>used_memory</code>, <code>maxmemory</code>, <code>evicted_keys</code>, <code>mem_fragmentation_ratio</code>. <code>redis-cli --bigkeys</code> to find memory hogs. <code>INFO keyspace</code> to see keys without TTL. Check the <code>maxmemory-policy</code>.</td></tr>
+<tr><th>Root Cause</th><td>No TTLs so keys accumulate forever, a few giant keys (a 2GB list/hash), fragmentation, or genuine growth past capacity. Policy set to <code>noeviction</code> so writes fail instead of evicting.</td></tr>
+<tr><th>Solution</th><td>Set <code>maxmemory-policy allkeys-lru</code> (or <code>volatile-lru</code>) so it evicts instead of erroring; add TTLs to cache keys; split/expire big keys; scale memory or shard. Flush cold data. Check fragmentation and consider <code>activedefrag</code>.</td></tr>
+<tr><th>Prevention</th><td>Every cache key gets a TTL; alert on <code>used_memory</code> &gt; 80% of maxmemory and on <code>evicted_keys</code> rate; ban unbounded keys; capacity planning; separate cache from any persistence use-case.</td></tr>
+<tr><th>Interview Answer</th><td>"OOM on writes usually means noeviction plus keys with no TTL. I set allkeys-lru so it evicts gracefully, run --bigkeys to find the whale keys, and enforce TTLs. Long term I alert on used_memory percentage, not just OOM errors."</td></tr>
+</table>
+
+<h3>Redis cache stampede (thundering herd)</h3>
+<table>
+<tr><th>Symptoms</th><td>A popular key expires and thousands of concurrent requests all miss and hit the DB simultaneously — DB CPU spikes to 100%, latency cliff, sometimes a full outage.</td></tr>
+<tr><th>Investigation</th><td>Correlate a DB load spike with a cache-miss spike at a round TTL boundary. Traces show many requests running the same expensive query at the same millisecond.</td></tr>
+<tr><th>Root Cause</th><td>Many keys share the same TTL and expire together, or one hot key expires with no coordination, so every request recomputes it.</td></tr>
+<tr><th>Solution</th><td><strong>Single-flight / mutex:</strong> first miss takes a short <code>SET key lock NX PX 5000</code> lock and recomputes; others wait or serve stale. <strong>TTL jitter:</strong> add ±10% randomness so keys don't expire in lockstep. <strong>Stale-while-revalidate:</strong> serve the old value while one worker refreshes. Pre-warm hot keys.</td></tr>
+<tr><th>Prevention</th><td>Randomized TTLs, per-key recompute lock, request coalescing at the app layer, background refresh for known-hot keys.</td></tr>
+<tr><th>Interview Answer</th><td>"Stampede is a coordination problem: N requests recomputing the same expired key. I fix it three ways — TTL jitter so they don't expire together, a single-flight lock via SET NX so only one request recomputes, and stale-while-revalidate so the rest serve slightly-old data instead of hammering the DB."</td></tr>
+</table>
+
+<h3>Hot key</h3>
+<table>
+<tr><th>Symptoms</th><td>One Redis shard/node is CPU-pinned while others idle; latency on operations touching one key (e.g. a celebrity's profile, a flash-sale product counter).</td></tr>
+<tr><th>Investigation</th><td><code>redis-cli --hotkeys</code> (needs LFU), <code>MONITOR</code> briefly to spot a dominating key, per-shard CPU from <code>INFO</code>. Look for a single key with millions of ops/sec.</td></tr>
+<tr><th>Root Cause</th><td>Access skew — one key far hotter than the keyspace, so consistent hashing can't spread the load; that key's single shard is the bottleneck.</td></tr>
+<tr><th>Solution</th><td>Replicate the hot key across N copies (<code>key#1..key#N</code>) and read a random one; add a local in-process cache (L1) in front of Redis (L2) for that key; use client-side caching. For counters, shard the counter and sum.</td></tr>
+<tr><th>Prevention</th><td>Detect skew via key-access metrics, design for known hot entities (celebrities, flash sales) with local caching and key fan-out from day one.</td></tr>
+<tr><th>Interview Answer</th><td>"A hot key defeats sharding because it all lands on one node. I fan it out into N replica keys and read a random one, and I add a short-lived in-process L1 cache so the hottest reads never even reach Redis."</td></tr>
+</table>
+
+<h3>Cache-DB inconsistency</h3>
+<table>
+<tr><th>Symptoms</th><td>Users see stale data after an update; cache and DB disagree; the wrong value persists until TTL.</td></tr>
+<tr><th>Investigation</th><td>Trace a write path: did it update DB then cache, or cache then DB? Look for a race where a concurrent read repopulates a just-deleted key with the old value.</td></tr>
+<tr><th>Root Cause</th><td>Write-through/write-behind race, or the classic cache-aside race: reader misses, fetches old DB value, and writes it to cache <em>after</em> the writer's invalidation. Dual-write with no ordering guarantee.</td></tr>
+<tr><th>Solution</th><td>Prefer <strong>cache-aside with invalidate-on-write</strong> (delete the key, don't update it) so the next read repopulates fresh. Use short TTLs as a safety net. For strict cases, delayed double-delete (delete, write DB, delete again after a short delay), or drive invalidation off the DB change stream / CDC (Debezium).</td></tr>
+<tr><th>Prevention</th><td>Single source of truth = DB; cache is disposable; never dual-write two systems as if atomic; TTL bounds staleness; CDC-based invalidation for correctness-critical data.</td></tr>
+<tr><th>Interview Answer</th><td>"I invalidate rather than update the cache on writes, and keep a short TTL as a backstop. The subtle bug is the read-repopulate race — I handle it with delayed double-delete or by driving invalidations off the DB's change stream so ordering is guaranteed."</td></tr>
+</table>
+
+<h2>Messaging &amp; Streaming Incidents</h2>
+
+<h3>RabbitMQ consumer stuck</h3>
+<table>
+<tr><th>Symptoms</th><td>Queue depth climbing, <code>messages_unacknowledged</code> high and not draining, consumers "connected" but not processing.</td></tr>
+<tr><th>Investigation</th><td><code>rabbitmqctl list_queues name messages messages_unacknowledged consumers</code>; check <code>consumer_utilisation</code> in the management UI. Thread dump / event-loop check on the consumer — is it blocked on a downstream call or deadlocked? Is prefetch too high so one consumer grabbed everything?</td></tr>
+<tr><th>Root Cause</th><td>Consumer blocked on a slow/hung downstream (DB, HTTP), a poison message it keeps failing on, prefetch (<code>QoS</code>) too large so unacked messages pile on one consumer, or it crashed without closing the channel.</td></tr>
+<tr><th>Solution</th><td>Restart/scale consumers; lower prefetch (<code>basic.qos prefetch=10-50</code>); add a dead-letter exchange so poison messages don't block the queue; add per-message timeout + nack-with-requeue-limit. Fix the blocked downstream.</td></tr>
+<tr><th>Prevention</th><td>DLQ with max-retries, sane prefetch, consumer heartbeats, ack only after successful processing, idempotent handlers, alert on unacked count and consumer_utilisation.</td></tr>
+<tr><th>Interview Answer</th><td>"Stuck consumer = messages delivered-unacked but not progressing. I check consumer_utilisation and prefetch. Usually it's a blocked downstream or a poison message. I add a DLQ so poison messages route out instead of blocking, and cap prefetch so work spreads."</td></tr>
+</table>
+
+<h3>Queue backlog growing</h3>
+<table>
+<tr><th>Symptoms</th><td>Queue depth rising steadily, end-to-end processing latency growing, SLA for async jobs breached.</td></tr>
+<tr><th>Investigation</th><td>Compare produce rate vs consume rate (both as msgs/sec). Is production spiking or consumption dropping? Check consumer CPU, downstream latency, and errors causing requeues.</td></tr>
+<tr><th>Root Cause</th><td>Producers outpacing consumers — traffic spike, a slow downstream throttling consumers, or consumers scaled too low. Requeue loops artificially inflating both rates.</td></tr>
+<tr><th>Solution</th><td>Scale consumers horizontally (add pods / partitions); optimize the handler; batch downstream calls; apply backpressure / rate-limit producers; shed low-priority messages. Autoscale on queue depth (KEDA).</td></tr>
+<tr><th>Prevention</th><td>KEDA/HPA autoscaling keyed on queue length, capacity headroom, priority queues, backpressure at producers, alert on backlog growth rate (derivative), not just absolute depth.</td></tr>
+<tr><th>Interview Answer</th><td>"I compare produce vs consume rate — a growing backlog is just produce &gt; consume. Fastest lever is scaling consumers (autoscale on queue depth with KEDA); if the downstream is the limiter I batch calls or shed low-priority work."</td></tr>
+</table>
+
+<h3>Message duplication</h3>
+<table>
+<tr><th>Symptoms</th><td>The same side effect happens twice — two emails, two charges, two inventory decrements.</td></tr>
+<tr><th>Investigation</th><td>Trace message IDs — same logical event processed twice. Check whether the consumer acks before or after processing, and whether a redelivery happened after a consumer crash.</td></tr>
+<tr><th>Root Cause</th><td>At-least-once delivery is the norm: a consumer processes, crashes before ack, and the broker redelivers. Retries and rebalances also cause redelivery. There is no true exactly-once across a network without idempotency.</td></tr>
+<tr><th>Solution</th><td>Make handlers <strong>idempotent</strong>: dedupe on a message/business key stored in a <code>processed_messages</code> table with a UNIQUE constraint, or use an idempotency key. For Kafka, enable the idempotent producer + transactions for exactly-once <em>within</em> the pipeline, but the consumer side still needs dedupe.</td></tr>
+<tr><th>Prevention</th><td>Design every consumer to be idempotent from day one; unique constraints on effect tables; store processed offsets/keys; treat exactly-once as "at-least-once + idempotent."</td></tr>
+<tr><th>Interview Answer</th><td>"I never rely on exactly-once delivery — I design idempotent consumers. Each message carries a key I record in a table with a unique constraint; a duplicate hits the constraint and I skip the side effect. That's how you make at-least-once safe."</td></tr>
+</table>
+
+<h3>Kafka consumer lag</h3>
+<table>
+<tr><th>Symptoms</th><td>Consumer group lag (latest offset − committed offset) growing per partition; real-time features fall behind; downstream data stale by minutes/hours.</td></tr>
+<tr><th>Investigation</th><td><code>kafka-consumer-groups.sh --describe --group g</code> → LAG per partition. Is lag on all partitions (undersized group) or one (skewed key / one slow consumer)? Check consumer processing time, GC pauses, rebalance storms, and downstream latency.</td></tr>
+<tr><th>Root Cause</th><td>Consumers &lt; partitions or too slow; hot partition from a bad partition key; frequent rebalances (long <code>max.poll.interval</code> processing) resetting progress; downstream (DB) throttling the handler.</td></tr>
+<tr><th>Solution</th><td>Add consumers up to the partition count; increase partitions if you need more parallelism; batch/pipeline downstream writes; tune <code>max.poll.records</code> and <code>max.poll.interval.ms</code>; fix the partition key to spread load; move heavy work off the poll thread.</td></tr>
+<tr><th>Prevention</th><td>Partition count ≥ target parallelism, even key distribution, alert on lag and lag-growth-rate (Burrow / kafka-exporter), idempotent processing so you can reset offsets safely, autoscale consumers.</td></tr>
+<tr><th>Interview Answer</th><td>"I describe the consumer group to see if lag is uniform or on one partition. Uniform means I'm consumer-bound — add consumers up to partition count. One partition means a hot key. I also check for rebalance storms from slow processing exceeding max.poll.interval, which silently resets progress."</td></tr>
+</table>
+
+<h2>Kubernetes &amp; Infra Incidents</h2>
+
+<h3>CrashLoopBackOff</h3>
+<table>
+<tr><th>Symptoms</th><td>Pod restarts repeatedly; <code>kubectl get pods</code> shows <code>CrashLoopBackOff</code> with rising restart count; backoff delay grows to 5min.</td></tr>
+<tr><th>Investigation</th><td><code>kubectl describe pod X</code> (events, last state, exit code), <code>kubectl logs X --previous</code> (logs from the crashed container — the key command), <code>kubectl get events --sort-by=.lastTimestamp</code>. Exit code 1 = app error, 137 = SIGKILL/OOM, 143 = SIGTERM.</td></tr>
+<tr><th>Root Cause</th><td>App throws on startup (bad config/secret, missing env var, unreachable dependency), failing liveness probe (too aggressive), OOMKilled, or a bad image. Migration failing on boot.</td></tr>
+<tr><th>Solution</th><td>Read <code>--previous</code> logs → fix the actual error (config/secret/dependency). If liveness probe is too strict, relax <code>initialDelaySeconds</code>/<code>failureThreshold</code> or add a startup probe. Roll back the image: <code>kubectl rollout undo deploy/X</code>.</td></tr>
+<tr><th>Prevention</th><td>Readiness/startup probes separate from liveness, validate config at deploy time, canary/staged rollout, resource requests/limits set correctly, health check that reflects real readiness.</td></tr>
+<tr><th>Interview Answer</th><td>"First command is always <code>kubectl logs --previous</code> plus <code>describe</code> for the exit code. 137 tells me OOM, 1 tells me an app-level startup error — usually a missing secret or a dependency it can't reach. I roll back the image to stop the loop, then fix root cause."</td></tr>
+</table>
+
+<h3>OOMKilled</h3>
+<table>
+<tr><th>Symptoms</th><td>Container killed with exit code 137, <code>Reason: OOMKilled</code> in <code>describe</code>, periodic restarts under load.</td></tr>
+<tr><th>Investigation</th><td><code>kubectl describe pod</code> → Last State OOMKilled. Compare memory <code>limits</code> vs actual usage (<code>kubectl top pod</code>, cAdvisor/Grafana). Is it a slow leak (sawtooth trending up) or a spike from a big request/batch?</td></tr>
+<tr><th>Root Cause</th><td>Memory limit too low for real working set, a memory leak, an unbounded in-memory buffer (loading a huge query result / file into RAM), or JVM/Node heap not aware of cgroup limit.</td></tr>
+<tr><th>Solution</th><td>Raise the limit if it's genuinely undersized; fix the leak (heap snapshot); stream instead of buffering large payloads; set runtime heap to respect the container limit (Node: <code>--max-old-space-size</code>; JVM: <code>-XX:MaxRAMPercentage</code>). Add requests=limits for guaranteed QoS on critical pods.</td></tr>
+<tr><th>Prevention</th><td>Right-size from real usage + headroom, alert on memory &gt; 80% of limit, leak tests, stream large data, set heap flags to the cgroup limit.</td></tr>
+<tr><th>Interview Answer</th><td>"137 with OOMKilled means working set exceeded the limit. I check the memory graph — a rising sawtooth is a leak (I take a heap snapshot), a spike is an unbounded buffer (I stream instead). I also make sure the runtime heap is capped to the cgroup limit, or it'll OOM before GC kicks in."</td></tr>
+</table>
+
+<h3>Kubernetes PVC stuck Pending</h3>
+<table>
+<tr><th>Symptoms</th><td>Pod stuck <code>Pending</code>; <code>kubectl get pvc</code> shows <code>Pending</code>; events say "waiting for a volume to be created" or "no persistent volumes available."</td></tr>
+<tr><th>Investigation</th><td><code>kubectl describe pvc X</code> and <code>describe pod</code> events; check the StorageClass exists and matches (<code>kubectl get storageclass</code>); check the CSI provisioner pod is healthy; verify the requested AZ has capacity and the access mode (RWO vs RWX) is supported.</td></tr>
+<tr><th>Root Cause</th><td>No/incorrect StorageClass, CSI driver down, cloud quota exhausted, AZ mismatch (volume in AZ-a, pod scheduled to AZ-b), or requesting RWX on a driver that only supports RWO.</td></tr>
+<tr><th>Solution</th><td>Set the right StorageClass / mark one default; restart/fix the CSI provisioner; request quota increase; use topology-aware provisioning so volume and pod land in the same AZ; use an RWX-capable backend (EFS/NFS) if multi-attach is needed.</td></tr>
+<tr><th>Prevention</th><td>Default StorageClass configured, CSI health alerts, quota monitoring, topology-aware volume binding (<code>volumeBindingMode: WaitForFirstConsumer</code>).</td></tr>
+<tr><th>Interview Answer</th><td>"Pending PVC is almost always provisioning: I describe the PVC for the event. Common causes are a missing StorageClass, a dead CSI driver, quota, or an AZ mismatch. WaitForFirstConsumer binding avoids the AZ trap by provisioning after the pod is scheduled."</td></tr>
+</table>
+
+<h3>Node NotReady</h3>
+<table>
+<tr><th>Symptoms</th><td><code>kubectl get nodes</code> shows a node <code>NotReady</code>; pods on it go <code>Unknown</code>/<code>Terminating</code>; after ~5min they reschedule elsewhere.</td></tr>
+<tr><th>Investigation</th><td><code>kubectl describe node X</code> → conditions (MemoryPressure, DiskPressure, PIDPressure, kubelet Ready). SSH: is <code>kubelet</code> running? <code>systemctl status kubelet</code>, <code>journalctl -u kubelet</code>. Check disk full (<code>df -h</code>), network to control plane, and the container runtime.</td></tr>
+<tr><th>Root Cause</th><td>Kubelet crashed/hung, node out of disk (image/log buildup), network partition from control plane, container runtime down, or the underlying VM is unhealthy.</td></tr>
+<tr><th>Solution</th><td>Cordon + drain (<code>kubectl drain X --ignore-daemonsets --delete-emptydir-data</code>) so workloads move; restart kubelet/runtime; clear disk (prune images/logs); if the VM is dead, terminate it and let autoscaler replace it.</td></tr>
+<tr><th>Prevention</th><td>Node disk/pressure alerts, log rotation + image GC, cluster autoscaler to replace bad nodes, spread replicas across nodes/AZs with anti-affinity + PodDisruptionBudgets.</td></tr>
+<tr><th>Interview Answer</th><td>"NotReady means the control plane stopped hearing from the kubelet. I describe the node for pressure conditions — DiskPressure from log/image buildup is common — then drain it so pods reschedule, and either fix the kubelet/disk or replace the VM via the autoscaler."</td></tr>
+</table>
+
+<h3>Load Balancer health check failing</h3>
+<table>
+<tr><th>Symptoms</th><td>Targets marked unhealthy, LB returns 503, traffic drops even though pods "look up." Sometimes flapping in/out of service.</td></tr>
+<tr><th>Investigation</th><td>Check the target-group health status and the exact health-check path/port/expected-code. <code>curl</code> the health endpoint from inside the cluster and from the LB's perspective. Compare readiness probe vs LB health check config. Check security-group/NACL/firewall between LB and targets.</td></tr>
+<tr><th>Root Cause</th><td>Health path returns non-2xx (dependency check failing), wrong port/path, timeout too tight for a slow /health, security group blocking the LB, or app not bound to <code>0.0.0.0</code>. A "deep" health check that fails when a non-critical dependency is down.</td></tr>
+<tr><th>Solution</th><td>Fix the health endpoint to reflect real serving readiness (shallow liveness vs deep readiness); align path/port/expected-code/timeout; open the security group; bind correctly. Increase healthy/unhealthy thresholds to stop flapping.</td></tr>
+<tr><th>Prevention</th><td>Separate liveness (am I up) from readiness (can I serve); don't fail health checks on non-critical deps; alert on unhealthy target count; test health checks in staging.</td></tr>
+<tr><th>Interview Answer</th><td>"I curl the exact health path/port the LB uses. The classic bug is a 'deep' health check that returns 500 when a non-critical dependency blips, so the LB pulls every target and you get a self-inflicted outage. Health checks should reflect <em>can I serve traffic</em>, not <em>is every dependency perfect</em>."</td></tr>
+</table>
+
+<h2>Network &amp; TLS Incidents</h2>
+
+<h3>DNS resolution failure</h3>
+<table>
+<tr><th>Symptoms</th><td><code>getaddrinfo ENOTFOUND</code> / <code>Name or service not known</code>, intermittent connection failures, in-cluster service discovery breaking.</td></tr>
+<tr><th>Investigation</th><td><code>dig svc.namespace.svc.cluster.local</code> / <code>nslookup</code>; in k8s check CoreDNS pods (<code>kubectl -n kube-system get pods -l k8s-app=kube-dns</code>) and their logs; check <code>/etc/resolv.conf</code> ndots setting; test from inside a pod (<code>kubectl run -it --rm debug --image=busybox -- nslookup</code>). Watch for CoreDNS CPU throttling / query flood.</td></tr>
+<tr><th>Root Cause</th><td>CoreDNS overloaded or crashing, misconfigured upstream resolver, <code>ndots:5</code> causing search-domain amplification (5 lookups per external name), TTL/cache issues, or an actual DNS provider outage.</td></tr>
+<tr><th>Solution</th><td>Scale/restart CoreDNS; add NodeLocal DNSCache; set <code>ndots:1</code> or use FQDNs with trailing dot for external hosts; increase cache TTL; fix upstream resolver. For provider outage, fail over to secondary DNS.</td></tr>
+<tr><th>Prevention</th><td>NodeLocal DNSCache, CoreDNS autoscaling + alerts on query errors/latency, low ndots, health checks that don't spam DNS, multi-provider DNS.</td></tr>
+<tr><th>Interview Answer</th><td>"I confirm with dig from inside a pod, then check CoreDNS health. In Kubernetes the sneaky one is ndots:5 turning one external lookup into five, overloading DNS — I fix it with NodeLocal DNSCache and FQDNs, which usually collapses the problem."</td></tr>
+</table>
+
+<h3>TLS handshake failure</h3>
+<table>
+<tr><th>Symptoms</th><td><code>SSL_ERROR</code> / <code>certificate has expired</code> / <code>unable to verify the first certificate</code> / <code>handshake failure</code>; clients can't connect, mobile apps break.</td></tr>
+<tr><th>Investigation</th><td><code>openssl s_client -connect host:443 -servername host</code> → inspect the cert chain, <code>notAfter</code>, and whether intermediates are sent. <code>echo | openssl s_client ... 2&gt;/dev/null | openssl x509 -noout -dates</code>. Check protocol/cipher mismatch (<code>-tls1_2</code>), SNI, and clock skew.</td></tr>
+<tr><th>Root Cause</th><td>Expired certificate (the #1 cause), missing intermediate cert in the chain, protocol mismatch (client wants TLS1.2, server only TLS1.3 or vice versa), SNI misconfig, or client trust store missing the CA.</td></tr>
+<tr><th>Solution</th><td>Renew/rotate the cert (cert-manager / ACME auto-renew); include the full chain (fullchain.pem); align enabled protocols/ciphers; fix SNI; sync clocks (NTP). Roll the new cert without downtime.</td></tr>
+<tr><th>Prevention</th><td>Automated renewal (cert-manager / Let's Encrypt), alert 30 days before <code>notAfter</code>, serve the full chain, monitor from an external prober, staged TLS policy changes.</td></tr>
+<tr><th>Interview Answer</th><td>"<code>openssl s_client</code> tells me everything — expiry, chain, protocol. Nine times out of ten it's an expired cert or a missing intermediate. The real fix is automation: cert-manager auto-renewal plus an alert 30 days before expiry so a human never has to remember."</td></tr>
+</table>
+
+<h3>502 Bad Gateway</h3>
+<table>
+<tr><th>Symptoms</th><td>Reverse proxy / LB returns 502; the proxy is up but got an invalid/empty/closed response from upstream.</td></tr>
+<tr><th>Investigation</th><td>Proxy logs (nginx <code>error.log</code>: "connection refused" / "upstream prematurely closed"). Are upstream pods running/ready? <code>kubectl get pods</code>, curl the upstream directly. Check if the app crashed, is still starting, or closed the connection (keep-alive mismatch).</td></tr>
+<tr><th>Root Cause</th><td>Upstream is down/crashed/not-ready, upstream crashed mid-response, keep-alive timeout mismatch (proxy reuses a connection the upstream already closed), or the app returned a malformed response.</td></tr>
+<tr><th>Solution</th><td>Restore/roll back the upstream; fix readiness so the proxy doesn't route to not-ready pods; align keep-alive timeouts (upstream keepalive &gt; proxy); add retry-on-idempotent-methods. Bounce crashed pods.</td></tr>
+<tr><th>Prevention</th><td>Readiness gating at the proxy, matched keep-alive timeouts, graceful shutdown (drain before SIGKILL), circuit breaker, canary deploys.</td></tr>
+<tr><th>Interview Answer</th><td>"502 means the proxy reached an upstream but got garbage or a closed connection — the app side is the problem, not the proxy. I check upstream readiness and logs; a subtle recurring 502 is usually a keep-alive timeout mismatch where the proxy reuses a connection the app already closed."</td></tr>
+</table>
+
+<h3>504 Gateway Timeout</h3>
+<table>
+<tr><th>Symptoms</th><td>Proxy/LB returns 504 after N seconds (e.g. 30s/60s); upstream never responded in time.</td></tr>
+<tr><th>Investigation</th><td>Trace the slow request (distributed tracing) to find the slow hop — DB query, external API, lock wait. Compare proxy <code>proxy_read_timeout</code> vs actual upstream latency (p99). Check for saturation (all workers busy) and downstream dependency latency.</td></tr>
+<tr><th>Root Cause</th><td>Upstream genuinely too slow (slow query, blocked on a lock, slow third-party call), thread/worker pool exhausted so requests queue, or a downstream dependency degraded. Sometimes retries amplifying load.</td></tr>
+<tr><th>Solution</th><td>Fix the slow hop (index the query, add caching, timeout the third-party call and degrade gracefully); scale workers; add a client-side timeout shorter than the gateway's so you fail fast; circuit-break the slow dependency. Don't just raise the gateway timeout.</td></tr>
+<tr><th>Prevention</th><td>Per-dependency timeouts + circuit breakers, p99 latency SLO alerts, bulkheads so one slow dependency doesn't exhaust the pool, load shedding, async for long operations.</td></tr>
+<tr><th>Interview Answer</th><td>"504 is 'upstream too slow,' so I trace the request to the slow hop rather than blindly raising the timeout. Usually it's a slow query or a hanging third-party call. I fix the hop, add a timeout + circuit breaker on that dependency, and add a bulkhead so it can't exhaust the whole worker pool."</td></tr>
+</table>
+
+<h2>Node.js Runtime Incidents</h2>
+
+<h3>High event loop delay</h3>
+<table>
+<tr><th>Symptoms</th><td>Latency across <em>all</em> endpoints rises together, health checks time out, throughput drops though CPU may not be pinned. Event-loop lag metric &gt; 100ms.</td></tr>
+<tr><th>Investigation</th><td>Measure lag with <code>perf_hooks.monitorEventLoopDelay()</code> or the <code>nodejs_eventloop_lag_seconds</code> prom metric; profile with <code>clinic doctor</code> / <code>clinic flame</code> or <code>node --prof</code> + <code>--prof-process</code>. Look for a synchronous hot path — JSON.parse of huge payloads, sync crypto, regex backtracking (ReDoS), big sync loops.</td></tr>
+<tr><th>Root Cause</th><td>CPU-bound synchronous work blocking the single-threaded loop: large <code>JSON.parse</code>/<code>stringify</code>, synchronous crypto/compression, <code>fs.*Sync</code>, catastrophic regex backtracking, or an unbounded loop over a big array.</td></tr>
+<tr><th>Solution</th><td>Move CPU work off the loop: worker threads, streaming parsers, async crypto, chunk big loops with <code>setImmediate</code>. Fix the ReDoS regex. Cache expensive computations. Add a concurrency limit / load shed when lag is high.</td></tr>
+<tr><th>Prevention</th><td>Event-loop-lag alert (&gt; 70ms warn, &gt; 200ms page), no <code>*Sync</code> on hot paths, payload size limits, regex safety review, offload CPU to workers, autocannon load tests.</td></tr>
+<tr><th>Interview Answer</th><td>"When every endpoint slows together but there's no DB culprit, I suspect the event loop is blocked. I measure lag with perf_hooks and flame-graph with clinic. The fix is to get CPU work — big JSON, crypto, a nasty regex — off the loop via worker threads or streaming, because in Node one blocked handler stalls everyone."</td></tr>
+</table>
+
+<h3>Memory leak</h3>
+<table>
+<tr><th>Symptoms</th><td>RSS/heap grows steadily over hours/days, GC gets more frequent, eventually OOMKilled/137 and restart; sawtooth that trends upward.</td></tr>
+<tr><th>Investigation</th><td>Watch <code>process.memoryUsage().heapUsed</code> trend; take heap snapshots at intervals (<code>--inspect</code> + Chrome DevTools, or <code>v8.writeHeapSnapshot()</code>), diff them to find the growing retained object. <code>clinic heapprofiler</code>. Common culprits: unbounded Map/cache, event listeners not removed, closures capturing big objects, global arrays.</td></tr>
+<tr><th>Root Cause</th><td>Objects kept reachable forever: an in-memory cache without eviction, <code>emitter.on</code> without <code>off</code> (listener leak, "MaxListenersExceeded"), timers not cleared, module-level arrays that only grow, or holding request/response references.</td></tr>
+<tr><th>Solution</th><td>Diff two heap snapshots → find the retaining path → fix (bound the cache with LRU + max size, remove listeners, clear timers, use <code>WeakMap</code> for object-keyed caches). Short-term mitigation: scheduled restart / higher limit while you fix it.</td></tr>
+<tr><th>Prevention</th><td>Bounded caches, listener hygiene, memory-trend alerts (not just OOM), heap-snapshot diff in soak tests, WeakMap/WeakRef for caches, load-soak in CI.</td></tr>
+<tr><th>Interview Answer</th><td>"A slow upward sawtooth ending in OOM is a classic leak. I take two heap snapshots an hour apart and diff them — the object with growing retained size and its retainer path is the culprit, usually an unbounded Map or unremoved event listeners. I bound the cache with an LRU and add a memory-trend alert so I catch it before OOM."</td></tr>
+</table>
+
+<h3>GC thrashing</h3>
+<table>
+<tr><th>Symptoms</th><td>CPU high in GC, periodic latency spikes (stop-the-world pauses), throughput drops; <code>--trace-gc</code> shows frequent long Mark-Sweep pauses.</td></tr>
+<tr><th>Investigation</th><td>Run with <code>--trace-gc --trace-gc-verbose</code>; look at GC pause frequency/duration and the ratio of GC time to total. Heap near <code>--max-old-space-size</code> forces constant full GCs. Check allocation rate (lots of short-lived objects churning the young generation).</td></tr>
+<tr><th>Root Cause</th><td>Heap pressure near the limit (so V8 GCs constantly), or a very high allocation rate — creating huge numbers of short-lived objects per request (big intermediate arrays, string concat in loops, JSON churn).</td></tr>
+<tr><th>Solution</th><td>Reduce allocations (reuse buffers, stream, avoid needless clones), raise <code>--max-old-space-size</code> if genuinely undersized, fix a partial leak keeping the heap full. Object pooling for hot allocations.</td></tr>
+<tr><th>Prevention</th><td>Alert on GC-time ratio &gt; 10%, allocation profiling in perf tests, streaming over buffering, right-sized heap vs container limit.</td></tr>
+<tr><th>Interview Answer</th><td>"GC thrashing shows up as CPU burned in GC with periodic pause spikes. <code>--trace-gc</code> tells me if the heap is pinned near the limit (raise it or fix a leak) or if allocation rate is the issue — then I cut per-request garbage by streaming and reusing buffers instead of allocating fresh objects."</td></tr>
+</table>
+
+<h2>Application &amp; Business-Logic Incidents</h2>
+
+<h3>API latency suddenly increased</h3>
+<table>
+<tr><th>Symptoms</th><td>p99 (and maybe p50) latency jumps at a specific timestamp; error rate may follow.</td></tr>
+<tr><th>Investigation</th><td>"What changed at that timestamp?" — deploy, flag, traffic, dependency. Trace a slow request to the bottleneck hop. Check DB slow log, downstream latency, cache hit rate drop, and saturation (CPU, event loop, pool).</td></tr>
+<tr><th>Root Cause</th><td>A deploy introduced an N+1 or removed a cache; cache hit rate dropped (cold/flushed cache); a downstream got slow; traffic spike saturated a resource; a new index-less query.</td></tr>
+<tr><th>Solution</th><td>Roll back the correlated deploy; warm/repair the cache; scale; add the missing index. Mitigate first, RCA after.</td></tr>
+<tr><th>Prevention</th><td>Latency SLO alerts, per-deploy latency canary, cache-hit-rate monitoring, trace sampling always on.</td></tr>
+<tr><th>Interview Answer</th><td>"A sharp latency step change almost always maps to an event at that exact time — I overlay the deploy/flag timeline on the latency graph, roll back the correlated change, then trace to confirm the mechanism."</td></tr>
+</table>
+
+<h3>Duplicate payments</h3>
+<table>
+<tr><th>Symptoms</th><td>Customer charged twice for one order; reconciliation shows two captures for one intent; support tickets.</td></tr>
+<tr><th>Investigation</th><td>Trace the payment request — a client retry (user double-click / network retry / mobile reconnect) or a gateway timeout where the first request actually succeeded. Check whether the create-charge call carried an idempotency key. Inspect logs for two requests with the same order but different request IDs.</td></tr>
+<tr><th>Root Cause</th><td>Non-idempotent charge endpoint: the client retried after a timeout, and the server treated the retry as a new charge. No idempotency key, no unique constraint on (order_id) in the payments table.</td></tr>
+<tr><th>Solution</th><td><strong>Idempotency key</strong> per payment attempt (client-generated UUID), stored server-side with a UNIQUE constraint: first request inserts + processes, a retry with the same key returns the <em>stored</em> result instead of charging again. Add a DB UNIQUE constraint on the business key (order_id/idempotency_key) as the last line of defense. Pass the idempotency key through to the payment gateway (Stripe/Razorpay support this natively). Refund the duplicate.</td></tr>
+<tr><th>Prevention</th><td>Idempotency keys mandatory on all mutating money endpoints; unique DB constraint; reconciliation job comparing gateway captures vs internal ledger daily; exactly-once semantics via at-least-once + idempotency.</td></tr>
+<tr><th>Interview Answer</th><td>"Duplicate charges come from retries on a non-idempotent endpoint. The fix is an idempotency key: the client sends a UUID, I store it with a UNIQUE constraint, and any retry with the same key returns the original result instead of charging again. I also forward that key to the payment gateway and back it with a unique DB constraint plus a daily reconciliation job."</td></tr>
+</table>
+
+<h3>Uber-style ride double-allocation</h3>
+<table>
+<tr><th>Symptoms</th><td>One driver assigned to two riders, or two drivers dispatched to one rider; concurrent matching races.</td></tr>
+<tr><th>Investigation</th><td>Trace two concurrent assignment requests hitting the same driver in the same millisecond window. Check whether the "is driver free?" check and the "assign" write are atomic or a read-then-write race (TOCTOU).</td></tr>
+<tr><th>Root Cause</th><td>Read-modify-write race: two matcher instances both read driver as AVAILABLE, both assign. No locking / no atomic conditional update.</td></tr>
+<tr><th>Solution</th><td>Make assignment atomic. Options: (1) <strong>Optimistic concurrency</strong> — <code>UPDATE drivers SET status='BUSY', rider_id=? WHERE id=? AND status='AVAILABLE'</code>; if 0 rows affected, someone else won, retry with another driver. (2) <strong>Distributed lock</strong> — Redis <code>SET driver:{id} lock NX PX 3000</code> (Redlock) around the assign. (3) <strong>SELECT ... FOR UPDATE</strong> row lock in a transaction. Optimistic conditional-update is usually best — lock-free, single round trip, no lock-expiry risk.</td></tr>
+<tr><th>Prevention</th><td>Always express "claim if still free" as a single atomic conditional write; unique constraint on active (driver_id) assignment; version columns; idempotent dispatch.</td></tr>
+<tr><th>Interview Answer</th><td>"Double-allocation is a TOCTOU race between check and assign. I make it one atomic operation — <code>UPDATE ... SET status='BUSY' WHERE id=? AND status='AVAILABLE'</code>. If rows-affected is 0, another matcher already claimed the driver and I pick someone else. That's optimistic concurrency: no lock to expire, one round trip, and the DB enforces the invariant."</td></tr>
+</table>
+
+<h3>Seat-booking race condition</h3>
+<table>
+<tr><th>Symptoms</th><td>Two users book the same seat/inventory unit; oversell; "seat already taken" only after payment.</td></tr>
+<tr><th>Investigation</th><td>Two concurrent bookings for seat 12A both succeed. Check the reserve flow: is availability checked and decremented atomically? Is there a unique constraint on (event_id, seat_id)?</td></tr>
+<tr><th>Root Cause</th><td>Classic lost-update / double-book race: both transactions read seat as free, both write a booking. No pessimistic lock, no optimistic version check, no unique constraint.</td></tr>
+<tr><th>Solution</th><td>Layered defense: (1) <strong>Unique DB constraint</strong> on (event_id, seat_id) — the ultimate guarantee; the second insert fails with a constraint violation. (2) <strong>Pessimistic lock</strong> — <code>SELECT ... FOR UPDATE</code> on the seat row inside a transaction so the second waits. (3) <strong>Optimistic</strong> — version column, <code>UPDATE ... WHERE version=?</code>. For high-contention flash sales, a short Redis reservation lock/hold (SET NX with TTL) to hold the seat during checkout, then confirm to DB. Always keep the unique constraint as the backstop.</td></tr>
+<tr><th>Prevention</th><td>Unique constraint on the seat, hold/reservation with TTL during checkout, FOR UPDATE or version column, idempotent booking key so retries don't double-book.</td></tr>
+<tr><th>Interview Answer</th><td>"I never trust an application-level check for uniqueness under concurrency. The non-negotiable is a UNIQUE constraint on (event_id, seat_id) so the DB rejects the second booking. On top I use <code>SELECT ... FOR UPDATE</code> or an optimistic version check to serialize, and for flash sales a short Redis hold so users don't lose a seat mid-checkout — but the constraint is what makes overselling impossible."</td></tr>
+</table>
+
+<div class="callout tip"><strong>Say this:</strong> "Optimistic concurrency (version column / conditional UPDATE) wins under low-to-moderate contention — no locks, no deadlocks, cheap retries. Pessimistic locking (SELECT ... FOR UPDATE) wins under high contention where retries would storm. A distributed lock (Redis Redlock) is for cross-service coordination but carries lock-expiry and clock-skew risk. And a UNIQUE DB constraint is the one guarantee that holds no matter how the app code races."</div>
+
+<h2>Production Architecture</h2>
+<p>An observability + incident-response pipeline: the app emits metrics, logs, and traces; a metrics backend evaluates alert rules and burns SLO budget; alerts route to on-call; the responder pulls up the runbook and dashboards to mitigate.</p>
+<pre class="mermaid">
+flowchart LR
+  A["App services"] --> M["Metrics Prometheus"]
+  A --> L["Logs Loki or ELK"]
+  A --> T["Traces Jaeger"]
+  M --> AL["Alertmanager rules"]
+  AL --> OC["On-call PagerDuty"]
+  OC --> RB["Runbook and dashboards"]
+  RB --> MIT["Mitigate rollback scale failover"]
+  MIT --> A
+</pre>
+<p>The three signals answer different questions: metrics say <em>where</em> and <em>how bad</em> (and drive alerts), traces say <em>which hop</em>, logs say <em>exactly why</em>. Alerts fire on symptoms (SLO burn), page the on-call, who reaches for the runbook — the loop closes when mitigation restores the app.</p>
+
+<p>The incident timeline as a sequence — from alert to resolution:</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant Mon as Monitoring
+  participant OC as OnCall
+  participant IC as IncidentCommander
+  participant Sys as Systems
+  Mon->>OC: SLO burn alert fires
+  OC->>OC: Ack and check what changed
+  OC->>IC: Declare SEV2 open channel
+  IC->>Sys: Roll back last deploy
+  Sys-->>IC: Error rate recovering
+  IC->>Mon: Confirm SLO back in budget
+  IC->>OC: Schedule blameless RCA
+</pre>
+<p>Note the ordering: <strong>mitigate (rollback) happens before RCA</strong>. The commander restores service first and confirms recovery on the dashboards, then schedules the post-mortem. Comms (declare, open channel) run in parallel with the technical fix.</p>
+
+<h2>Monitoring &amp; Alerting</h2>
+<p>Alert on symptoms with actionable thresholds; page only when a human must act now.</p>
+<table>
+<tr><th>Metric</th><th>Warn</th><th>Page</th><th>Why</th></tr>
+<tr><td>HTTP 5xx error ratio</td><td>&gt; 0.5%</td><td>&gt; 2% for 5m</td><td>Customer-facing failure</td></tr>
+<tr><td>p99 latency</td><td>&gt; 300ms</td><td>&gt; 1s for 5m</td><td>SLO breach</td></tr>
+<tr><td>SLO fast-burn (multi-window)</td><td>—</td><td>2% budget in 1h</td><td>Will exhaust budget soon</td></tr>
+<tr><td>DB connection pool used</td><td>&gt; 70%</td><td>&gt; 90%</td><td>Exhaustion imminent</td></tr>
+<tr><td>Redis used_memory</td><td>&gt; 75%</td><td>&gt; 90%</td><td>OOM/eviction risk</td></tr>
+<tr><td>Kafka consumer lag</td><td>&gt; 10k</td><td>&gt; 100k or growing</td><td>Falling behind</td></tr>
+<tr><td>Event-loop lag (Node)</td><td>&gt; 70ms</td><td>&gt; 200ms</td><td>Loop blocked</td></tr>
+<tr><td>Pod restarts</td><td>&gt; 3/hr</td><td>CrashLoop</td><td>Unstable workload</td></tr>
+<tr><td>Cert expiry</td><td>30 days</td><td>7 days</td><td>TLS outage risk</td></tr>
+</table>
+<p><strong>SLO / error budget:</strong> Define an SLO (e.g. 99.9% availability = 43min/month of allowed downtime). Track the <em>error budget</em> (1 − SLO). Alert on <strong>burn rate</strong> using multi-window multi-burn-rate alerts (fast burn: 14.4× over 1h + 5min; slow burn: 6× over 6h) — this pages for real problems and stays quiet for noise. When the budget is exhausted, freeze risky deploys until it recovers; that's the policy lever tying reliability to release velocity.</p>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Alerting on causes, not symptoms.</strong> "CPU &gt; 80%" pages at 3am for nothing; "error ratio &gt; 2%" pages when customers actually hurt. Alert on user-facing SLOs.</li>
+<li><strong>No runbooks.</strong> Every alert should link a runbook: what it means, how to verify, how to mitigate. Tribal knowledge doesn't scale to 3am.</li>
+<li><strong>Restarting without RCA.</strong> A restart that "fixes it" hides a leak/loop that returns in 6 hours. Capture a heap snapshot / thread dump <em>before</em> restarting.</li>
+<li><strong>No idempotency.</strong> Any retryable mutation (payments, orders, messages) without an idempotency key will double-execute in production. Guaranteed.</li>
+<li><strong>Missing DB constraints.</strong> Enforcing uniqueness in app code instead of a UNIQUE constraint = eventual double-booking under concurrency.</li>
+<li><strong>Unbounded retries.</strong> Retries without exponential backoff + jitter + a circuit breaker turn a blip into a self-inflicted DDoS (retry storm / cascading failure).</li>
+<li><strong>Deep health checks.</strong> Health checks that fail on non-critical dependencies pull healthy nodes and cause self-outages.</li>
+<li><strong>No load shedding / bulkheads.</strong> One slow dependency exhausts the whole pool and takes everything down.</li>
+<li><strong>Raising timeouts to "fix" 504s.</strong> Masks the slow hop and lets more requests pile up. Fix the latency, don't hide it.</li>
+<li><strong>Blameful post-mortems.</strong> Kills honesty, so the real root cause never surfaces. Blameless only.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they likely run reliability / incident response</th></tr>
+<tr><td>Google</td><td>Originated SRE: SLOs, error budgets, blameless post-mortems, "error budget freeze" tying release velocity to reliability, the four golden signals, and toil reduction. Multi-window burn-rate alerting comes from the SRE workbook.</td></tr>
+<tr><td>Amazon</td><td>Ownership model ("you build it, you run it"), COE (Correction of Errors) post-mortems with 5-whys, operational readiness reviews, and heavy use of idempotency + cells/shuffle-sharding to limit blast radius. Weekly ops reviews.</td></tr>
+<tr><td>Netflix</td><td>Pioneered chaos engineering (Chaos Monkey / Simian Army, now Chaos platform) to inject failure in prod; regional failover/evacuation drills; strong on circuit breakers (Hystrix historically) and fallbacks; incident tooling like Dispatch.</td></tr>
+<tr><td>Uber</td><td>Massive real-time matching; likely uses region-based failover, extensive distributed-systems tooling, atomic assignment (optimistic concurrency) for dispatch, and a mature on-call + incident-management practice given global scale.</td></tr>
+<tr><td>Swiggy</td><td>Food-delivery peak-load (lunch/dinner spikes); likely autoscaling, queue-based order pipelines, hot-partition handling for popular restaurants, and surge/backpressure controls; on-call with runbooks for peak events.</td></tr>
+<tr><td>PhonePe</td><td>UPI-scale payments; likely idempotent transaction processing, strong reconciliation, distributed transaction handling, and high-availability data stores with careful failover — payments demand exactly-once effects via idempotency + ledgers.</td></tr>
+<tr><td>Razorpay</td><td>Payments platform; idempotency keys on all payment APIs (public docs), reconciliation between gateway and internal ledger, retries with idempotency, and strong monitoring on payment success rate as the core SLI.</td></tr>
+<tr><td>Atlassian</td><td>Documented incident-management framework (SEV levels, IC roles, comms cadence, blameless PIRs); Statuspage for customer comms; Opsgenie for on-call/alerting. Publicly shares its incident handbook.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>How do you decide whether to roll back vs roll forward?
+  <ol><li>Roll back by default (fastest, safest); roll forward only if rollback is impossible (irreversible migration) or the fix is trivial and verified.</li></ol></li>
+<li>What's the difference between an SLI, SLO, and SLA?
+  <ol><li>SLI = the measured metric; SLO = internal target on it; SLA = external contract with penalties, always looser than the SLO.</li></ol></li>
+<li>Why alert on burn rate instead of a raw threshold?
+  <ol><li>Burn rate ties alerts to budget consumption — pages fast for severe issues, ignores brief blips, reduces noise.</li></ol></li>
+<li>How do you make a payment endpoint idempotent?
+  <ol><li>Client-generated idempotency key stored with a UNIQUE constraint; return the stored result on retry; forward the key to the gateway.</li></ol></li>
+<li>Optimistic vs pessimistic locking — when each?
+  <ol><li>Optimistic (version/conditional update) for low contention; pessimistic (FOR UPDATE) for high contention where retries would storm.</li></ol></li>
+<li>Why is a distributed lock (Redis) risky?
+  <ol><li>Lock expiry + clock skew + GC pause can let two holders proceed; prefer atomic conditional writes or fencing tokens.</li></ol></li>
+<li>How do you debug a memory leak in Node without restarting?
+  <ol><li>Diff two heap snapshots to find growing retained objects and their retainer path; fix the retention (LRU/WeakMap/listener cleanup).</li></ol></li>
+<li>What exit codes matter for containers?
+  <ol><li>137 = SIGKILL/OOM, 143 = SIGTERM, 1 = app error, 139 = segfault; drives whether you look at memory, config, or code.</li></ol></li>
+<li>How do you prevent a cache stampede?
+  <ol><li>TTL jitter + single-flight recompute lock + stale-while-revalidate + pre-warming hot keys.</li></ol></li>
+<li>How do you handle a poison message?
+  <ol><li>Retry with a cap, then dead-letter it so it doesn't block the queue; alert on DLQ depth; inspect and reprocess after fix.</li></ol></li>
+<li>What causes Kafka rebalance storms?
+  <ol><li>Processing exceeding max.poll.interval.ms so the consumer is kicked; fix by shortening work per poll or moving work off the poll thread.</li></ol></li>
+<li>How do you stop a retry storm / cascading failure?
+  <ol><li>Exponential backoff with jitter, retry budgets, circuit breakers, and load shedding at the edge.</li></ol></li>
+<li>Difference between liveness and readiness probes?
+  <ol><li>Liveness = restart if dead; readiness = remove from LB until it can serve; failing liveness on a dependency causes crash loops.</li></ol></li>
+<li>How do you find a slow query fast?
+  <ol><li>pg_stat_activity/pg_stat_statements or slow log + pt-query-digest, then EXPLAIN ANALYZE for the plan.</li></ol></li>
+<li>What's a blameless post-mortem and why?
+  <ol><li>Focus on systemic causes, not individuals, so people report honestly and you fix the real issue.</li></ol></li>
+<li>How do you guarantee no double-booking of a seat?
+  <ol><li>A UNIQUE DB constraint as the hard guarantee, plus FOR UPDATE or optimistic version check to serialize.</li></ol></li>
+<li>How do you diagnose a 504 vs a 502?
+  <ol><li>502 = upstream returned bad/closed connection (app down/keepalive); 504 = upstream too slow (trace the slow hop).</li></ol></li>
+<li>What's the first thing you check on any alert?
+  <ol><li>"What changed?" — deploy, flag, config, traffic, dependency — because most incidents correlate with a recent change.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>SLO / SLI / error budgets:</strong> How to pick an SLI (customer-facing), set an SLO, and use the budget to gate deploys. Angle: reliability is a feature you budget for, not a maximize-at-all-costs goal.</li>
+<li><strong>Idempotency:</strong> Keys, dedupe tables, unique constraints; "exactly-once = at-least-once + idempotent." Angle: any retryable mutation needs it.</li>
+<li><strong>Distributed locks vs optimistic concurrency:</strong> Redlock's caveats, fencing tokens, conditional updates. Angle: prefer the DB to enforce invariants over app-level locks.</li>
+<li><strong>Circuit breakers:</strong> Closed/open/half-open states, thresholds, fallbacks. Angle: stop cascading failure by failing fast on a sick dependency.</li>
+<li><strong>Retries &amp; backoff:</strong> Exponential backoff + jitter, retry budgets, idempotency requirement. Angle: naive retries amplify outages.</li>
+<li><strong>Rate limiting / load shedding:</strong> Token bucket, per-tenant quotas, shedding low-priority traffic under load. Angle: protect the core under overload.</li>
+<li><strong>Observability trio:</strong> Metrics vs logs vs traces and when each answers the question. Angle: metrics to detect, traces to localize, logs to explain.</li>
+<li><strong>Graceful degradation &amp; bulkheads:</strong> Isolate resources so one dependency can't sink everything; serve reduced functionality. Angle: partial availability beats total outage.</li>
+</ul>
+
+<div class="interview">
+<h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+
+<details><summary>Database CPU is at 100%. Walk me through it end to end.</summary><p>First I confirm the DB process is the culprit with <code>top</code> on the host, ruling out a noisy neighbor. Then <code>SELECT pid, now()-query_start AS dur, state, query FROM pg_stat_activity WHERE state='active' ORDER BY dur DESC</code> to find the longest-running queries, and <code>pg_stat_statements</code> ordered by <code>total_exec_time</code> for the aggregate hog. I <code>EXPLAIN ANALYZE</code> the top offender — almost always a Seq Scan on a large table from a missing index or a stale-stats bad plan. To restore service now I <code>pg_terminate_backend(pid)</code> the runaway, and if a report is hammering the primary I route it to a read replica. Then I add the index with <code>CREATE INDEX CONCURRENTLY</code> to avoid the table lock, roll back the deploy if it introduced the query, and add a slow-query alert plus a statement_timeout so it's caught in staging next time.</p></details>
+
+<details><summary>A hot cache key just expired and the DB is melting. What's happening and how do you fix it live?</summary><p>That's a cache stampede — one hot key expired and thousands of concurrent requests all missed and are recomputing the same expensive query against the DB simultaneously. Live mitigation: I can manually re-populate the key or extend its TTL to stop the herd immediately, and scale/rate-limit if needed. The real fix is three-layered: TTL jitter (±10%) so keys don't expire in lockstep; a single-flight recompute lock via <code>SET key:lock NX PX 5000</code> so only the first miss recomputes while others wait or serve stale; and stale-while-revalidate so the rest serve the slightly-old value instead of hammering the DB. For known-hot keys I add background refresh so they never expire under load.</p></details>
+
+<details><summary>Kafka consumer lag is growing on your group. Diagnose it.</summary><p><code>kafka-consumer-groups.sh --describe --group g</code> and look at LAG per partition. If lag is uniform across all partitions, I'm consumer-bound — add consumers up to the partition count (more consumers than partitions does nothing), or increase partitions for more parallelism. If lag is on one partition, it's a hot key from a bad partition key and I need to fix key distribution. I also check for rebalance storms: if processing per poll exceeds <code>max.poll.interval.ms</code>, the broker evicts the consumer and progress resets — I fix that by moving heavy work off the poll thread or lowering <code>max.poll.records</code>. Because processing is idempotent, I can safely reset offsets if needed. Long term: alert on lag <em>and</em> lag-growth-rate, and autoscale consumers.</p></details>
+
+<details><summary>A pod is in CrashLoopBackOff. What are your exact commands?</summary><p><code>kubectl describe pod X</code> for events and the last-state exit code, then the key one: <code>kubectl logs X --previous</code> to see the crashed container's output, plus <code>kubectl get events --sort-by=.lastTimestamp</code>. Exit code 137 means OOMKilled (bump the memory limit or fix a leak), 1 means an app-level startup error — usually a missing secret/env var or an unreachable dependency, sometimes a failing migration. If it's a too-aggressive liveness probe restarting a slow-starting app, I add a startup probe or relax initialDelaySeconds. To stop the loop immediately I <code>kubectl rollout undo deploy/X</code> to the last good image, then fix root cause and redeploy via canary.</p></details>
+
+<details><summary>Clients are getting 504 Gateway Timeout. How do you respond?</summary><p>504 means the gateway reached the upstream but the upstream didn't respond within the timeout — an upstream latency problem, not a proxy problem. I trace a slow request end to end to find the slow hop: usually a slow DB query, a lock wait, or a hanging third-party call, sometimes worker-pool exhaustion queueing requests. I do <em>not</em> just raise the gateway timeout — that hides the problem and lets requests pile up. I fix the hop (index the query, cache, or add a hard timeout on the third-party call with graceful degradation), add a circuit breaker on that dependency, and a bulkhead so one slow dependency can't exhaust the whole worker pool. I also set client-side timeouts shorter than the gateway's to fail fast.</p></details>
+
+<details><summary>A customer was charged twice. Root cause and permanent fix?</summary><p>Root cause is a non-idempotent charge endpoint: the client retried after a network timeout or gateway 5xx where the first request had actually succeeded, and the server treated the retry as a new charge. Permanent fix is an idempotency key — the client generates a UUID per payment attempt and sends it; the server stores it with a UNIQUE constraint, so the first request processes and stores the result while any retry with the same key returns the <em>stored</em> result instead of charging again. I forward that key to the payment gateway (Stripe/Razorpay support it natively) so even the gateway dedupes, and I add a UNIQUE DB constraint on the business key as the last line of defense plus a daily reconciliation job comparing gateway captures against our ledger. Then refund the duplicate.</p></details>
+
+<details><summary>Two users booked the same seat. How do you make that impossible?</summary><p>The non-negotiable guarantee is a UNIQUE constraint on (event_id, seat_id) in the bookings table — no matter how the application races, the DB rejects the second insert with a constraint violation. Never rely on an app-level "is it free?" check under concurrency; that's a lost-update race. On top of the constraint I serialize with either <code>SELECT ... FOR UPDATE</code> on the seat row inside a transaction (pessimistic, good for high contention) or an optimistic version column with <code>UPDATE ... WHERE version=?</code>. For flash sales I add a short-lived Redis reservation hold (<code>SET seat NX PX 120000</code>) so users don't lose their seat mid-checkout, then confirm to the DB. But the constraint is what actually makes overselling impossible.</p></details>
+
+<details><summary>How do you prevent Uber-style double-allocation of a driver?</summary><p>It's a TOCTOU race: two matcher instances both read the driver as AVAILABLE and both assign. I collapse check-and-assign into one atomic conditional write: <code>UPDATE drivers SET status='BUSY', rider_id=? WHERE id=? AND status='AVAILABLE'</code>. If rows-affected is 1 I won the driver; if it's 0, another matcher already claimed them and I pick a different driver. That's optimistic concurrency — lock-free, one round trip, no lock-expiry risk, and the DB enforces the invariant. I back it with a unique constraint on the active assignment and make dispatch idempotent so retries don't create a second assignment.</p></details>
+
+<details><summary>Your Node service has a memory leak. Find it without guessing.</summary><p>I watch the <code>heapUsed</code> trend to confirm a rising sawtooth (grows, GC frees some, net climbs) heading toward OOM/137. Then I take two heap snapshots an hour apart — via <code>--inspect</code> + Chrome DevTools or <code>v8.writeHeapSnapshot()</code> — and diff them in the Comparison view. The object type with growing retained size, plus its retainer path, is the culprit; it's usually an unbounded Map/cache, event listeners added without <code>removeListener</code> (you'll see MaxListenersExceeded warnings), or timers never cleared. I fix the retention — bound the cache with an LRU + max size, use a WeakMap for object-keyed caches, remove listeners — and add a memory-trend alert so I catch the next one before OOM rather than after.</p></details>
+
+<details><summary>Every endpoint got slow at once but CPU looks fine. What's your hypothesis?</summary><p>In Node, when all endpoints degrade together with no single DB culprit, my hypothesis is a blocked event loop — one synchronous CPU-bound operation is stalling the single thread for everyone. I confirm with the event-loop-lag metric (<code>perf_hooks.monitorEventLoopDelay</code> or the prom gauge); &gt;100ms confirms it. Then I flame-graph with <code>clinic flame</code> or <code>node --prof</code> to find the hot synchronous path — typically a huge <code>JSON.parse</code>/<code>stringify</code>, synchronous crypto/compression, an <code>fs.*Sync</code> call, or catastrophic regex backtracking (ReDoS). The fix is to get CPU work off the loop: worker threads, streaming parsers, async crypto, chunk big loops with <code>setImmediate</code>, or fix the regex — plus a payload size limit and a lag-based load-shed.</p></details>
+
+<details><summary>Connection pool is exhausted but DB CPU is near zero. Explain the paradox.</summary><p>Low CPU means connections are <em>held, not busy</em> — the classic signature is <code>idle in transaction</code>. I run <code>SELECT count(*), state FROM pg_stat_activity GROUP BY state</code>; a pile of idle-in-transaction confirms code that opens a transaction and then does slow non-DB work (or leaks the connection on an error path) without committing. Immediate mitigation: kill those sessions and bounce the app to reset the pool. Fixes: set <code>idle_in_transaction_session_timeout</code>, ensure every acquire has a finally-release, keep transactions short (no network calls inside them), and put PgBouncer in transaction-pooling mode in front so app pool size decouples from DB max_connections. Then alert on pool utilization &gt; 80%.</p></details>
+
+<details><summary>How do error budgets change how you operate?</summary><p>An SLO of 99.9% gives a monthly error budget of ~43 minutes of allowed unreliability. I track burn rate with multi-window multi-burn-rate alerts — a fast-burn alert (14.4× over 1h, confirmed over 5min) pages for acute problems, a slow-burn alert (6× over 6h) catches gradual degradation, and neither pages for harmless blips. The budget becomes a policy lever: when it's healthy we ship features and take risks; when it's exhausted we freeze risky deploys and spend the sprint on reliability. It converts "how reliable should we be?" from an argument into a number, and it aligns dev velocity with ops stability instead of pitting them against each other.</p></details>
+
+<details><summary>Redis is throwing OOM on writes. Walk me through recovery.</summary><p><code>redis-cli INFO memory</code> shows <code>used_memory</code> at maxmemory, and the OOM-on-write error tells me the policy is <code>noeviction</code>. Immediate recovery: switch to <code>maxmemory-policy allkeys-lru</code> so it evicts cold keys instead of erroring, which restores writes instantly. Then <code>redis-cli --bigkeys</code> to find whale keys (a multi-GB list/hash) and <code>INFO keyspace</code> to spot keys with no TTL — the usual root cause is cache keys accumulating forever with no expiry. I add TTLs, split or expire big keys, and check <code>mem_fragmentation_ratio</code> (enable activedefrag if fragmented). Prevention: every cache key gets a TTL, alert on used_memory &gt; 80% and on evicted_keys rate, and capacity-plan or shard before it fills.</p></details>
+
+<details><summary>A message got processed twice and sent two emails. Why, and how do you guarantee once?</summary><p>Because brokers are at-least-once: the consumer processed the message, crashed before acking, and the broker redelivered it — retries and rebalances do the same. There's no true exactly-once across a network. The guarantee comes from idempotent consumers, not the broker. Each message carries a stable key; before the side effect I insert that key into a <code>processed_messages</code> table with a UNIQUE constraint — if the insert succeeds I proceed, if it hits the constraint the message was already handled and I skip. That makes at-least-once safe. For Kafka I can add the idempotent producer + transactions for exactly-once within the pipeline, but the consumer's external side effects (sending email, charging) still need the dedupe key.</p></details>
+
+<details><summary>How do you run the first 5 minutes of an incident as the on-call?</summary><p>Ack the page to stop re-alerting and read what fired — which SLO, which service. Open the service dashboard and read the four golden signals over 1h and 24h to classify it as errors, latency, or saturation, and whether it's one endpoint or all. Then the key question: "what changed in the last hour?" — deploys (<code>kubectl rollout history</code>), feature flags, config, traffic, dependency status pages; most incidents correlate with a recent change. If a change correlates, I mitigate against that hypothesis immediately — roll back or flip the flag — before I fully diagnose. If impact is real and not instantly fixed, I declare a SEV, open the incident channel, name myself IC, and post the first status update, then keep a 15-30 minute comms cadence. Diagnosis and RCA come after service is restored.</p></details>
+
+<details><summary>When do you choose a distributed lock over a DB constraint or optimistic concurrency?</summary><p>Almost never for enforcing a data invariant — a UNIQUE constraint or an atomic conditional UPDATE is safer because the database enforces it transactionally with no expiry or clock assumptions. A distributed lock (Redis Redlock, etcd lease) is for coordinating work <em>across services or resources the DB can't see</em> — e.g. ensuring only one worker runs a scheduled job, or serializing access to an external non-transactional resource. Its risks are real: if the lock's TTL expires during a GC pause or the holder is slow, two workers can both believe they hold it, so you need fencing tokens (a monotonically increasing number the downstream checks) to make it safe. So my order of preference is: DB unique constraint → atomic conditional update (optimistic) → SELECT FOR UPDATE (pessimistic) → distributed lock with fencing tokens only when nothing else can express the invariant.</p></details>
+
+</div>

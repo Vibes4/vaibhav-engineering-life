@@ -1,0 +1,118 @@
+<h1>How AWS Lambda Works <span class="tag express">Case Study</span></h1>
+<p>AWS Lambda is <strong>Function-as-a-Service (FaaS)</strong>: you upload a function, and AWS runs it in response to events — an HTTP request, a file upload, a queue message — without you managing any servers. The fascinating system-design problem underneath is how Lambda gives you the illusion of "infinite, instant, pay-per-use compute" by juggling a pool of short-lived sandboxed containers, balancing the <em>cold start</em> cost against keeping containers <em>warm</em>.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 240" role="img" aria-label="Lambda flow: event source to invoke service to worker fleet of micro-VM sandboxes running function code, with a dashed cold-start edge that creates a new sandbox">
+    <defs>
+      <marker id="arr-lambda" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <!-- Event source -->
+    <rect class="box" x="14" y="92" width="130" height="56" rx="9"></rect>
+    <text class="lbl" x="79" y="115" text-anchor="middle">Event source</text>
+    <text class="sub" x="79" y="131" text-anchor="middle">API GW / S3 / queue</text>
+
+    <!-- Invoke service -->
+    <rect class="box" x="184" y="92" width="130" height="56" rx="9"></rect>
+    <text class="lbl" x="249" y="115" text-anchor="middle">Invoke service</text>
+    <text class="sub" x="249" y="131" text-anchor="middle">place &amp; route</text>
+
+    <!-- Worker fleet (STAR) -->
+    <rect class="box-accent" x="372" y="40" width="206" height="160" rx="10"></rect>
+    <text class="lbl" x="475" y="60" text-anchor="middle">Worker fleet</text>
+    <text class="accent-text" x="475" y="76" text-anchor="middle">Firecracker micro-VMs</text>
+
+    <!-- warm sandbox -->
+    <rect class="box" x="392" y="92" width="166" height="40" rx="7"></rect>
+    <text class="sub" x="475" y="116" text-anchor="middle">warm sandbox (reused)</text>
+    <!-- cold sandbox -->
+    <rect class="box" x="392" y="146" width="166" height="40" rx="7"></rect>
+    <text class="sub" x="475" y="170" text-anchor="middle">new sandbox (cold)</text>
+
+    <!-- Function code -->
+    <rect class="box" x="606" y="92" width="100" height="56" rx="9"></rect>
+    <text class="lbl" x="656" y="115" text-anchor="middle">Function</text>
+    <text class="sub" x="656" y="131" text-anchor="middle">your code</text>
+
+    <!-- Edges -->
+    <line class="edge" x1="144" y1="120" x2="178" y2="120" marker-end="url(#arr-lambda)"></line>
+    <text class="cap" x="161" y="112" text-anchor="middle">event</text>
+
+    <!-- invoke -> warm sandbox -->
+    <line class="edge" x1="314" y1="112" x2="386" y2="112" marker-end="url(#arr-lambda)"></line>
+    <text class="cap" x="350" y="104" text-anchor="middle">reuse</text>
+    <!-- invoke -> cold sandbox (dashed) -->
+    <path class="edge-dash" d="M314,128 C344,128 350,166 386,166" marker-end="url(#arr-lambda)"></path>
+    <text class="cap" x="352" y="156" text-anchor="middle">cold start: create</text>
+
+    <!-- sandbox -> function code -->
+    <line class="edge" x1="558" y1="112" x2="600" y2="118" marker-end="url(#arr-lambda)"></line>
+    <text class="cap" x="582" y="106" text-anchor="middle">handler</text>
+  </svg>
+  <div class="diagram-cap">Figure: an event triggers the invoke service, which routes to a warm micro-VM sandbox when one is free, or (dashed) creates a brand-new sandbox on a cold start before running your function code.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<ul>
+  <li><strong>Functional:</strong> run user code in response to events; isolate each tenant's code securely; scale from zero to thousands of concurrent executions automatically; bill only for actual execution time.</li>
+  <li><strong>Non-functional:</strong> strong multi-tenant isolation (your code must never see mine); low startup latency; high density (pack many functions per physical host to be cost-efficient); elastic — scale up in seconds, scale to zero when idle.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> the whole design is a tension between two goals — <em>isolation</em> (security wants a fresh, sandboxed environment per tenant) and <em>speed/cost</em> (performance wants to reuse a hot environment). Lambda's architecture is essentially the resolution of that tension.</div>
+
+<h2>Step-by-step request flow</h2>
+<p>Tracing the components in the diagram, here is the life of a single invocation:</p>
+<ol>
+  <li><strong>Event source:</strong> an API Gateway request, S3 object-created event, or queue message arrives and triggers the function.</li>
+  <li><strong>Invoke service:</strong> the front door decides <em>where</em> to run this invocation. It looks for a free, already-initialized environment for this function/version.</li>
+  <li><strong>Worker fleet (★) — warm path:</strong> if a free environment exists, the request is routed to it and execution begins almost immediately (~1–10ms of platform overhead).</li>
+  <li><strong>Worker fleet (★) — cold path (dashed):</strong> if none is free, a new Firecracker micro-VM sandbox is created (boots in ~125ms), the runtime is bootstrapped, and your init code runs — the cold-start cost.</li>
+  <li><strong>Function code:</strong> in either case the sandbox finally invokes your handler. Afterwards the environment is kept warm for a while, then frozen and reclaimed if idle.</li>
+</ol>
+
+<h2>The execution environment lifecycle</h2>
+<p>Lambda runs your code inside an <strong>execution environment</strong> — a sandboxed micro-VM (AWS uses Firecracker). Its life has distinct phases, and understanding them explains every latency surprise:</p>
+<ul>
+  <li><strong>Init (cold start):</strong> download your code, start the sandbox, bootstrap the runtime (Node/Python/etc.), and run your initialization code (everything outside the handler). This is the slow part.</li>
+  <li><strong>Invoke (warm):</strong> the handler runs. If the environment already exists from a previous request, you skip Init entirely — this is a warm start and it's fast.</li>
+  <li><strong>Shutdown:</strong> after a period of inactivity, AWS freezes then destroys the environment to reclaim resources. The next request after that pays a cold start again.</li>
+</ul>
+
+<h2>The core hard problem: cold starts vs warm containers</h2>
+<p>A request arrives. If there's a free, already-initialized environment, route to it → <strong>warm</strong>, milliseconds. If none is free, spin up a new one → <strong>cold start</strong>, tens to hundreds of ms (sometimes seconds with big dependencies or VPC attachment). This is exactly what the demo simulates.</p>
+<table>
+  <tr><th>Warm start</th><td>Reuses an existing environment. Fast (~1-10ms overhead). But the environment may hold leftover state from the last invocation — global variables persist!</td></tr>
+  <tr><th>Cold start</th><td>Fresh, clean environment. Pays full Init cost. Worse for latency-sensitive, spiky traffic.</td></tr>
+  <tr><th>Provisioned concurrency</th><td>Pre-warm N environments so they're always ready → no cold starts. Costs money even when idle.</td></tr>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> because warm environments are reused, global/module-scope state survives between invocations. Caching a DB connection there is good; accidentally leaking one user's data into a global that the next user reads is a real bug. Treat the handler as stateless; treat globals as a per-environment cache only.</div>
+
+<h2>Concurrency &amp; auto-scaling</h2>
+<p>Concurrency = number of requests executing <em>at the same instant</em>. One environment handles exactly one request at a time. So to serve 100 simultaneous requests, Lambda needs 100 environments. It scales by spinning up environments on demand, up to an account/function limit.</p>
+<p>Concrete numbers make the model click. The default account limit is <strong>1,000 concurrent executions per region</strong> (raisable to tens of thousands). A useful identity is <em>concurrency ≈ request rate × average duration</em>: 1,000 requests/sec at 50ms each needs only ~50 environments, but 1,000 req/sec at 2s each needs ~2,000 — over the default cap. Lambda scales by adding up to <strong>1,000 new environments every 10 seconds per function</strong> (a burst then a ramp), which is <strong>why</strong> a sudden 0→10,000 spike produces a wave of cold starts rather than instant capacity: provisioning thousands of micro-VMs simultaneously would blow the per-host density and warm-pool budget. A cold start adds anywhere from ~100ms (small Node/Python) to over 1s (large dependencies, or +several hundred ms historically for VPC attachment), while a warm start adds only ~1–10ms — the gap that drives the entire warm-vs-cold tradeoff.</p>
+<ul>
+  <li><strong>Concurrency limit:</strong> a cap (default ~1000/region) protects downstream systems and the platform. Hit it and extra requests are <strong>throttled</strong> (429 / retried).</li>
+  <li><strong>Scale-up rate:</strong> Lambda adds capacity in bursts then ramps; a sudden 0→10,000 spike causes many cold starts at once.</li>
+  <li><strong>Reserved concurrency:</strong> carve out a guaranteed slice for a critical function so a noisy neighbour can't starve it.</li>
+</ul>
+
+<h2>The execution sandbox &amp; isolation</h2>
+<p>Multi-tenancy is the cost story: AWS packs many customers' functions onto shared hardware. Security demands that one tenant can't read another's memory or escape the sandbox. AWS built <strong>Firecracker</strong>, a lightweight micro-VM, to get VM-grade isolation with container-like startup speed (boots in ~125ms) and tiny memory overhead — so they can run thousands of micro-VMs per host densely <em>and</em> safely.</p>
+<div class="callout tip"><strong>Senior tip:</strong> "why not just containers?" Plain containers share the host kernel — a kernel exploit breaks isolation across tenants. Firecracker gives each function its own kernel/VM boundary, which is why it's the right tradeoff for untrusted multi-tenant code.</div>
+
+<h2>Tradeoffs &amp; when not to use Lambda</h2>
+<table>
+  <tr><th>Great fit</th><td>Spiky/unpredictable load, event-driven glue, infrequent jobs — you pay nothing when idle and scale automatically.</td></tr>
+  <tr><th>Poor fit</th><td>Steady high-throughput workloads (a 24/7 server is cheaper), very latency-sensitive paths (cold starts), long-running tasks (15-min cap), heavy local state.</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is a cold start and why does it happen?</summary><p>A cold start is when a request has no free pre-initialized environment, so Lambda must create one: start the micro-VM, bootstrap the runtime, and run your init code. It happens on the first request, after scale-up, or after idle environments are reclaimed. Warm starts skip all of this by reusing an existing environment.</p></details>
+  <details><summary>Why can global variables persist between invocations, and is that good or bad?</summary><p>Because Lambda reuses warm environments, module-scope state outlives a single invocation. Good for caching expensive resources like DB connections; dangerous if you store request-specific or user data in globals, since the next request in the same environment could read it.</p></details>
+  <details><summary>How does Lambda achieve concurrency, and what happens at the limit?</summary><p>Each environment serves one request at a time, so concurrency N requires N environments, which Lambda spins up on demand. Past the account/function concurrency limit, additional requests are throttled (429) and event sources may retry.</p></details>
+  <details><summary>Why does AWS use Firecracker micro-VMs instead of plain containers?</summary><p>Plain containers share the host kernel, so a kernel escape breaks tenant isolation. Firecracker gives each function a separate minimal VM (its own kernel) with VM-grade isolation but ~125ms boot and tiny overhead, enabling safe high-density multi-tenancy.</p></details>
+  <details><summary>How would you eliminate cold starts for a latency-critical API?</summary><p>Use Provisioned Concurrency to keep a set of environments pre-initialized and ready, so requests always hit a warm environment. Trade-off: you pay for that reserved capacity even when idle, partially giving up the pay-per-use benefit.</p></details>
+  <details><summary>How many concurrent environments do you need for 500 req/sec at 200ms each?</summary><p>Use concurrency ≈ request rate × average duration = 500 × 0.2s = ~100 environments. That sits well under the default 1,000/region limit, so no throttling — but if duration jumped to 2.5s you'd need ~1,250 and would hit the cap, requiring a limit increase or reserved concurrency.</p></details>
+</div>

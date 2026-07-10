@@ -19,6 +19,7 @@
   <tr><th>Use when</th><td>Event sourcing, analytics pipelines, log aggregation, huge fan-out.</td><td>Task queues, complex routing, RPC-style work distribution.</td></tr>
 </table>
 <p>Kafka <strong>consumer groups</strong>: each partition is read by exactly one consumer in a group, so adding consumers (up to the partition count) scales throughput while preserving per-partition order.</p>
+<div class="callout tip"><strong>Deeper dive:</strong> this page is the head-to-head comparison; for implementation depth see <a href="#mastery::kafka">Kafka (Mastery)</a> and <a href="#mastery::rabbitmq">RabbitMQ (Mastery)</a>.</div>
 
 <h2>Delivery guarantees</h2>
 <ul>

@@ -1,0 +1,118 @@
+<h1>How the Stock Exchange Works <span class="tag express">Case Study</span></h1>
+<p>A stock exchange is, at its heart, a giant <strong>matching engine</strong>: millions of people send buy and sell intentions, and the system must pair them up fairly and instantly. The interesting system-design problem is doing this with <strong>microsecond latency</strong>, perfect <strong>fairness</strong> (who got there first?), and zero tolerance for losing or duplicating a single trade — all at once.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 260" role="img" aria-label="Orders enter the gateway, are sequenced into one ordered stream, matched against the in-memory order book, journaled for durability, and fanned out to trade and market-data feeds">
+    <defs>
+      <marker id="arr-stock-exchange" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <!-- row 1: gateway -> sequencer -> matching engine -->
+    <rect class="box" x="16" y="98" width="120" height="56" rx="9"></rect>
+    <text class="lbl" x="76" y="122" text-anchor="middle">Order Gateway</text>
+    <text class="sub" x="76" y="140" text-anchor="middle">auth / validate</text>
+
+    <rect class="box" x="186" y="98" width="120" height="56" rx="9"></rect>
+    <text class="lbl" x="246" y="122" text-anchor="middle">Sequencer</text>
+    <text class="sub" x="246" y="140" text-anchor="middle">total order</text>
+
+    <rect class="box-accent" x="356" y="86" width="150" height="80" rx="9"></rect>
+    <text class="lbl" x="431" y="112" text-anchor="middle">Matching Engine</text>
+    <text class="sub" x="431" y="130" text-anchor="middle">order book (RAM)</text>
+    <text class="sub" x="431" y="146" text-anchor="middle">bids / asks</text>
+
+    <line class="edge" x1="136" y1="126" x2="180" y2="126" marker-end="url(#arr-stock-exchange)"></line>
+    <text class="cap" x="158" y="118" text-anchor="middle">orders</text>
+    <line class="edge" x1="306" y1="126" x2="350" y2="126" marker-end="url(#arr-stock-exchange)"></line>
+    <text class="cap" x="328" y="118" text-anchor="middle">seq #</text>
+
+    <!-- journal below matching engine -->
+    <rect class="box" x="356" y="196" width="150" height="48" rx="9"></rect>
+    <text class="lbl" x="431" y="217" text-anchor="middle">Journal</text>
+    <text class="sub" x="431" y="233" text-anchor="middle">append-only, replicated</text>
+    <line class="edge" x1="431" y1="166" x2="431" y2="190" marker-end="url(#arr-stock-exchange)"></line>
+    <text class="cap" x="467" y="183" text-anchor="middle">persist</text>
+
+    <!-- feeds -->
+    <rect class="box" x="566" y="46" width="138" height="50" rx="9"></rect>
+    <text class="lbl" x="635" y="68" text-anchor="middle">Trade Feed</text>
+    <text class="sub" x="635" y="84" text-anchor="middle">fills / executions</text>
+
+    <rect class="box" x="566" y="156" width="138" height="50" rx="9"></rect>
+    <text class="lbl" x="635" y="178" text-anchor="middle">Market-Data Feed</text>
+    <text class="sub" x="635" y="194" text-anchor="middle">book / prices</text>
+
+    <line class="edge" x1="506" y1="116" x2="562" y2="78" marker-end="url(#arr-stock-exchange)"></line>
+    <text class="cap" x="540" y="92" text-anchor="middle">trades</text>
+    <line class="edge" x1="506" y1="140" x2="562" y2="176" marker-end="url(#arr-stock-exchange)"></line>
+    <text class="cap" x="540" y="166" text-anchor="middle">quotes</text>
+  </svg>
+  <div class="diagram-cap">Figure: orders flow through a gateway and sequencer into the single in-memory matching engine, which journals every event and emits trade and market-data feeds.</div>
+</div>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Order Gateway</strong> receives an order, authenticates the trader, validates the symbol/price/size, rate-limits, then forwards it inward. Many gateways run in parallel.</li>
+  <li><strong>Sequencer</strong> merges all gateways' orders into one <em>totally ordered</em> stream and stamps each with a monotonic sequence number — this single point is what makes fairness (price-time priority) well-defined.</li>
+  <li><strong>Matching Engine</strong> (the star) reads that stream on a single thread and applies each event to the in-memory <strong>order book</strong> (bids/asks), matching crossing orders and generating fills.</li>
+  <li><strong>Journal</strong> records every event append-only and replicated <em>before</em> it is applied, so the exact book can be rebuilt by replay after a crash.</li>
+  <li><strong>Trade Feed</strong> publishes executions to participants and downstream clearing/settlement.</li>
+  <li><strong>Market-Data Feed</strong> broadcasts the updated book state and last price to millions of subscribers via a separate read-optimized pipeline.</li>
+</ol>
+
+<h2>Requirements: what must it actually do?</h2>
+<p>Before designing anything, separate <em>what the system does</em> (functional) from <em>how well it must do it</em> (non-functional). Confusing these is the #1 fresher mistake.</p>
+<ul>
+  <li><strong>Functional:</strong> accept orders (buy/sell, limit/market), maintain an order book per symbol, match crossing orders, broadcast trades and price updates, allow cancellation.</li>
+  <li><strong>Non-functional:</strong> ultra-low latency (often &lt;100 microseconds end-to-end), determinism (same inputs → same trades, always), fairness (strict ordering), durability (a confirmed trade is never lost), and high throughput (millions of orders/second at peak).</li>
+</ul>
+<p><strong>Putting numbers on it:</strong> a top-tier matching engine processes a single order in roughly <strong>1–10 microseconds</strong> in-core, and the wire-to-wire ("tick-to-trade") path is budgeted at <strong>tens of microseconds</strong>. NASDAQ's INET and the LMAX Disruptor are both engineered around this: LMAX famously demonstrated <strong>~6 million orders/second on one thread</strong> by eliminating locks and cache misses. Why so extreme? Because latency is a competitive product — a market maker quoting a price needs to cancel and re-quote faster than a rival can pick off a stale quote. A few microseconds of jitter is the difference between a profitable and a losing strategy, so exchanges co-locate clients in the same data center and measure latency in <em>nanoseconds of variance</em>.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Notice that "availability" is NOT the top priority here, unlike a typical web app. Correctness and fairness beat uptime — an exchange would rather halt trading than execute trades in the wrong order. Knowing which property to sacrifice is the whole game.</div>
+
+<h2>The core hard problem: the matching engine</h2>
+<p>The matching engine is the beating heart. It holds the <strong>order book</strong> — two sorted lists per symbol: <strong>bids</strong> (buyers, sorted highest price first) and <strong>asks</strong> (sellers, sorted lowest price first). A trade happens when the best bid price meets or exceeds the best ask price (they "cross").</p>
+<p>The tie-breaking rule is <strong>price-time priority</strong>:</p>
+<ul>
+  <li><strong>Price first:</strong> a buyer willing to pay more gets served before a buyer offering less. Best price wins.</li>
+  <li><strong>Time second:</strong> among orders at the same price, the one that arrived earliest gets filled first. First come, first served.</li>
+</ul>
+<p>Think of it like a single-file queue at a bakery, except people who offer more money get to cut to the front. Within the same offer, it's pure FIFO.</p>
+
+<h2>Why a single thread? Determinism over parallelism</h2>
+<p>Surprisingly, the matching core for one symbol usually runs on a <strong>single thread</strong> (often pinned to one CPU core). A fresher's instinct is "parallelize for speed!" — but here that breaks fairness, because two threads could match the same order or reorder events.</p>
+<table>
+  <tr><th>Single-threaded matcher</th><td>Deterministic, trivially correct ordering, no locks. Limited to ~one core's throughput per symbol, but symbols can be sharded across cores. This is what real exchanges (LMAX, NASDAQ) do.</td></tr>
+  <tr><th>Multi-threaded matcher</th><td>More raw throughput per symbol, but needs locks/coordination that add latency and risk non-deterministic ordering — fatal for fairness. Almost never used for the core match loop.</td></tr>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> Sharding by symbol works only because orders for different symbols never interact. An order for AAPL can never match against MSFT, so each symbol is an independent matching engine. This is why exchanges scale horizontally by symbol, not by splitting one symbol's book.</div>
+
+<h2>Data model and storage: in-memory first</h2>
+<p>The live order book lives <strong>entirely in RAM</strong> — disk is far too slow for microsecond matching. But RAM is volatile, so durability comes from an <strong>append-only event log</strong>: every incoming order/cancel is written sequentially to a journal (and replicated) <em>before</em> it is processed.</p>
+<ul>
+  <li><strong>Event sourcing:</strong> the book is never stored directly; it is <em>derived</em> by replaying the ordered log of events. Crash? Replay the log and rebuild the exact same book.</li>
+  <li><strong>Sequential writes:</strong> appending to a log is the fastest durable write a disk can do (no random seeks).</li>
+  <li><strong>Replication:</strong> the log is streamed to backup machines so a failover replays the identical sequence and gets an identical book.</li>
+</ul>
+
+<h2>Consistency and atomicity</h2>
+<p>A match must be <strong>atomic</strong>: when a buy and sell cross, both sides fill (or partially fill) together — you can never debit the seller's shares without crediting the buyer. Because matching is single-threaded and in-memory, atomicity is easy: one thread processes one order to completion before touching the next. No partial states are ever visible.</p>
+<div class="callout tip"><strong>Senior tip:</strong> This is the elegance of the design — by serializing all events through one ordered log and one thread, you get atomicity, consistency, and determinism almost for free. The hard distributed-systems problems are pushed to the <em>edges</em> (gateways, market-data fan-out, settlement), keeping the sacred core simple.</div>
+
+<h2>Scaling and the rest of the pipeline</h2>
+<p>The matching core is fast but small. The surrounding system absorbs scale:</p>
+<ul>
+  <li><strong>Gateways:</strong> many front-end servers validate, authenticate, and rate-limit orders, then forward them into the single ordered stream.</li>
+  <li><strong>Market data fan-out:</strong> after each trade, the new book state and last price are broadcast to potentially millions of subscribers via a separate read-optimized pipeline (multicast / pub-sub).</li>
+  <li><strong>Clearing &amp; settlement:</strong> a trade on the exchange is just a promise; actual money/share transfer happens afterward in a separate (slower, eventually-consistent) settlement system.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is price-time priority and why does it matter?</summary><p>It's the matching rule: orders are filled by best price first, and among equal prices by earliest arrival time. It matters because it defines <em>fairness</em> — without a deterministic rule, two traders offering the same price would have no defined order, which could be exploited or disputed. It makes the engine's output predictable and auditable.</p></details>
+  <details><summary>Why run the matching engine on a single thread?</summary><p>To guarantee deterministic ordering and atomicity without locks. Multiple threads could reorder events or partially apply a match, breaking fairness. A single thread processes one event fully before the next, so the book is always in a consistent state. Throughput is scaled by sharding different symbols onto different cores, not by parallelizing one symbol.</p></details>
+  <details><summary>How do you keep an in-memory order book durable across crashes?</summary><p>Event sourcing: write every order/cancel to an append-only, replicated log <em>before</em> applying it. The book is a derived view, rebuilt by replaying the log. After a crash, replay the log (and the replica continues from the same sequence) to reconstruct the identical book. Sequential log writes are fast enough to stay on the latency budget.</p></details>
+  <details><summary>How does the exchange scale to millions of orders per second?</summary><p>Shard by symbol — each symbol is an independent matching engine, so they run on separate cores/machines with no coordination. Front-end gateways scale horizontally to handle validation and connections, and market-data distribution is a separate read-side pipeline (multicast/pub-sub) decoupled from matching.</p></details>
+  <details><summary>What happens to an order that doesn't immediately match?</summary><p>A limit order that doesn't cross the opposite side <em>rests</em> in the book at its price, joining the queue at that price level by arrival time. It stays until it's matched by a future incoming order, cancelled, or expires. A market order, by contrast, matches against the best available prices immediately and any unfilled remainder is typically cancelled rather than rested.</p></details>
+  <details><summary>Why is there a separate sequencer in front of the matching engine?</summary><p>Multiple gateways accept orders concurrently, so their arrival order is ambiguous. The sequencer merges every order into one totally ordered stream with monotonic sequence numbers, establishing a single authoritative "who came first." That total order is what makes price-time priority deterministic and auditable, and it's also the exact order written to the journal and replayed on failover, so replicas rebuild an identical book.</p></details>
+</div>

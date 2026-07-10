@@ -1,0 +1,121 @@
+<h1>How LLMs Like ChatGPT Work <span class="tag express">Case Study</span></h1>
+<p>A Large Language Model (LLM) like ChatGPT does one deceptively simple thing over and over: <strong>predict the next token</strong>. Given the text so far, it outputs a probability distribution over what comes next, picks one, appends it, and repeats. This is <em>autoregressive generation</em>. The system-design interest is everything around that loop — tokenization, the transformer doing the prediction, how sampling controls creativity, the finite context window, and how to serve it cheaply with batching and a KV-cache.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 230" role="img" aria-label="LLM pipeline: prompt to tokenizer to transformer model with KV-cache to sampler, looping back to the model autoregressively, then detokenizer to text">
+    <defs>
+      <marker id="arr-chatgpt" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <!-- Prompt -->
+    <rect class="box" x="10" y="96" width="100" height="50" rx="9"></rect>
+    <text class="lbl" x="60" y="125" text-anchor="middle">Prompt</text>
+
+    <!-- Tokenizer -->
+    <rect class="box" x="138" y="96" width="116" height="50" rx="9"></rect>
+    <text class="lbl" x="196" y="117" text-anchor="middle">Tokenizer</text>
+    <text class="sub" x="196" y="133" text-anchor="middle">BPE → IDs</text>
+
+    <!-- Transformer (STAR) -->
+    <rect class="box-accent" x="282" y="96" width="140" height="50" rx="9"></rect>
+    <text class="lbl" x="352" y="117" text-anchor="middle">Transformer</text>
+    <text class="accent-text" x="352" y="133" text-anchor="middle">+ KV-cache</text>
+
+    <!-- Sampler -->
+    <rect class="box" x="450" y="96" width="124" height="50" rx="9"></rect>
+    <text class="lbl" x="512" y="117" text-anchor="middle">Sampler</text>
+    <text class="sub" x="512" y="133" text-anchor="middle">temp / top-k</text>
+
+    <!-- Detokenizer -->
+    <rect class="box" x="602" y="96" width="106" height="50" rx="9"></rect>
+    <text class="lbl" x="655" y="117" text-anchor="middle">Detokenizer</text>
+    <text class="sub" x="655" y="133" text-anchor="middle">IDs → text</text>
+
+    <!-- Text -->
+    <rect class="box" x="602" y="178" width="106" height="42" rx="9"></rect>
+    <text class="lbl" x="655" y="204" text-anchor="middle">Text out</text>
+
+    <!-- Forward edges -->
+    <line class="edge" x1="110" y1="121" x2="132" y2="121" marker-end="url(#arr-chatgpt)"></line>
+    <line class="edge" x1="254" y1="121" x2="276" y2="121" marker-end="url(#arr-chatgpt)"></line>
+    <text class="cap" x="265" y="113" text-anchor="middle">token IDs</text>
+    <line class="edge" x1="422" y1="121" x2="444" y2="121" marker-end="url(#arr-chatgpt)"></line>
+    <text class="cap" x="433" y="113" text-anchor="middle">logits</text>
+    <line class="edge" x1="574" y1="121" x2="596" y2="121" marker-end="url(#arr-chatgpt)"></line>
+    <text class="cap" x="585" y="113" text-anchor="middle">stop tok</text>
+    <line class="edge" x1="655" y1="146" x2="655" y2="172" marker-end="url(#arr-chatgpt)"></line>
+
+    <!-- Autoregressive loop: sampler back to model (dashed) -->
+    <path class="edge-dash" d="M512,96 C512,40 352,40 352,90" marker-end="url(#arr-chatgpt)"></path>
+    <text class="accent-text" x="432" y="36" text-anchor="middle">autoregressive loop: append token, re-feed</text>
+  </svg>
+  <div class="diagram-cap">Figure: the prompt is tokenized once, then each step runs the transformer (reusing its KV-cache) → sampler → appended token, looping back into the model until a stop token, after which the IDs are detokenized to text.</div>
+</div>
+
+<h2>Tokenization: text becomes numbers</h2>
+<p>Models don't see characters or words; they see <strong>tokens</strong> — integer IDs for common chunks of text. "tokenization" might split into <code>token</code> + <code>ization</code>. A scheme like Byte-Pair Encoding (BPE) learns a vocabulary of ~50k–100k frequent sub-words so any text (even typos, code, emoji) can be represented.</p>
+<ul>
+  <li><strong>Why sub-words, not words?</strong> A fixed word vocabulary can't handle unseen words; pure characters make sequences too long. Sub-words are the sweet spot: ~1 token ≈ 0.75 English words.</li>
+  <li><strong>Why it matters:</strong> you pay per token, the context window is measured in tokens, and the model's whole world is token IDs in, token IDs out.</li>
+</ul>
+
+<h2>Step-by-step request flow</h2>
+<p>Following the pipeline in the diagram, here is one response being generated:</p>
+<ol>
+  <li><strong>Prompt:</strong> your raw text (system + conversation + new message) arrives as a string.</li>
+  <li><strong>Tokenizer:</strong> BPE splits it into sub-word tokens and maps them to integer IDs — done once for the whole prompt.</li>
+  <li><strong>Transformer (★):</strong> the model runs self-attention over the sequence and emits a logit (score) for every token in the vocabulary. On the first pass it reads the whole prompt (prefill) and fills the <em>KV-cache</em>.</li>
+  <li><strong>Sampler:</strong> temperature scales the logits, top-k/top-p trims the candidate set, and one token is sampled from the resulting distribution.</li>
+  <li><strong>Autoregressive loop (dashed):</strong> the sampled token is appended and fed back into the transformer. Thanks to the KV-cache, this decode step only computes K/V for the one new token, not the whole history. Repeat until a stop token or length limit.</li>
+  <li><strong>Detokenizer → Text:</strong> the accumulated token IDs are mapped back to characters and streamed out as readable text.</li>
+</ol>
+
+<h2>The core loop: autoregressive next-token prediction</h2>
+<p>This is the heart of the demo. Generation is a loop:</p>
+<ul>
+  <li><strong>1.</strong> Feed the current token sequence into the model.</li>
+  <li><strong>2.</strong> It outputs a score (logit) for every token in the vocabulary — a probability distribution over "what comes next".</li>
+  <li><strong>3.</strong> <em>Sample</em> one token from that distribution.</li>
+  <li><strong>4.</strong> Append it to the sequence and go back to step 1, until you emit a stop token or hit a length limit.</li>
+</ul>
+<p>The demo uses a tiny n-gram (Markov) model instead of a transformer, but the loop is identical: build a next-token distribution from context, sample, append, repeat. "Just predicting the next token" is genuinely how fluent paragraphs emerge.</p>
+<div class="callout tip"><strong>Senior tip:</strong> the only fundamental difference between the toy n-gram and a real LLM is <em>how</em> the next-token distribution is computed. The n-gram looks up counts of the last word or two; the transformer uses attention over the entire context to produce a far richer distribution. The generation loop is exactly the same.</div>
+
+<h2>The transformer at inference time</h2>
+<p>The model that produces the distribution is a <strong>transformer</strong>. Its key mechanism is <em>self-attention</em>: for each position, it weighs how much every earlier token should influence the prediction here. That's how it captures long-range meaning ("it" refers to the noun three sentences back). At inference it runs forward only — no learning — turning the input tokens into that next-token distribution.</p>
+
+<h2>Sampling: temperature &amp; top-k</h2>
+<p>Step 3 — how you pick from the distribution — controls personality. Always taking the single most likely token (greedy) is repetitive and robotic; sampling adds variety.</p>
+<table>
+  <tr><th>Temperature</th><td>Scales the distribution before sampling. Low (→0) = sharp, deterministic, "safe". High (&gt;1) = flatter, more random/creative, risk of nonsense.</td></tr>
+  <tr><th>Top-k</th><td>Only consider the k most likely tokens, then sample among them. Prevents picking absurd low-probability tokens.</td></tr>
+  <tr><th>Top-p (nucleus)</th><td>Consider the smallest set of tokens whose probabilities sum to p. Adapts the candidate set to how confident the model is.</td></tr>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> high temperature feels "more creative" but can derail into incoherent text; temperature 0 is reproducible but bland and can loop. There's no single "best" — it's a knob you tune per use case (code completion wants low, brainstorming wants higher).</div>
+
+<h2>The context window</h2>
+<p>The model can only "see" a fixed number of tokens at once — the <strong>context window</strong> (e.g. 8k, 128k, 1M tokens). It includes your prompt <em>plus</em> everything generated so far. Run past it and the earliest tokens must be dropped or summarised — the model literally cannot attend to text outside the window.</p>
+<ul>
+  <li><strong>Why finite?</strong> Attention cost grows with sequence length, so longer windows cost more compute and memory.</li>
+  <li><strong>Consequence:</strong> "it forgot what I said earlier" usually means earlier turns fell out of the window.</li>
+</ul>
+
+<h2>Serving: batching &amp; the KV-cache</h2>
+<p>Generation is expensive and sequential (token N+1 needs token N). Two tricks make serving efficient:</p>
+<ul>
+  <li><strong>KV-cache:</strong> self-attention recomputes "keys" and "values" for all previous tokens every step. Instead, cache them after the first pass and reuse — so each new token only computes its own K/V, not the whole history. This turns generation from O(n²) per step into roughly O(n).</li>
+  <li><strong>Batching:</strong> GPUs are most efficient processing many sequences at once. Servers group concurrent requests (continuous/in-flight batching) to keep the GPU saturated and drive down cost per token.</li>
+</ul>
+<p>The numbers explain the user experience. A response is split into <strong>prefill</strong> (process all N prompt tokens in one parallel pass) and <strong>decode</strong> (generate one token at a time). Prefill is compute-bound and scales with prompt length — a 32k-token prompt does far more work before the first token appears, which is <strong>why</strong> "time to first token" climbs with context size and is often quoted separately (e.g. tens to low hundreds of ms for short prompts). Decode is memory-bandwidth-bound and runs at a steady <strong>per-token latency</strong> (commonly tens of ms, i.e. roughly 20–100 tokens/sec for a large model), which is the speed you see text streaming. Without the KV-cache, generating the 1,000th token would re-process all 999 prior tokens — O(n²) total — so the cache is what keeps decode roughly linear and makes long outputs affordable. Continuous batching then packs dozens of concurrent sequences into each GPU step; since decode is bandwidth-bound, adding more sequences raises total throughput (tokens/sec across users) with little extra per-step latency, which is <strong>why</strong> cost-per-token falls sharply as utilization rises.</p>
+<div class="callout tip"><strong>Senior tip:</strong> the KV-cache is why the first token of a response is slow (the "prefill" reads the whole prompt) but subsequent tokens stream out quickly (the "decode" phase reuses the cache). That prefill-vs-decode split shapes how LLM serving systems are designed and priced.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What does "autoregressive" mean for an LLM?</summary><p>It generates one token at a time, feeding each newly produced token back in as input for the next step. The next token is always conditioned on everything generated so far, so output is built left-to-right in a loop until a stop token or length limit.</p></details>
+  <details><summary>Why tokens instead of words or characters?</summary><p>Words can't handle unseen terms and need a huge vocabulary; characters make sequences too long and slow. Sub-word tokens (e.g. BPE) cover any text with a manageable vocabulary while keeping sequences short — about 1 token per 0.75 English words.</p></details>
+  <details><summary>What do temperature and top-k actually control?</summary><p>Both shape how the next token is sampled. Temperature scales the distribution: low makes it sharp/deterministic, high makes it flat/random. Top-k restricts sampling to the k most likely tokens, preventing rare nonsense tokens from being chosen.</p></details>
+  <details><summary>What is the context window and what happens when you exceed it?</summary><p>It's the fixed maximum number of tokens (prompt + generation) the model can attend to at once. Exceed it and the earliest tokens are dropped or summarized — the model can no longer "see" them, which is why long conversations seem to forget earlier details.</p></details>
+  <details><summary>What problem does the KV-cache solve?</summary><p>Without it, each generated token re-derives the attention keys/values for the entire history — O(n²) work. The KV-cache stores those per-token K/V vectors after computing them once, so each new step only computes its own, making decoding far cheaper and enabling fast token streaming.</p></details>
+</div>

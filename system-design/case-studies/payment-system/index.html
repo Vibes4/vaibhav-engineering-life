@@ -1,0 +1,113 @@
+<h1>How a Payment System Works <span class="tag express">Case Study</span></h1>
+<p>A payment system moves money between accounts and external processors. The fascinating thing is that, unlike most web systems, it optimizes for <strong>correctness over availability</strong>: it is far better to reject a payment than to charge someone twice or lose a cent. This forces three classic patterns — <strong>idempotency</strong>, the <strong>double-entry ledger</strong>, and the <strong>saga</strong> — that every senior engineer must know cold.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 250" role="img" aria-label="A client calls the payment API which dedupes on an idempotency-key store, posts double-entry rows through the ledger service, calls the external processor, and later receives an async webhook callback">
+    <defs>
+      <marker id="arr-payment-system" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <!-- client -->
+    <rect class="box" x="16" y="98" width="118" height="56" rx="9"></rect>
+    <text class="lbl" x="75" y="122" text-anchor="middle">Client</text>
+    <text class="sub" x="75" y="140" text-anchor="middle">+ idempotency key</text>
+
+    <!-- payment API -->
+    <rect class="box" x="184" y="98" width="128" height="56" rx="9"></rect>
+    <text class="lbl" x="248" y="122" text-anchor="middle">Payment API</text>
+    <text class="sub" x="248" y="140" text-anchor="middle">dedupe / route</text>
+
+    <!-- idempotency-key store above API -->
+    <rect class="box" x="184" y="16" width="128" height="48" rx="9"></rect>
+    <text class="lbl" x="248" y="37" text-anchor="middle">Idempotency Store</text>
+    <text class="sub" x="248" y="53" text-anchor="middle">key → result</text>
+
+    <!-- ledger service (star) -->
+    <rect class="box-accent" x="360" y="92" width="138" height="68" rx="9"></rect>
+    <text class="lbl" x="429" y="118" text-anchor="middle">Ledger Service</text>
+    <text class="sub" x="429" y="136" text-anchor="middle">double-entry</text>
+    <text class="sub" x="429" y="151" text-anchor="middle">debits == credits</text>
+
+    <!-- processor -->
+    <rect class="box" x="558" y="98" width="146" height="56" rx="9"></rect>
+    <text class="lbl" x="631" y="122" text-anchor="middle">Payment Processor</text>
+    <text class="sub" x="631" y="140" text-anchor="middle">card network / bank</text>
+
+    <!-- edges -->
+    <line class="edge" x1="134" y1="126" x2="178" y2="126" marker-end="url(#arr-payment-system)"></line>
+    <text class="cap" x="156" y="118" text-anchor="middle">charge</text>
+
+    <line class="edge" x1="248" y1="98" x2="248" y2="68" marker-end="url(#arr-payment-system)"></line>
+    <text class="cap" x="290" y="86" text-anchor="middle">check key</text>
+
+    <line class="edge" x1="312" y1="126" x2="354" y2="126" marker-end="url(#arr-payment-system)"></line>
+    <text class="cap" x="333" y="118" text-anchor="middle">post entries</text>
+
+    <line class="edge" x1="498" y1="120" x2="552" y2="120" marker-end="url(#arr-payment-system)"></line>
+    <text class="cap" x="525" y="112" text-anchor="middle">capture</text>
+
+    <!-- async webhook back (dashed) -->
+    <line class="edge-dash" x1="552" y1="142" x2="500" y2="142" marker-end="url(#arr-payment-system)"></line>
+    <text class="cap" x="525" y="160" text-anchor="middle">webhook (async)</text>
+  </svg>
+  <div class="diagram-cap">Figure: the API dedupes on the idempotency store, the ledger posts double-entry rows, the processor captures the money, and a dashed async webhook later confirms the final state.</div>
+</div>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Client</strong> sends "charge $50" with a unique <strong>idempotency key</strong> it reuses on every retry.</li>
+  <li><strong>Payment API</strong> looks the key up in the <strong>Idempotency Store</strong>. A hit returns the stored result immediately (no double charge); a miss proceeds.</li>
+  <li><strong>Ledger Service</strong> (the star) posts the <strong>double-entry</strong> rows — a debit and a matching credit — in one atomic transaction <em>together with</em> the idempotency key, moving the entry into a PENDING state.</li>
+  <li><strong>Payment Processor</strong> is called to actually capture the funds on the card network or bank.</li>
+  <li><strong>Webhook (async, dashed)</strong> arrives from the processor later, and the ledger transitions the entry to SETTLED or REVERSED. A nightly reconciliation job backstops any missed webhook.</li>
+</ol>
+
+<h2>Requirements: correctness is non-negotiable</h2>
+<ul>
+  <li><strong>Functional:</strong> charge/refund, transfer between accounts, talk to external processors (Stripe, banks), record every movement, report balances.</li>
+  <li><strong>Non-functional:</strong> <em>exactly-once</em> money movement (the holy grail), auditability (every cent traceable), strong consistency of balances, durability, and reasonable availability — but availability bends before correctness ever does.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Phrase it as the CAP tradeoff: a payment system chooses <strong>C over A</strong>. When in doubt, it stops and asks/retries rather than guessing — because an incorrect debit is a real-world financial loss, while a brief outage is merely an inconvenience.</div>
+
+<h2>The core hard problem: never charge twice</h2>
+<p>Networks are unreliable. A client sends "charge $50", the charge succeeds, but the response is lost. The client retries. Without protection, the user is charged $100. This is the <strong>at-least-once delivery</strong> reality of distributed systems — you cannot prevent retries, so you must make them <em>safe</em>.</p>
+<p>The fix is the <strong>idempotency key</strong>: the client generates a unique key per logical operation and sends it with every retry. The server records the key with the result. If a request arrives with a key it has already processed, it returns the <em>stored original result</em> instead of doing the work again.</p>
+<div class="callout warn"><strong>Gotcha:</strong> The idempotency record and the actual money movement must be committed in the <em>same atomic transaction</em>. If you write the ledger entry but crash before saving the key, a retry double-charges. If you save the key but crash before the ledger entry, the money never moves but retries are blocked. Atomicity binds them together.</div>
+
+<h2>Data model: the double-entry ledger</h2>
+<p>Banks have used double-entry bookkeeping for 500 years because it makes errors mathematically visible. Every transaction writes <strong>at least two entries</strong>: a <strong>debit</strong> from one account and a matching <strong>credit</strong> to another. The iron law: <em>total debits always equal total credits</em>. Money is never created or destroyed, only moved.</p>
+<table>
+  <tr><th>Mutable balance column</th><td>Simple, but you only see the current number. No history, hard to audit, and a bug can silently make money appear/vanish with nothing to detect it.</td></tr>
+  <tr><th>Append-only double-entry ledger</th><td>Balance is the <em>sum</em> of immutable entries. Full audit trail, and the debits==credits invariant is a built-in self-check. The industry standard.</td></tr>
+</table>
+<ul>
+  <li><strong>Append-only:</strong> entries are never updated or deleted. A correction is a <em>new reversing entry</em>, preserving history.</li>
+  <li><strong>Balance = sum of entries:</strong> derived, never stored as a mutable truth, so it can always be recomputed and verified.</li>
+</ul>
+
+<h2>Talking to the outside world: the saga pattern</h2>
+<p>A real payment spans multiple systems — your ledger, a fraud check, the card network, the merchant's bank. You cannot hold one giant ACID transaction across all of them (they're separate companies with separate databases). Instead you use a <strong>saga</strong>: a sequence of local transactions, each with a <strong>compensating action</strong> that undoes it if a later step fails.</p>
+<ul>
+  <li><strong>Step:</strong> reserve funds → call processor → confirm. Each step commits locally.</li>
+  <li><strong>Compensation:</strong> if the processor declines, run "release reserved funds" to roll back logically — you can't un-commit, so you post a reversing entry.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Sagas trade atomicity for <em>eventual consistency</em>. There will be brief windows where money is "in flight" (reserved but not settled). Model these explicitly as states (PENDING, SETTLED, REVERSED) rather than pretending the transfer is instantaneous — hiding the in-flight state is how bugs hide too.</div>
+
+<h2>Consistency with external processors</h2>
+<p>The external processor (e.g. a card network) is the source of truth for whether money actually moved, and it's eventually consistent. Two tools keep your ledger aligned:</p>
+<ul>
+  <li><strong>Webhooks:</strong> the processor calls you back when a charge settles or fails, so you update the in-flight entry to its final state.</li>
+  <li><strong>Reconciliation:</strong> a daily batch job compares your ledger against the processor's report and flags any mismatch — the ultimate safety net that catches lost webhooks or bugs.</li>
+</ul>
+<p><strong>Putting numbers on it:</strong> webhooks are best-effort, not guaranteed — processors typically retry a failed delivery with exponential backoff for up to <strong>~72 hours</strong>, and a small fraction never arrive. That is precisely why reconciliation is non-negotiable rather than a nice-to-have. On scale: the ledger must hold the line on <strong>strong consistency</strong> for balances (a read of an account must reflect every committed entry), while the surrounding API can run at, say, <strong>p99 &lt; 300 ms</strong> for the synchronous authorize step. Settlement itself is deliberately asynchronous and can take <strong>T+1 to T+2 days</strong> for card rails — so the system models money as in-flight (PENDING) for hours or days, never pretending the transfer is instant. The reconciliation invariant is exact: <em>sum of debits == sum of credits</em>, checked across <em>every</em> account, every night; a single mismatched cent is treated as a sev-1 incident.</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is an idempotency key and how does it prevent double charges?</summary><p>A unique client-generated identifier for one logical operation, sent with the original request and every retry. The server stores it alongside the operation's result. On seeing a key it has already processed, it returns the saved result instead of repeating the work. This turns an unsafe at-least-once retry into a safe exactly-once effect.</p></details>
+  <details><summary>Why must the idempotency key be saved in the same transaction as the money movement?</summary><p>So they succeed or fail together. If only the money moves and the key isn't saved, a retry re-charges; if only the key is saved, the money never moves but retries are blocked. A single atomic transaction guarantees the key exists exactly when the effect exists, making the operation truly idempotent across crashes.</p></details>
+  <details><summary>What is double-entry bookkeeping and why use it in software?</summary><p>Every transaction records equal debits and credits across accounts, so total debits always equal total credits. In software it gives an append-only audit trail and a built-in invariant: if debits != credits, you have a bug. It makes money impossible to silently create or destroy, which is exactly the guarantee a payment system needs.</p></details>
+  <details><summary>What is the saga pattern and when do you need it?</summary><p>A way to coordinate a transaction across multiple independent systems that can't share one ACID transaction. It's a sequence of local transactions, each paired with a compensating action that logically undoes it. If a later step fails, you run the compensations in reverse. You need it whenever a business operation spans services/databases you don't control jointly.</p></details>
+  <details><summary>How do you stay consistent with an external processor that's eventually consistent?</summary><p>Model in-flight states (PENDING/SETTLED/REVERSED) explicitly, react to the processor's webhooks to move entries to their final state, and run a periodic reconciliation job that diffs your ledger against the processor's report to catch any missed updates. Reconciliation is the backstop that guarantees the books eventually agree.</p></details>
+  <details><summary>If webhooks can be lost, why not just rely on them and skip reconciliation?</summary><p>Webhooks are best-effort delivery over the public internet — they can be dropped, delayed, duplicated, or arrive out of order, and processors only retry for a bounded window (often ~72h). Relying on them alone means a lost webhook leaves an entry stuck in PENDING forever, silently diverging your books from reality. Reconciliation is the authoritative, pull-based source of truth: by diffing your ledger against the processor's settlement report on a schedule, you catch every gap regardless of webhook reliability. Webhooks make you fast; reconciliation makes you correct.</p></details>
+</div>

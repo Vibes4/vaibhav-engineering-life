@@ -3,6 +3,12 @@
    Also handles the persisted dark-mode toggle. */
 
 const MODULES = {
+  "Quick Recap": {
+    folder: "recap",
+    items: [
+      ["interview-20min", "⚡ 20-Min Interview Recap", "Node, Angular, SQL, Docker, micro…"]
+    ]
+  },
   "JavaScript": {
     folder: "javascript",
     items: [
@@ -288,22 +294,77 @@ const MODULES = {
     ]
   },
   "System Design": {
-    folder: "system-design",
+    folder: "system-design", divider: "System Design",
     items: [
       ["fundamentals",         "SD fundamentals",      "scalability, CAP, load balancing"],
       ["caching",              "Caching & Redis",      "patterns, eviction, invalidation"],
       ["message-queues",       "Message queues",       "Kafka, RabbitMQ, async work"],
-      ["rate-limiter",         "Rate limiter",         "token bucket, sliding window"],
       ["url-shortener",        "URL shortener",        "base62, hashing, scale"],
       ["chat-system",          "Chat system",          "websockets, fan-out, presence"],
       ["notification-service", "Notification service", "push/email, queues, retries"],
       ["file-upload",          "File upload service",  "chunking, presigned URLs"]
     ]
   },
-  "Wrap-up": {
-    folder: "express-specific",
+  "How Products Work": {
+    folder: "system-design/case-studies", collapsed: true, divider: "System Design · Case Studies",
     items: [
-      ["why-express",     "Why Express over Node?", "what Express adds on top of node"]
+      ["reddit",              "How Reddit Works",              "hot ranking, votes, read-heavy"],
+      ["airbnb",              "How Airbnb Works",              "geo+date search, no double-booking"],
+      ["twitter-timeline",    "How Twitter Timeline Works",    "fan-out on write vs read"],
+      ["slack",               "How Slack Works",               "websockets, channel fan-out, presence"],
+      ["google-docs",         "How Google Docs Works",         "OT/CRDT collaborative editing"],
+      ["bluesky",             "How Bluesky Works",             "AT Protocol, feed generators"],
+      ["stock-exchange",      "How the Stock Exchange Works",  "order book, price-time matching"],
+      ["payment-system",      "How a Payment System Works",    "idempotency, double-entry ledger"],
+      ["spotify",             "How Spotify Works",             "CDN streaming, adaptive bitrate"],
+      ["tinder",              "How Tinder Works",              "geo proximity, mutual match"],
+      ["uber-nearby-drivers", "How Uber Finds Drivers",        "geohash/quadtree proximity"],
+      ["youtube",             "How YouTube Works",             "transcode ladder, CDN, ABR"],
+      ["whatsapp",            "How WhatsApp Works",            "E2E encryption, delivery receipts"],
+      ["airtag",              "How Apple AirTag Works",        "Find My network, rotating keys"]
+    ]
+  },
+  "How Technologies Work": {
+    folder: "system-design/case-studies",
+    items: [
+      ["s3",                  "How AWS S3 Works",              "object storage, consistent hashing"],
+      ["lambda",              "How AWS Lambda Works",          "serverless, cold starts, scaling"],
+      ["chatgpt",             "How LLMs Like ChatGPT Work",    "tokens, autoregression, sampling"]
+    ]
+  },
+  "Core Topics": {
+    folder: "mastery", divider: "Senior Backend Interview Mastery",
+    items: [
+      ["mongodb",                "MongoDB",                "replica sets, sharding, WiredTiger, oplog"],
+      ["networking",             "Networking",             "TCP/TLS/HTTP, DNS, load balancing"],
+      ["cloud",                  "Cloud",                  "compute, storage, networking, IAM"],
+      ["cloud-providers",        "Cloud: AWS vs Azure vs GCP","service equivalents + unique features"],
+      ["infrastructure",         "Infrastructure",         "containers, IaC, CI/CD, service mesh"],
+      ["kubernetes",             "Kubernetes",             "pods, controllers, scheduling, probes"],
+      ["redis",                  "Redis",                  "single-thread, persistence, cluster"],
+      ["rabbitmq",               "RabbitMQ",               "exchanges, acks, DLQ, backpressure"],
+      ["kafka",                  "Kafka",                  "partitions, ISR, consumer groups, lag"],
+      ["distributed-systems",    "Distributed Systems",    "CAP, consensus, consistency, clocks"],
+      ["performance-engineering","Performance Engineering","latency, throughput, profiling, p99"],
+      ["production-scenarios",   "Production Scenarios",   "incidents: RCA, debugging, prevention"]
+    ]
+  },
+  "Networking Deep-Dives": {
+    folder: "mastery",
+    items: [
+      ["tls",             "TLS / SSL",                "handshake, certs, mTLS, ciphers"],
+      ["dns",             "DNS",                      "resolution, records, anycast, DNSSEC"],
+      ["http",            "HTTP/1.1 · 2 · 3 · QUIC",  "multiplexing, HOL blocking, caching"],
+      ["load-balancing",  "Load Balancing & Proxies", "L4/L7, algorithms, health checks"]
+    ]
+  },
+  "Reliability & Security": {
+    folder: "mastery",
+    items: [
+      ["observability",   "Observability",                 "metrics, logs, traces, OTel, SLO"],
+      ["rate-limiting",   "Rate Limiting & Resiliency",    "token bucket, breakers, backoff"],
+      ["auth",            "Auth · OAuth2 / OIDC / JWT / mTLS","tokens, flows, sessions, RBAC"],
+      ["concurrency",     "Concurrency & Async",           "event loop, locks, races, CAS"]
     ]
   }
 };
@@ -316,37 +377,68 @@ const search  = document.getElementById("search");
 const flat = {};
 const keyOf = (folder, slug) => `${folder}::${slug}`;
 
+function renderItems(parent, { folder, items }) {
+  items.forEach(([slug, name, blurb]) => {
+    const key = keyOf(folder, slug);
+    flat[key] = { folder, slug, name, blurb };
+    const a = document.createElement("a");
+    a.className = "nav-item";
+    a.dataset.key = key;
+    a.href = "#" + key;
+    a.innerHTML = `${name}<small>${blurb}</small>`;
+    parent.appendChild(a);
+  });
+}
+
+function renderGroupInto(parent, [group, def]) {
+  const details = document.createElement("details");
+  details.className = "nav-group";
+  details.open = !def.collapsed;               // collapsed groups start closed
+  details._defaultOpen = details.open;         // remembered so search-clear can restore it
+  const summary = document.createElement("summary");
+  summary.className = "nav-group-title";
+  summary.textContent = group;
+  details.appendChild(summary);
+  renderItems(details, def);
+  parent.appendChild(details);
+}
+
 function buildNav() {
   navList.innerHTML = "";
-  for (const [group, { folder, items, collapsed, divider }] of Object.entries(MODULES)) {
-    if (divider) {                             // labelled separator before a block of groups
-      const dv = document.createElement("div");
-      dv.className = "nav-section-divider";
-      dv.textContent = divider;
-      navList.appendChild(dv);
-    }
 
-    const details = document.createElement("details");
-    details.className = "nav-group";
-    details.open = !collapsed;                 // expanded by default; collapsed groups start closed
-
-    const summary = document.createElement("summary");
-    summary.className = "nav-group-title";
-    summary.textContent = group;
-    details.appendChild(summary);
-
-    items.forEach(([slug, name, blurb]) => {
-      const key = keyOf(folder, slug);
-      flat[key] = { folder, slug, name, blurb };
-      const a = document.createElement("a");
-      a.className = "nav-item";
-      a.dataset.key = key;
-      a.href = "#" + key;
-      a.innerHTML = `${name}<small>${blurb}</small>`;
-      details.appendChild(a);
-    });
-    navList.appendChild(details);
+  // A `divider` starts a new collapsible MEGA-section that owns every group
+  // declared after it (until the next divider). Groups before the first divider
+  // stay "loose" at the top of the nav (the core curriculum).
+  const looseGroups = [];
+  const sections = [];          // { title, groups: [[name, def], ...] }
+  let current = null;
+  for (const entry of Object.entries(MODULES)) {
+    if (entry[1].divider) { current = { title: entry[1].divider, groups: [] }; sections.push(current); }
+    (current ? current.groups : looseGroups).push(entry);
   }
+
+  looseGroups.forEach(entry => renderGroupInto(navList, entry));
+
+  sections.forEach(sec => {
+    const wrap = document.createElement("details");
+    wrap.className = "nav-divider-group";
+    const single = sec.groups.length === 1;
+    // single-group section inherits that group's collapsed flag; multi-group opens by default
+    wrap.open = single ? !sec.groups[0][1].collapsed : true;
+    wrap._defaultOpen = wrap.open;
+
+    const sum = document.createElement("summary");
+    sum.className = "nav-section-divider";
+    sum.textContent = sec.title;
+    wrap.appendChild(sum);
+
+    // For a lone group the inner title would just echo the section label, so
+    // render its items directly; multi-group sections keep their sub-headers.
+    if (single) renderItems(wrap, sec.groups[0][1]);
+    else sec.groups.forEach(entry => renderGroupInto(wrap, entry));
+
+    navList.appendChild(wrap);
+  });
 }
 
 function escapeHtml(s) {
@@ -392,17 +484,71 @@ function groupIntoAccordions(root) {
   root.appendChild(frag);
 }
 
+/* Insert a "Collapse all / Expand all" control above the concept accordions so
+   the whole page can be folded down to its headings in one click. The label
+   stays in sync if the user opens/closes individual panels by hand. */
+function addAccordionToolbar(root) {
+  const panels = root.querySelectorAll("details.acc");
+  if (panels.length < 2) return;              // not worth a button for a tiny page
+
+  const bar = document.createElement("div");
+  bar.className = "acc-toolbar";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "acc-toggle-all";
+
+  const sync = () => {
+    const anyOpen = Array.from(panels).some(p => p.open);
+    btn.textContent = anyOpen ? "⊟ Collapse all" : "⊞ Expand all";
+    btn.dataset.action = anyOpen ? "collapse" : "expand";
+  };
+  btn.addEventListener("click", () => {
+    const expand = btn.dataset.action === "expand";
+    panels.forEach(p => { p.open = expand; });
+    sync();
+  });
+  panels.forEach(p => p.addEventListener("toggle", sync));
+  sync();
+
+  bar.appendChild(btn);
+  root.insertBefore(bar, root.firstChild);
+}
+
+/* ---------- Mermaid diagrams ----------
+   Content is injected via innerHTML, so Mermaid can't use startOnLoad. After each
+   module loads we render any `<pre class="mermaid">` blocks in place. Concept panels
+   are open by default, so blocks are visible (non-zero width) at render time. */
+function mermaidTheme() {
+  return document.documentElement.classList.contains("dark") ? "dark" : "neutral";
+}
+async function renderMermaid() {
+  const m = window.mermaid;
+  if (!m) return;
+  const nodes = content.querySelectorAll(".mermaid:not([data-processed])");
+  if (!nodes.length) return;
+  try {
+    m.initialize({ startOnLoad: false, theme: mermaidTheme(), securityLevel: "loose",
+                   flowchart: { useMaxWidth: true }, sequence: { useMaxWidth: true } });
+    await m.run({ nodes });
+  } catch (e) { /* on parse error, leave the diagram source visible rather than blow up the page */ }
+}
+
+let currentKey = null;
+
 async function loadModule(key) {
   const meta = flat[key];
   if (!meta) return;
+  currentKey = key;
 
   document.querySelectorAll(".nav-item").forEach(el =>
     el.classList.toggle("active", el.dataset.key === key));
 
-  // make sure the active item's group is expanded
+  // make sure the active item's group AND its mega-section are expanded
   const activeEl = document.querySelector(".nav-item.active");
-  const activeGroup = activeEl && activeEl.closest(".nav-group");
-  if (activeGroup) activeGroup.open = true;
+  if (activeEl) {
+    const grp = activeEl.closest(".nav-group");          if (grp) grp.open = true;
+    const sec = activeEl.closest(".nav-divider-group");  if (sec) sec.open = true;
+  }
 
   const base = `${meta.folder}/${meta.slug}`;
   content.innerHTML = `<p class="placeholder">Loading ${meta.name}…</p>`;
@@ -431,6 +577,8 @@ async function loadModule(key) {
 
     content.innerHTML = explanation + codeBlock;
     groupIntoAccordions(content);
+    addAccordionToolbar(content);
+    renderMermaid();
     content.scrollTop = 0;
   } catch (e) {
     content.innerHTML = `<div class="callout warn"><strong>Could not load module.</strong>
@@ -457,6 +605,8 @@ themeToggle.addEventListener("click", () => {
   const isDark = document.documentElement.classList.toggle("dark");
   try { localStorage.setItem("theme", isDark ? "dark" : "light"); } catch (e) {}
   syncThemeIcon();
+  // Mermaid bakes the theme into the rendered SVG, so re-load the current page to re-theme diagrams.
+  if (currentKey && content.querySelector(".mermaid")) loadModule(currentKey);
 });
 syncThemeIcon();
 
@@ -489,20 +639,41 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && isMobile()) closeSidebar();
 });
 
+/* ---------- Collapse / expand the entire sidenav ---------- */
+const navToggleAll = document.getElementById("nav-toggle-all");
+const navToggleAllLabel = document.getElementById("nav-toggle-all-label");
+if (navToggleAll) {
+  navToggleAll.addEventListener("click", () => {
+    const panels = document.querySelectorAll("#nav-list .nav-divider-group, #nav-list .nav-group");
+    const anyOpen = Array.from(panels).some(d => d.open);
+    panels.forEach(d => { d.open = !anyOpen; });   // all open -> close everything, else open everything
+    navToggleAllLabel.textContent = anyOpen ? "⊞ Expand all" : "⊟ Collapse all";
+  });
+}
+
 /* ---------- Search ---------- */
 search.addEventListener("input", () => {
   const q = search.value.toLowerCase().trim();
+  const visible = el => el.style.display !== "none";
+
+  // 1) show/hide individual items
+  document.querySelectorAll(".nav-item").forEach(el => {
+    el.style.display = el.textContent.toLowerCase().includes(q) ? "" : "none";
+  });
+
+  // 2) collapse/hide groups, then mega-sections, based on whether they hold a hit.
+  //    While searching, open containers with matches; on clear, restore the
+  //    remembered default-open state (so manually-closed sections don't pop open
+  //    just because the search box was emptied — except groups, which reset).
   document.querySelectorAll(".nav-group").forEach(group => {
-    let anyMatch = false;
-    group.querySelectorAll(".nav-item").forEach(el => {
-      const match = el.textContent.toLowerCase().includes(q);
-      el.style.display = match ? "" : "none";
-      if (match) anyMatch = true;
-    });
-    // while searching, expand groups with hits and hide groups with none;
-    // when the box is cleared, show every group again (expanded)
-    group.style.display = q && !anyMatch ? "none" : "";
-    if (q) group.open = anyMatch; else group.open = true;
+    const any = Array.from(group.querySelectorAll(".nav-item")).some(visible);
+    group.style.display = q && !any ? "none" : "";
+    group.open = q ? any : group._defaultOpen;
+  });
+  document.querySelectorAll(".nav-divider-group").forEach(sec => {
+    const any = Array.from(sec.querySelectorAll(".nav-item")).some(visible);
+    sec.style.display = q && !any ? "none" : "";
+    sec.open = q ? any : sec._defaultOpen;
   });
 });
 

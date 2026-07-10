@@ -67,9 +67,6 @@ auth (JWT) · **Why Express over Node?**
 **NestJS:** overview · modules · controllers · providers & DI · lifecycle
 (middleware/guards/pipes/interceptors) · exception filters · ecosystem & features
 
-**Quick recap:** open `recap.html` (or the ⚡ button in the app) for a self-contained
-15-minute cheat-sheet across all topics — ideal right before an interview.
-
 **MongoDB:** basics (+ Mongoose) · data modeling (embed vs reference) · aggregation pipeline ·
 indexing & performance · transactions
 

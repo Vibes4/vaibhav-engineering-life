@@ -1,0 +1,368 @@
+<h1>Rate Limiting &amp; Resiliency <span class="tag express">Mastery</span></h1>
+<p>Rate limiting decides <em>who gets to call you and how often</em>; resiliency decides <em>what your service does when its dependencies misbehave</em>. Together they are the two halves of "keep the system up under load and failure." This page pushes past "use a token bucket" into Redis Lua atomicity, sliding-window sorted sets, circuit-breaker state machines, full-jitter backoff math, deadline propagation, and the incidents that actually get asked about at Staff level.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Rate limiting protects a service from being overwhelmed by capping request rate per caller — usually with a token bucket or sliding window keyed on user, API key, or IP, enforced at the edge and backed by a shared Redis counter for cross-instance accuracy. When you exceed the limit you get a 429 with a Retry-After header. Resiliency is the flip side: it's how the caller survives a slow or failing dependency — timeouts and deadlines so you never wait forever, retries with exponential backoff and full jitter so you don't stampede, circuit breakers to stop hammering a dead dependency, bulkheads to isolate pools, and load shedding plus graceful degradation so you drop low-priority work instead of falling over. Idempotency keys make the retries safe."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The fuller answer separates the two concerns and names the internals an interviewer is fishing for.</p>
+<ul>
+  <li><strong>Algorithms:</strong> Fixed window is a single counter per window — cheap but suffers boundary bursts (2x the limit across a window edge). Sliding window log stores every timestamp in a sorted set — exact but memory-heavy. Sliding window counter interpolates the previous and current window — cheap approximation, the industry default. Token bucket allows bursts up to the bucket size and refills at the sustained rate. Leaky bucket smooths output to a constant rate regardless of input burst.</li>
+  <li><strong>Distributed enforcement:</strong> per-instance counters drift and let N instances each admit the full limit, so you centralize state in Redis. The atomic move is a Lua script that does check-and-decrement in one round trip, or <code>INCR</code>+<code>EXPIRE</code> for fixed window, or a sorted set with <code>ZADD</code>/<code>ZREMRANGEBYSCORE</code> for a true sliding window.</li>
+  <li><strong>Identifying the caller:</strong> API key &gt; user ID &gt; IP. IP is a trap — NAT and mobile carriers put thousands of users behind one IP, and <code>X-Forwarded-For</code> is client-spoofable unless you trust only the last proxy hop.</li>
+  <li><strong>Responses:</strong> HTTP 429, <code>Retry-After</code>, and the <code>X-RateLimit-Limit / Remaining / Reset</code> headers so well-behaved clients self-throttle.</li>
+  <li><strong>Resiliency patterns:</strong> timeouts and deadline propagation (a budget that shrinks as it flows through the call chain), retries with exponential backoff + full jitter, circuit breaker (closed → open → half-open), bulkheads, load shedding / admission control, backpressure via bounded queues, graceful degradation with fallbacks, and hedged requests to cut tail latency.</li>
+  <li><strong>Placement:</strong> coarse limits and DDoS shielding at the edge/gateway; fine-grained per-tenant and per-endpoint limits at the service. Resiliency lives in the caller (client-side library or sidecar/service mesh).</li>
+</ul>
+
+<h2>Internal Working</h2>
+<h3>Token bucket (the workhorse)</h3>
+<ol>
+  <li>State per key: <code>tokens</code> (current count) and <code>last_refill</code> (timestamp). Stored as a Redis hash.</li>
+  <li>On request, compute elapsed time <code>now - last_refill</code>, add <code>elapsed * refill_rate</code> tokens, cap at <code>capacity</code> (the burst size).</li>
+  <li>If <code>tokens &gt;= cost</code>, subtract <code>cost</code>, allow, write back state. Else reject with 429 and compute <code>Retry-After = (cost - tokens) / refill_rate</code>.</li>
+  <li>The whole read-modify-write MUST be atomic across instances — do it in a Lua script so no two instances race the same bucket.</li>
+</ol>
+<pre><code>-- token_bucket.lua  KEYS[1]=bucket  ARGV: now, rate, capacity, cost
+local st = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(st[1]) or tonumber(ARGV[3])
+local ts     = tonumber(st[2]) or tonumber(ARGV[1])
+local rate, cap, cost = tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local delta = math.max(0, tonumber(ARGV[1]) - ts)
+tokens = math.min(cap, tokens + delta * rate)
+local allowed = tokens &gt;= cost
+if allowed then tokens = tokens - cost end
+redis.call('HMSET', KEYS[1], 'tokens', tokens, 'ts', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000))
+return { allowed and 1 or 0, tokens }</code></pre>
+<h3>Sliding window log with a Redis sorted set</h3>
+<ol>
+  <li>Each request adds a member scored by timestamp: <code>ZADD key now now</code>.</li>
+  <li>Evict everything older than the window: <code>ZREMRANGEBYSCORE key 0 (now-window)</code>.</li>
+  <li>Count survivors: <code>ZCARD key</code>. If <code>&gt; limit</code>, reject. Set a TTL so idle keys die.</li>
+  <li>Exact to the millisecond, but memory is O(limit) per key — a 10k/min limit stores 10k members per active caller.</li>
+</ol>
+<h3>Sliding window counter (approximation)</h3>
+<ol>
+  <li>Keep two fixed-window counters: current and previous window.</li>
+  <li>Estimated rate = <code>current + previous * (1 - elapsed_fraction_of_current_window)</code>.</li>
+  <li>Two integers per key, no per-request storage — this is what most API gateways ship by default.</li>
+</ol>
+<h3>Circuit breaker state machine</h3>
+<ol>
+  <li><strong>Closed:</strong> calls pass through; a rolling window counts failures. When failure ratio crosses the threshold (e.g. &gt;50% over the last 20 calls), trip to Open.</li>
+  <li><strong>Open:</strong> fail fast immediately (no call to the dependency) for <code>reset_timeout</code> (e.g. 30s). This is what stops retry storms from crushing a recovering service.</li>
+  <li><strong>Half-open:</strong> after the timeout, allow a small number of trial requests. If they succeed, close; if any fail, re-open and reset the timer.</li>
+</ol>
+<div class="callout warn"><strong>Watch out:</strong> A naive breaker keyed on a raw failure <em>count</em> trips on low-traffic endpoints from a couple of blips. Use a <em>ratio</em> over a rolling window plus a minimum-volume threshold (don't evaluate until you've seen, say, 20 requests).</div>
+
+<h2>Why was this built?</h2>
+<p>Before rate limiting, a single misbehaving client — a runaway cron, a scraping bot, a buggy retry loop — could consume all of a service's capacity and take it down for everyone (the "noisy neighbor" and thundering-herd problems). Operators tried to cope with over-provisioning, IP blocklists, and manual firewall rules, all reactive and coarse.</p>
+<p>On the resiliency side, early distributed systems used unbounded synchronous calls with no timeouts. One slow dependency would exhaust every thread waiting on it, which cascaded: the caller became slow, its callers piled up, and the failure propagated up the stack until the whole system was down — a <em>cascading failure</em>. Netflix's 2011–2012 outages drove the creation of Hystrix (circuit breakers + bulkheads + fallbacks), which codified these patterns. AWS's "Timeouts, retries and backoff with jitter" and Google's SRE book (deadlines, load shedding) turned them into industry standards.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>When it wins</th><th>When it loses</th></tr>
+<tr><td>Fixed window</td><td>One counter per window, INCR+EXPIRE</td><td>Simplest, cheapest, coarse quotas</td><td>2x burst at window boundaries</td></tr>
+<tr><td>Sliding window log</td><td>Sorted set of timestamps</td><td>Need exact enforcement, low limits</td><td>Memory O(limit) per key</td></tr>
+<tr><td>Sliding window counter</td><td>Two windows interpolated</td><td>General-purpose API limiting</td><td>Slight over/under-count at edges</td></tr>
+<tr><td>Token bucket</td><td>Refill rate + burst capacity</td><td>Allow bursts, smooth sustained rate</td><td>Two fields of state, refill math</td></tr>
+<tr><td>Leaky bucket</td><td>Queue drained at constant rate</td><td>Traffic shaping to a steady output</td><td>Adds latency, buffers requests</td></tr>
+<tr><td>Retry (no breaker)</td><td>Blind exponential backoff</td><td>Transient blips only</td><td>Amplifies load on a dead dependency</td></tr>
+<tr><td>Circuit breaker</td><td>Trip open on failure ratio</td><td>Protect a failing dependency</td><td>Adds a fast-fail path to reason about</td></tr>
+<tr><td>Bulkhead</td><td>Separate pools per dependency</td><td>Isolate one bad dep from the rest</td><td>Lower total utilization</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Protects capacity:</strong> caps worst-case load so one caller can't starve the rest — the core fairness guarantee.</li>
+  <li><strong>Prevents cascading failure:</strong> breakers + timeouts + bulkheads stop a single slow dependency from taking down the whole call graph.</li>
+  <li><strong>Monetization &amp; tiering:</strong> quotas map directly to plans (free vs pro vs enterprise).</li>
+  <li><strong>Predictable tail latency:</strong> timeouts and hedged requests bound p99 instead of letting it drift to the slowest replica.</li>
+  <li><strong>Graceful degradation:</strong> shed low-priority traffic first, keep the money path alive.</li>
+  <li><strong>Backpressure signal:</strong> 429 + Retry-After tells clients to slow down instead of retrying blindly.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>Shared-counter latency &amp; coupling:</strong> a central Redis adds a network hop to every request and becomes a availability dependency of the whole fleet.</li>
+  <li><strong>Approximation vs cost trade-off:</strong> exact limiting is memory-heavy; cheap limiting is approximate.</li>
+  <li><strong>Retry amplification:</strong> naive retries multiply load exactly when the system is already struggling.</li>
+  <li><strong>Breaker false trips:</strong> a badly tuned breaker fails healthy requests; a lax one never protects anything.</li>
+  <li><strong>Operational complexity:</strong> deadlines, budgets, jitter, and half-open trials are subtle and easy to get wrong.</li>
+  <li><strong>Client identity is hard:</strong> IP-based limiting punishes NAT'd users; header-based identity can be spoofed.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><strong>Local vs global limits:</strong> local (per-instance) counters are fast and need no network but drift — N instances each admit the full limit, so effective global limit ≈ N × configured. Global (shared Redis) is accurate but adds latency and a dependency. Hybrid: local token buckets synced periodically, or allocate each instance a slice of the global budget.</li>
+  <li><strong>Accuracy vs memory vs cost:</strong> sliding log (exact, heavy) ↔ sliding counter (approx, cheap).</li>
+  <li><strong>Fail-open vs fail-closed:</strong> if Redis is down, do you allow all traffic (fail-open, availability first) or reject all (fail-closed, protection first)? Most public APIs fail open with a local fallback limiter.</li>
+  <li><strong>Retries vs load:</strong> more retries improve success rate for transient errors but amplify load during real outages — bounded by circuit breakers and retry budgets.</li>
+  <li><strong>Timeout tightness:</strong> tight timeouts free threads fast but cause false failures on slow-but-fine requests; loose timeouts tie up resources.</li>
+  <li><strong>Edge vs service enforcement:</strong> edge is cheap and blocks abuse early but lacks business context; service-level knows the tenant/cost but has already paid for connection handling.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't reach for these when they add more risk than they remove:
+<ul>
+  <li><strong>Internal, trusted, low-fanout calls</strong> with capacity headroom — a rate limiter there just adds a Redis dependency and a failure mode for no protection benefit.</li>
+  <li><strong>Retries on non-idempotent writes without an idempotency key</strong> — you'll double-charge, double-ship, or duplicate records. Fix idempotency first.</li>
+  <li><strong>Circuit breakers on a dependency you can't fall back from</strong> — tripping open just converts slow errors into fast errors with no recovery; sometimes you must wait.</li>
+  <li><strong>Rate limiting purely by IP for a mobile/consumer app</strong> — carrier NAT means one IP = thousands of users; you'll throttle innocent people.</li>
+  <li><strong>Retries inside a request that also has an upstream deadline</strong> without honoring the remaining budget — you'll blow the caller's deadline retrying work that's already doomed.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical topology puts coarse DDoS/volumetric protection and per-IP limits at the CDN/edge, per-API-key and per-tenant limits at the API gateway (backed by a shared Redis cluster with a local fallback), and per-endpoint resiliency (breakers, bulkheads, deadlines) inside each service or its mesh sidecar. Deadlines are injected at the gateway and propagated downstream so the whole call tree shares one budget.</p>
+<pre class="mermaid">
+flowchart LR
+  C["Client"] --&gt; EDGE["CDN Edge WAF"]
+  EDGE --&gt; GW["API Gateway"]
+  GW --&gt; RL{"Rate Limiter"}
+  RL --&gt; RC["Redis Cluster shared counters"]
+  RL --&gt; LOCAL["Local fallback bucket"]
+  GW --&gt; SVC["Service with breaker and bulkhead"]
+  SVC --&gt; DEP1["Payments"]
+  SVC --&gt; DEP2["Inventory"]
+  SVC --&gt; FB["Fallback cache"]
+</pre>
+<ul>
+  <li><strong>Edge:</strong> Cloudflare/CloudFront + WAF absorbs volumetric attacks before they cost you compute.</li>
+  <li><strong>Gateway:</strong> Envoy/Kong/APIGee runs the token-bucket or sliding-window logic, calling a Redis cluster; if Redis is unreachable it degrades to a per-pod local limiter (fail-open with a cap).</li>
+  <li><strong>Service:</strong> resilience4j / Hystrix / Polly / a mesh (Istio, Linkerd) wraps outbound calls with timeouts, breakers, bulkheads, and retries.</li>
+  <li><strong>Deadline propagation:</strong> gRPC deadlines or a <code>X-Request-Deadline</code> header flow downstream; each hop subtracts its own latency and refuses to start work that can't finish in time.</li>
+</ul>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>Retry storm / thundering herd:</strong> a dependency blips, every client retries at the same instant, and the synchronized wave keeps it down. Fix: full jitter + circuit breakers + retry budgets.</li>
+  <li><strong>Redis hot key:</strong> a single global limiter key (e.g. per-endpoint, not per-user) funnels all traffic to one Redis shard's slot. Fix: shard the key or use per-caller keys.</li>
+  <li><strong>Counter drift under partition:</strong> Redis cluster failover loses the last few INCRs; limits briefly loosen or reset.</li>
+  <li><strong>Breaker flapping:</strong> a marginal dependency oscillates open/closed, causing intermittent 503s. Fix: hysteresis, longer reset timeout, higher half-open threshold.</li>
+  <li><strong>Deadline not propagated:</strong> service A times out at 1s but calls B which retries for 3s — wasted work on an already-abandoned request.</li>
+  <li><strong>Fail-open cascade:</strong> Redis outage flips every gateway to fail-open simultaneously, and the now-unlimited traffic overwhelms the backend.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<ul>
+  <li>Inspect a limiter key: <code>redis-cli HGETALL rl:user:123</code> or <code>redis-cli ZRANGE rl:user:123 0 -1 WITHSCORES</code> for sliding-log.</li>
+  <li>Find hot slots: <code>redis-cli --hotkeys</code> and <code>redis-cli INFO keyspace</code>; watch <code>redis-cli --latency</code> and <code>--latency-history</code>.</li>
+  <li>Live command stream (careful in prod): <code>redis-cli MONITOR | grep 'EVALSHA'</code>.</li>
+  <li>Confirm 429 shape: <code>curl -i https://api/... </code> and check <code>Retry-After</code>, <code>X-RateLimit-*</code>.</li>
+  <li>Breaker state: expose <code>resilience4j.circuitbreaker.state</code> / Hystrix stream; grep logs for <code>CircuitBreakerOpenException</code>.</li>
+  <li>Retry amplification: compare inbound RPS to outbound RPS on the failing dependency — a &gt;1 ratio means retries are amplifying.</li>
+  <li>Deadline violations: trace with OpenTelemetry; look for spans killed by <code>DEADLINE_EXCEEDED</code> and check whether children ran past the parent deadline.</li>
+  <li>Thread/connection pool exhaustion: check pool <code>active</code> vs <code>max</code>, queue depth, and rejection counts — the classic bulkhead signal.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>Meaning</th><th>Healthy / alert</th></tr>
+<tr><td>rate_limited_ratio (429s / total)</td><td>Fraction of requests rejected by the limiter</td><td>&lt;1% steady; alert &gt;5% sustained</td></tr>
+<tr><td>limiter_redis_latency_p99</td><td>Round trip for the limiter check</td><td>&lt;2ms same-AZ; alert &gt;10ms</td></tr>
+<tr><td>limiter_fail_open_rate</td><td>Requests served without a real check</td><td>≈0; any sustained value = Redis trouble</td></tr>
+<tr><td>circuit_breaker_state</td><td>Closed / open / half-open per dependency</td><td>Alert on any breaker Open &gt; 1 min</td></tr>
+<tr><td>retry_ratio (retries / requests)</td><td>Retry amplification factor</td><td>&lt;0.1 healthy; alert &gt;0.3</td></tr>
+<tr><td>dependency_timeout_rate</td><td>Calls killed by timeout</td><td>&lt;0.5%; alert &gt;2%</td></tr>
+<tr><td>bulkhead_rejections</td><td>Calls rejected by full pool</td><td>0 normally; any spike = saturation</td></tr>
+<tr><td>load_shed_count</td><td>Low-priority requests dropped</td><td>0 at baseline; &gt;0 means overload</td></tr>
+<tr><td>deadline_exceeded_count</td><td>Requests abandoned past budget</td><td>Alert on rising trend</td></tr>
+<tr><td>queue_depth / queue_wait</td><td>Backpressure indicator</td><td>Alert when wait &gt; timeout budget</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>The limiter's own state store is the scaling bottleneck. Options in order of scale: (1) local in-memory limiter — infinite scale, no accuracy; (2) shared Redis single instance — accurate, ~100k+ ops/s, one shard; (3) Redis Cluster — shard keys by caller so load spreads across slots; (4) two-tier — local token buckets that periodically reconcile a slice of the global budget, cutting Redis traffic by the sync ratio.</p>
+<pre class="mermaid">
+flowchart TD
+  REQ["Incoming request"] --&gt; L1["Local bucket per pod"]
+  L1 --&gt;|"budget available"| PASS["Allow immediately"]
+  L1 --&gt;|"local budget low"| SYNC["Fetch slice from global"]
+  SYNC --&gt; REDIS["Redis global budget"]
+  REDIS --&gt;|"granted N tokens"| L1
+  REDIS --&gt;|"exhausted"| REJECT["429 Too Many Requests"]
+</pre>
+<ul>
+  <li><strong>Key sharding:</strong> per-user keys naturally distribute; avoid a single global key that hot-spots one slot.</li>
+  <li><strong>Pipeline / EVALSHA:</strong> ship the Lua script once, call by SHA to avoid resending it; pipeline batches to cut round trips.</li>
+  <li><strong>Two-tier budgeting:</strong> each pod leases M tokens from Redis and serves locally until depleted — trades a little accuracy for a huge drop in Redis QPS.</li>
+  <li><strong>Cell-based / approximate:</strong> partition callers into cells with independent limiters to bound blast radius and store.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>X-Forwarded-For spoofing:</strong> a client can inject fake XFF entries. Trust only the value your own trusted proxy appends (the rightmost hop), or use a platform-set header like <code>CF-Connecting-IP</code>. Never key limits off a client-controllable header.</li>
+  <li><strong>NAT / shared IP fairness:</strong> IP limiting throttles legitimate users behind carrier-grade NAT; prefer authenticated identity (API key / user ID) and reserve IP limits for unauthenticated endpoints.</li>
+  <li><strong>Limiter as DoS target:</strong> if the limiter itself is expensive (sliding log with huge windows), an attacker can exhaust Redis memory. Cap window size and set TTLs.</li>
+  <li><strong>Enumeration via 429 vs 401:</strong> different responses for known vs unknown keys can leak validity — keep the limiter response uniform.</li>
+  <li><strong>Retry-After as an oracle:</strong> don't leak exact internal capacity; round Retry-After.</li>
+  <li><strong>Distributed / L7 DDoS:</strong> per-key limits don't stop a botnet with many keys — layer with WAF, challenge (CAPTCHA/JS), and anomaly detection.</li>
+  <li><strong>Idempotency key replay:</strong> scope keys per user and expire them so a stolen key can't be replayed indefinitely.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>Limiter overhead:</strong> a local token bucket is a few nanoseconds; a Redis round trip is ~0.3–2ms same-AZ, which dominates the check. Two-tier design amortizes this to near-zero for most requests.</li>
+  <li><strong>Lua atomicity cost:</strong> the script runs on Redis's single thread — keep it O(1); a sliding-log <code>ZREMRANGEBYSCORE</code> is O(log N + M) where M is evicted members, so it can spike CPU on large windows.</li>
+  <li><strong>Memory:</strong> sliding log = O(limit) members per active key; token bucket = 2 fields; sliding counter = 2 ints. At 1M active users a 10k-limit sliding log is billions of members — don't.</li>
+  <li><strong>Timeout tuning:</strong> set per-dependency timeouts near p99.9 of healthy latency, not an arbitrary round number — too tight causes false failures, too loose ties up threads.</li>
+  <li><strong>Hedged requests:</strong> fire a second request after p95 latency; caps tail at the cost of ~5% extra load. Google's BigTable/Spanner use this to crush p99.</li>
+  <li><strong>Backoff math (full jitter):</strong> <code>sleep = random(0, min(cap, base * 2^attempt))</code>. Full jitter beats "equal jitter" and fixed backoff at decorrelating clients — AWS's measurements show it minimizes both completion time and competing load.</li>
+  <li><strong>Connection pool sizing:</strong> pool size ≈ target throughput × latency (Little's Law); undersized pools serialize, oversized pools remove backpressure and let overload propagate.</li>
+</ul>
+<pre><code>// full jitter exponential backoff
+const base = 100, cap = 20000;   // ms
+function delay(attempt) {
+  const exp = Math.min(cap, base * 2 ** attempt);
+  return Math.random() * exp;      // uniform 0..exp
+}</code></pre>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Fixed window with high limits:</strong> boundary burst lets 2x through. Fix: sliding window counter.</li>
+  <li><strong>Per-instance counters believed to be global:</strong> effective limit = N × configured. Fix: shared store or divide budget by instance count.</li>
+  <li><strong>Non-atomic check-then-decrement:</strong> two instances both read "1 left" and both allow. Fix: Lua / atomic INCR.</li>
+  <li><strong>Retries without a circuit breaker or budget:</strong> retry storm. Fix: breaker + retry budget (cap retries to ~10% of requests).</li>
+  <li><strong>Retrying non-idempotent operations:</strong> duplicate side effects. Fix: idempotency keys.</li>
+  <li><strong>No jitter on backoff:</strong> synchronized retry waves. Fix: full jitter.</li>
+  <li><strong>Timeout longer than the caller's deadline:</strong> wasted work. Fix: propagate and honor the deadline budget.</li>
+  <li><strong>Retrying on 4xx (except 429):</strong> a 400 will never succeed on retry. Fix: retry only 429/503/network errors.</li>
+  <li><strong>One global limiter key:</strong> Redis hot slot. Fix: key per caller.</li>
+  <li><strong>Breaker on request count not ratio:</strong> trips on low traffic. Fix: ratio + minimum volume.</li>
+  <li><strong>Fail-closed on limiter outage for a public API:</strong> total outage from a Redis blip. Fix: fail-open with a local cap.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they plausibly use it</th></tr>
+<tr><td>Google</td><td>gRPC deadlines with propagation across the whole RPC tree; Google SRE popularized deadline budgets, load shedding by criticality, and hedged/tied requests in Spanner/BigTable to cut p99 tail latency.</td></tr>
+<tr><td>Amazon</td><td>API Gateway usage plans (token-bucket throttling with burst + steady-rate keys); AWS SDKs ship adaptive retry mode with full jitter and a retry-quota bucket that stops retries during widespread failure.</td></tr>
+<tr><td>Netflix</td><td>Originated Hystrix (circuit breakers, bulkheads, fallbacks); concurrency-limits library for adaptive load shedding; Zuul edge gateway enforces per-route limits. Likely on resilience4j now.</td></tr>
+<tr><td>Uber</td><td>Per-city / per-service rate limits at the edge (their in-house limiter and QALM/load-shedder); deadline propagation across their microservice mesh; likely Ringpop/consistent-hash for sharded limiter state.</td></tr>
+<tr><td>Swiggy</td><td>Likely rate-limits order and search APIs per user/device to blunt scraping and bot abuse during flash offers; load sheds non-critical calls (recommendations) during peak dinner surge to protect checkout.</td></tr>
+<tr><td>PhonePe</td><td>Likely strict per-user and per-VPA transaction rate limits with idempotency keys so UPI retries never double-debit; circuit breakers around bank/NPCI switch calls that are frequently slow.</td></tr>
+<tr><td>Razorpay</td><td>Per-API-key rate limits with 429 + Retry-After documented for merchants; idempotency keys on payment creation; likely breakers + timeouts around downstream bank gateways with graceful fallback messaging.</td></tr>
+<tr><td>Atlassian</td><td>Documented per-tenant REST API rate limits with <code>X-RateLimit-*</code> and cost-budget headers (Jira/Confluence); per-app quotas for Marketplace apps; likely token-bucket cost-based limiting where heavy endpoints cost more tokens.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>What's the difference between rate limiting, throttling, and shaping?
+    <ol><li>Limiting rejects over-limit; throttling delays/slows; shaping (leaky bucket) buffers to a constant output rate.</li></ol></li>
+  <li>Walk me through the boundary-burst problem in fixed window.
+    <ol><li>Limit N in window W; N at the end of one window + N at the start of the next = 2N in ~W. Sliding window fixes it.</li></ol></li>
+  <li>How do you make the check-and-decrement atomic across instances?
+    <ol><li>Single Redis Lua script (runs on the single thread) or atomic INCR with EXPIRE; never read-then-write in the app.</li></ol></li>
+  <li>Sliding log vs sliding counter — when do you accept the approximation?
+    <ol><li>Log is exact but O(limit) memory; counter is 2 ints with small edge error — use counter unless exactness is contractual.</li></ol></li>
+  <li>Token bucket vs leaky bucket?
+    <ol><li>Token allows bursts up to capacity then throttles to refill rate; leaky bucket enforces constant output, no burst.</li></ol></li>
+  <li>How do you identify the caller, and what breaks?
+    <ol><li>API key &gt; user ID &gt; IP; IP breaks under NAT and XFF spoofing — trust only the proxy-appended hop.</li></ol></li>
+  <li>What do you return when limited?
+    <ol><li>429 + Retry-After + X-RateLimit-Limit/Remaining/Reset so clients self-throttle.</li></ol></li>
+  <li>Redis is down — fail open or closed?
+    <ol><li>Public API: fail open with a local per-pod cap. Protection-critical: fail closed. State the trade explicitly.</li></ol></li>
+  <li>Local vs global limits — what's the drift?
+    <ol><li>N instances each admit the full limit → effective ≈ N×. Divide the budget or centralize; two-tier reconciles periodically.</li></ol></li>
+  <li>Explain the circuit breaker states and transitions.
+    <ol><li>Closed (count failures) → Open (fail fast for reset_timeout) → Half-open (trial requests) → Closed or back to Open.</li></ol></li>
+  <li>Why jitter on retries, and which jitter?
+    <ol><li>Decorrelates synchronized clients to avoid retry waves; full jitter (random 0..exp) minimizes both latency and competing load.</li></ol></li>
+  <li>What's a retry budget and why?
+    <ol><li>Cap retries to a fraction (~10%) of requests so retries can't amplify load during a broad outage.</li></ol></li>
+  <li>What is deadline propagation?
+    <ol><li>A shrinking time budget passed downstream; each hop subtracts its latency and refuses work that can't finish in time.</li></ol></li>
+  <li>What are bulkheads?
+    <ol><li>Isolated thread/connection pools per dependency so one saturated dep can't exhaust shared resources.</li></ol></li>
+  <li>How does load shedding decide what to drop?
+    <ol><li>By request criticality/priority — drop low-priority (recommendations) first, keep the money path; admission control at the front.</li></ol></li>
+  <li>What are hedged requests and their cost?
+    <ol><li>Fire a duplicate after p95, take the first response; cuts tail latency at ~5% extra load. Cancel the loser.</li></ol></li>
+  <li>Why do retries need idempotency keys?
+    <ol><li>So a retried write is deduplicated server-side and doesn't double-charge/double-create.</li></ol></li>
+  <li>Where do you enforce — edge or service?
+    <ol><li>Coarse/DDoS at edge, fine-grained per-tenant/endpoint at service; often both layers.</li></ol></li>
+  <li>How do you rate limit by cost, not count?
+    <ol><li>Assign each endpoint a token cost; heavy queries deduct more from the same bucket (Atlassian/GitHub GraphQL model).</li></ol></li>
+  <li>How do you prevent a breaker from flapping?
+    <ol><li>Ratio over a rolling window + minimum volume + longer reset timeout + gradual half-open ramp (hysteresis).</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>Redis internals:</strong> "Why is a Lua script atomic?" → single-threaded execution, script runs to completion before any other command. Expect follow-ups on EVALSHA, cluster slots, and CROSSSLOT errors on multi-key scripts.</li>
+  <li><strong>Distributed consensus / clocks:</strong> "How do sliding windows behave under clock skew across instances?" → use server-side Redis time (<code>TIME</code>) not app clocks; NTP skew corrupts timestamp-based windows.</li>
+  <li><strong>Load balancing:</strong> "How does this interact with autoscaling?" → per-instance limits must divide by live instance count or you loosen the global limit as you scale out.</li>
+  <li><strong>Microservices &amp; mesh:</strong> "Would you do this in code or the sidecar?" → mesh (Envoy) gives language-agnostic breakers/retries/limits; library gives finer business context.</li>
+  <li><strong>Queues &amp; backpressure:</strong> "Rate limiting vs a bounded queue?" → limiting rejects at the door; a bounded queue buffers then rejects (reject vs block); both are backpressure mechanisms.</li>
+  <li><strong>Idempotency &amp; exactly-once:</strong> "How do you dedupe retries?" → idempotency key + a store of seen keys with a TTL; ties into exactly-once semantics discussion.</li>
+  <li><strong>Observability:</strong> "How do you tell retries from real traffic?" → tag retries with an attempt header/count; compare inbound vs outbound RPS on the dependency.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+<h3>Retry storm takes down a recovering service</h3>
+<table>
+<tr><th>Symptoms</th><td>Dependency has a 5s blip, then can't recover; its RPS stays pinned at 4x normal even after the root cause is fixed.</td></tr>
+<tr><th>Investigation</th><td>Compare inbound vs outbound RPS (ratio ~4). Traces show every client retrying 3x with fixed 1s backoff, synchronized. No breaker.</td></tr>
+<tr><th>Root Cause</th><td>Blind retries with no jitter and no circuit breaker; the synchronized retry wave keeps the dependency saturated.</td></tr>
+<tr><th>Solution</th><td>Add circuit breaker (trip open at 50% failures) to fail fast, full-jitter backoff, and a retry budget capping retries to 10%.</td></tr>
+<tr><th>Prevention</th><td>Standardize the resilient client library across services; alert on retry_ratio &gt; 0.3.</td></tr>
+<tr><th>Interview Answer</th><td>"Retries without a breaker amplify load during the exact window you need to shed it. I add fail-fast breakers, full jitter, and a retry budget so the dependency can recover."</td></tr>
+</table>
+<h3>Rate limiter loosens 8x after autoscaling</h3>
+<table>
+<tr><th>Symptoms</th><td>After scaling from 5 to 40 pods during a sale, a client that should get 1000 rpm is doing ~8000 rpm; backend overloads.</td></tr>
+<tr><th>Investigation</th><td>Limiter is in-memory per pod. 40 pods each enforce 1000 → effective 40,000. Confirmed by summing per-pod counters.</td></tr>
+<tr><th>Root Cause</th><td>Per-instance local limiting mistaken for a global limit; no shared state.</td></tr>
+<tr><th>Solution</th><td>Move to shared Redis limiter (Lua token bucket keyed per user), or two-tier with a global budget leased to pods.</td></tr>
+<tr><th>Prevention</th><td>Load test the limiter at target replica count; assert effective global limit in integration tests.</td></tr>
+<tr><th>Interview Answer</th><td>"Local counters don't compose — N pods means N× the limit. Either centralize the counter in Redis or divide the budget by live replica count."</td></tr>
+</table>
+<h3>Redis hot slot during flash sale</h3>
+<table>
+<tr><th>Symptoms</th><td>Limiter p99 jumps from 1ms to 40ms; one Redis node at 100% CPU while others idle; cascading gateway timeouts.</td></tr>
+<tr><th>Investigation</th><td><code>redis-cli --hotkeys</code> shows one key <code>rl:global:checkout</code> taking all traffic; it maps to a single cluster slot.</td></tr>
+<tr><th>Root Cause</th><td>A single global limiter key funneled all requests to one slot/node, no sharding.</td></tr>
+<tr><th>Solution</th><td>Key per user/tenant (spreads across slots); for a truly global limit use N sub-keys and sum, or two-tier local buckets.</td></tr>
+<tr><th>Prevention</th><td>Ban single global keys in review; monitor per-slot load and limiter_redis_latency_p99.</td></tr>
+<tr><th>Interview Answer</th><td>"A global key is a hot slot. I shard by caller so load spreads, and if I truly need one global limit I split it into N counters and aggregate."</td></tr>
+</table>
+<h3>Deadline not propagated wastes capacity</h3>
+<table>
+<tr><th>Symptoms</th><td>Gateway times out user requests at 1s, but backend CPU stays pegged doing work no one is waiting for.</td></tr>
+<tr><th>Investigation</th><td>Traces show service B retrying a DB call for 3s on requests whose parent span was already cancelled at 1s.</td></tr>
+<tr><th>Root Cause</th><td>Deadline set at the edge wasn't propagated; downstream had its own longer timeout and no cancellation.</td></tr>
+<tr><th>Solution</th><td>Propagate gRPC deadline / X-Request-Deadline header; each hop checks remaining budget and aborts doomed work; wire context cancellation.</td></tr>
+<tr><th>Prevention</th><td>Enforce deadline propagation in the RPC framework; alert on deadline_exceeded and orphaned-work spans.</td></tr>
+<tr><th>Interview Answer</th><td>"Without deadline propagation, downstream services burn CPU on abandoned requests. I pass a shrinking budget and cancel work that can't finish in time."</td></tr>
+</table>
+<h3>Duplicate charges from payment retries</h3>
+<table>
+<tr><th>Symptoms</th><td>Support reports customers double-charged during a period of elevated payment-API latency.</td></tr>
+<tr><th>Investigation</th><td>Client timed out at 2s and retried; the original request had actually succeeded server-side. No idempotency key.</td></tr>
+<tr><th>Root Cause</th><td>Retrying a non-idempotent write with no dedupe — the retry created a second charge.</td></tr>
+<tr><th>Solution</th><td>Require an idempotency key per charge; server stores key→result with a TTL and returns the original result on replay.</td></tr>
+<tr><th>Prevention</th><td>Make idempotency keys mandatory on all mutating endpoints; test the retry-after-success path.</td></tr>
+<tr><th>Interview Answer</th><td>"Retries are only safe if the operation is idempotent. For payments I require an idempotency key so a retry returns the original result instead of charging again."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Design a distributed rate limiter for 1000 req/min per API key across 50 gateway pods.</summary><p>Centralize state in Redis so pods share one view. Use a token bucket in a Lua script keyed <code>rl:{apiKey}</code> — the hash tag isn't needed unless multi-key; per-key naturally spreads across cluster slots. Script does refill (elapsed × rate, capped at capacity=burst), check <code>tokens &gt;= cost</code>, decrement, PEXPIRE. To cut Redis QPS at scale, go two-tier: each pod leases a slice (e.g. 20 tokens) from Redis and serves locally until depleted, then re-leases — trades bounded over-admission for a big drop in round trips. Return 429 + Retry-After = (cost−tokens)/rate. Fail open with a local per-pod cap if Redis is unreachable. Use Redis server TIME for the timestamp to avoid app clock skew.</p></details>
+  <details><summary>Why is full jitter mathematically better than fixed or "equal" jitter?</summary><p>Fixed backoff keeps all clients that failed at the same instant synchronized — they all wake at t+base, t+2base, hammering in waves. Equal jitter (<code>base·2^n/2 + rand(0, base·2^n/2)</code>) still clusters around the midpoint. Full jitter (<code>rand(0, min(cap, base·2^n))</code>) spreads clients uniformly across the whole interval, maximally decorrelating them. AWS's simulations showed full jitter minimizes both total completion time and the number of competing calls hitting the server, because the uniform spread flattens the load spike better than any scheme with a non-zero lower bound.</p></details>
+  <details><summary>How do you build a true sliding window in Redis, and what's the cost?</summary><p>Sorted set per key. On each request: <code>ZREMRANGEBYSCORE key 0 (now-window)</code> to evict old, <code>ZADD key now member</code> (member must be unique — use now + a counter to avoid collisions), <code>ZCARD key</code> to count, PEXPIRE. Wrap all of it in one Lua script for atomicity. It's exact to the millisecond. Cost: memory is O(limit) members per active key — a 10k/min limit stores up to 10k members per caller, so at millions of callers it's billions of members. CPU: ZREMRANGEBYSCORE is O(log N + M) for M evicted. For high limits, prefer the sliding-window-counter approximation (two integers, interpolated) instead.</p></details>
+  <details><summary>Explain the circuit breaker tuning knobs and how you'd pick them.</summary><p>Failure-rate threshold (e.g. 50%): fraction of failures in the rolling window that trips Open. Minimum-number-of-calls (e.g. 20): don't evaluate the ratio until you've seen enough volume — prevents tripping on a single blip on low-traffic endpoints. Sliding-window size (count- or time-based). reset_timeout / wait-duration-in-open (e.g. 30s): how long to fail fast before probing. permitted-calls-in-half-open (e.g. 5): trial requests; if they succeed, close. Slow-call threshold treats slow-but-successful calls as failures (e.g. &gt;2s counts). Pick the threshold from your dependency's normal error rate + margin, reset_timeout from its typical recovery time, and add hysteresis (longer timeout, higher half-open bar) to stop flapping on marginal deps.</p></details>
+  <details><summary>What breaks when you rate limit by IP, and what do you do instead?</summary><p>Carrier-grade NAT and corporate proxies put thousands of distinct users behind one IP, so a per-IP limit throttles innocents and lets a single abuser behind a unique IP through untouched. <code>X-Forwarded-For</code> is client-spoofable — an attacker prepends fake entries to dodge limits; you must trust only the value your own trusted proxy appends (rightmost hop) or a platform header like CF-Connecting-IP. The fix: rate limit authenticated traffic by API key / user ID, and reserve IP limits for unauthenticated endpoints (login, signup) where you additionally layer WAF and challenge mechanisms. For login specifically, limit by (IP + username) tuple to slow both credential stuffing and targeted attacks.</p></details>
+  <details><summary>Fail-open vs fail-closed when the limiter's Redis is down — how do you decide?</summary><p>It's an availability-vs-protection call and depends on what the limiter guards. A public API where the backend can absorb a short spike should fail open — a Redis blip shouldn't 503 all customers — but with a local per-pod cap so "open" isn't literally unlimited. A limiter protecting a fragile or expensive resource (a payment switch, a small DB) should fail closed, because unbounded traffic would be worse than rejecting. The dangerous middle case is fail-open cascading: every gateway flips open simultaneously and the now-unlimited flood overwhelms a backend that was only surviving because of the limiter. Mitigate with the local fallback cap and by making Redis itself HA (cluster + replicas) so the failure is rare.</p></details>
+  <details><summary>How does deadline propagation actually work in a call tree?</summary><p>The entrypoint sets an absolute deadline (now + budget), not a relative timeout. It passes that deadline downstream — gRPC does it natively via the deadline in call metadata; over HTTP you send <code>X-Request-Deadline</code> or a remaining-ms header. Each hop computes <code>remaining = deadline - now</code>, uses <code>min(remaining, its own timeout)</code> for its calls, and refuses to even start work if remaining is below a floor (fail fast with DEADLINE_EXCEEDED). Critically, cancellation propagates: when the parent's context is cancelled (client gave up), children observe it and abort, freeing threads and DB work. Without this, a service keeps grinding on requests nobody is waiting for — wasted capacity exactly during overload.</p></details>
+  <details><summary>What's a bulkhead and how is it different from a circuit breaker?</summary><p>A bulkhead isolates resources: you give each downstream dependency its own thread pool or connection-pool/semaphore with a max concurrency, so if dependency A goes slow and its pool fills, calls to A get rejected but dependencies B and C keep their own pools and stay healthy. It prevents one slow dep from exhausting a shared pool and stalling everything (the classic cascading failure). A circuit breaker is temporal — it stops calling a dependency that's failing over time. They're complementary: the bulkhead contains the blast radius of a slow dep right now; the breaker stops calling a dead dep and gives it room to recover. Netflix Hystrix shipped both together.</p></details>
+  <details><summary>How do hedged (or tied) requests reduce tail latency, and what's the risk?</summary><p>For a read you can safely duplicate, send the request to one replica; if no response by, say, the p95 latency, send a second copy to another replica and take whichever returns first, cancelling the loser. Because it's rare for two independent replicas to both be slow, this collapses p99 toward p50 at only ~5% extra requests (you only hedge the slow tail). "Tied" requests go further: send both immediately but have them cancel each other once one starts executing, so you don't do double work. Risks: it amplifies load if your hedge trigger is too aggressive (hedging everything doubles traffic), and it's only safe for idempotent reads — never hedge a non-idempotent write. Google uses this in BigTable/Spanner.</p></details>
+  <details><summary>Rate limiting by request cost instead of count — how and why?</summary><p>Not all requests are equal: a paginated list of 1 item and a report scanning a million rows shouldn't each cost "1." Assign each endpoint (or each query, for GraphQL) a token cost proportional to its work, and deduct that cost from the caller's token bucket. GitHub's GraphQL API and Atlassian do exactly this — a complex query might cost 50 points against a 5000-point hourly budget. It gives fair protection: a caller can make many cheap calls or few expensive ones, but can't hide an expensive operation behind a low request count. Implementation: the limiter computes cost before or after execution (post-execution needs a reservation + reconcile), then the Lua decrement uses that cost as ARGV.</p></details>
+  <details><summary>Why aren't per-instance in-memory limiters enough, and when are they actually fine?</summary><p>They drift: with N instances each enforcing limit L, the effective global limit is up to N×L because instances don't share state, and it changes as you autoscale. They're fine when (a) you only need approximate protection and can divide L by expected instance count, (b) traffic is evenly load-balanced so each instance sees ~1/N, or (c) you use them as the fast local tier of a two-tier design that reconciles against a global Redis budget. They're the right first line even in distributed setups because they're free (no network) and absorb the common case — you only touch Redis when the local budget runs low, cutting central QPS dramatically.</p></details>
+  <details><summary>Retries, timeouts, and breakers all interact — give me the correct layering.</summary><p>Innermost: a per-attempt timeout near the dependency's healthy p99.9. Around retries: retry only on retryable errors (timeout, 503, 429-with-Retry-After, connection reset — never 4xx except 429), with full-jitter exponential backoff, a bounded max attempts, and a retry budget capping total retries to ~10% of requests. Around that: a circuit breaker that trips on failure ratio so retries stop entirely when the dep is down. Enclosing everything: an overall deadline/budget for the whole operation so retries + backoff can never exceed what the caller is willing to wait — each retry checks remaining budget before sleeping/attempting. And every retried write carries an idempotency key. The order matters: the breaker short-circuits before you spend retry budget, and the deadline caps the whole thing.</p></details>
+  <details><summary>How do load shedding and admission control decide what to drop under overload?</summary><p>You tag requests with a criticality/priority (e.g. CRITICAL_PLUS for checkout, CRITICAL for core reads, SHEDDABLE for recommendations/prefetch). When a server detects overload — rising queue depth, latency past SLO, CPU saturation — it sheds from the lowest priority up, rejecting SHEDDABLE traffic first with a fast 503 so the money path keeps its capacity. Admission control does this at the front door before work is queued, so you don't spend resources on requests you'll drop. Adaptive versions (Netflix concurrency-limits, Google's approach) measure the server's actual capacity via latency gradient (like TCP Vegas) and adjust the concurrency limit dynamically rather than using a fixed threshold. The key insight: under overload, serving fewer requests well beats serving all requests badly (or crashing).</p></details>
+  <details><summary>Reject vs block for backpressure with a bounded queue — which and why?</summary><p>A bounded queue is your backpressure buffer. When it fills you choose: block the producer (backpressure propagates upstream, producer slows) or reject immediately (fast fail, producer decides what to do). For synchronous request/response you almost always reject — blocking ties up the caller's thread and the caller has a deadline anyway; a fast 503/429 lets it shed or retry elsewhere. Blocking is appropriate in internal pipelines where the producer can genuinely slow down (e.g. a Kafka consumer that just stops polling) and you want lossless flow control. The anti-pattern is an unbounded queue — it hides the overload, grows until OOM, and adds latency to every request (queue wait) with no ceiling. Always bound it and set the bound so max queue wait stays under the timeout budget.</p></details>
+  <details><summary>Your 429 rate is spiking but real traffic is flat — how do you debug it?</summary><p>First confirm it's real limiting not a misconfig: check limiter_fail_open_rate (if Redis flapped, some pods may be mis-counting) and whether a recent deploy changed limit config. Pull the top limited keys — is it one caller (a broken client retry loop hammering you) or broad? If one caller, check their retry behavior: a client retrying on 429 without honoring Retry-After creates a feedback loop that inflates the 429 count. Check whether autoscaling changed instance count on a per-instance limiter (effective limit shifted). Inspect a sample key's state (<code>HGETALL</code>/<code>ZCARD</code>) to verify the counter matches reality — a clock-skew bug or non-unique sorted-set members can corrupt counts. Correlate with limiter_redis_latency: if Redis got slow, some checks may be timing out and being counted wrong. The usual culprit is a client ignoring Retry-After and retry-storming your limiter.</p></details>
+  <details><summary>How would you rate limit a GraphQL API where one query can be arbitrarily expensive?</summary><p>Count-based limiting is meaningless — one query can request the entire object graph. Use query complexity analysis: statically compute a cost from the query AST before execution (each field a weight, list fields multiply by the requested/estimated page size, nesting compounds), reject queries over a max complexity outright, and deduct the computed cost from a token-bucket budget per caller. Also enforce max depth to stop deeply nested recursive queries, and require pagination limits (no unbounded lists). Optionally do post-execution reconciliation if actual cost diverged from the estimate. GitHub's GraphQL API is the canonical example — a 5000-point/hour budget where each query's cost is computed from its shape. This is cost-based token-bucket limiting applied to a variable-cost interface.</p></details>
+</div>

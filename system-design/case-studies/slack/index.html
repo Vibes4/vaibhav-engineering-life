@@ -1,0 +1,107 @@
+<h1>How Slack Works <span class="tag express">Case Study</span></h1>
+<p>Slack is a team chat app organised into <strong>workspaces</strong> (a company), <strong>channels</strong> (rooms inside it), and direct messages. The interesting system-design problem is <strong>real-time fan-out</strong>: when someone types in <code>#general</code>, every connected member of that channel must see the message in milliseconds — but nobody outside it should. Doing this for millions of concurrent connections is the hard part.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 240" role="img" aria-label="Slack real-time architecture: clients over WebSockets to a gateway tier, which fans out via a pub/sub bus, persists to the message store, and tracks presence">
+    <defs>
+      <marker id="arr-slack" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="20" y="92" width="120" height="56" rx="9"></rect>
+    <text class="lbl" x="80" y="116" text-anchor="middle">Clients</text>
+    <text class="sub" x="80" y="134" text-anchor="middle">web / mobile</text>
+
+    <rect class="box-accent" x="220" y="92" width="150" height="56" rx="9"></rect>
+    <text class="lbl" x="295" y="114" text-anchor="middle">WebSocket Gateway</text>
+    <text class="sub" x="295" y="132" text-anchor="middle">stateful fan-out</text>
+
+    <rect class="box" x="450" y="20" width="150" height="52" rx="9"></rect>
+    <text class="lbl" x="525" y="42" text-anchor="middle">Channel/Message</text>
+    <text class="sub" x="525" y="60" text-anchor="middle">service</text>
+
+    <rect class="box" x="450" y="98" width="150" height="44" rx="9"></rect>
+    <text class="lbl" x="525" y="125" text-anchor="middle">Pub/Sub bus</text>
+
+    <rect class="box" x="450" y="168" width="150" height="44" rx="9"></rect>
+    <text class="lbl" x="525" y="195" text-anchor="middle">Message store</text>
+
+    <rect class="box" x="220" y="178" width="150" height="44" rx="9"></rect>
+    <text class="lbl" x="295" y="205" text-anchor="middle">Presence service</text>
+
+    <line class="edge" x1="140" y1="120" x2="214" y2="120" marker-end="url(#arr-slack)"></line>
+    <text class="cap" x="177" y="112" text-anchor="middle">WebSocket</text>
+
+    <line class="edge" x1="370" y1="112" x2="444" y2="52" marker-end="url(#arr-slack)"></line>
+    <text class="cap" x="420" y="78" text-anchor="middle">route</text>
+
+    <line class="edge" x1="370" y1="120" x2="444" y2="120" marker-end="url(#arr-slack)"></line>
+    <text class="cap" x="407" y="112" text-anchor="middle">publish</text>
+
+    <line class="edge" x1="525" y1="72" x2="525" y2="94" marker-end="url(#arr-slack)"></line>
+    <text class="cap" x="560" y="88" text-anchor="middle">fan-out</text>
+
+    <line class="edge" x1="525" y1="72" x2="525" y2="164" marker-end="url(#arr-slack)"></line>
+    <text class="cap" x="565" y="158" text-anchor="middle">persist</text>
+
+    <line class="edge-dash" x1="295" y1="148" x2="295" y2="174" marker-end="url(#arr-slack)"></line>
+    <text class="cap" x="335" y="166" text-anchor="middle">heartbeat</text>
+  </svg>
+  <div class="diagram-cap">Figure: a message is published once to the pub/sub bus and fanned out by every gateway holding a subscriber, while the durable write goes to the message store.</div>
+</div>
+
+<h2>Requirements</h2>
+<ul>
+  <li><strong>Functional:</strong> send/receive messages in channels and DMs; create channels; show who is online (presence); show unread badges and counts; full message history that survives reconnects.</li>
+  <li><strong>Non-functional:</strong> near real-time delivery (&lt;200ms), highly available, ordered delivery within a channel, must hold <strong>millions of long-lived connections</strong>, and never lose a message even if the client is briefly offline.</li>
+</ul>
+
+<h2>The core hard problem: real-time fan-out</h2>
+<p>HTTP is request/response — the client asks, the server answers. But chat is <em>server-initiated</em>: the server must push a message to you without you asking. That is why Slack uses <strong>WebSockets</strong> — a single long-lived, bidirectional TCP connection per client that stays open so the server can push at any time.</p>
+<p>Think of a channel as a mailing list. When a message arrives, the server looks up every subscriber of that channel and writes the message down their open socket. This "look up the members, push to each" step is <strong>fan-out</strong>, and it is the heart of the demo for this page.</p>
+
+<h2>Why not just poll?</h2>
+<table>
+  <tr><th>Short polling</th><td>Client asks "anything new?" every few seconds. Simple, but wasteful (mostly empty replies) and laggy (delay = poll interval). Terrible at scale.</td></tr>
+  <tr><th>Long polling</th><td>Server holds the request open until there is news. Better latency, but still one request per message and heavy on connection churn.</td></tr>
+  <tr><th>WebSocket</th><td>One persistent connection, server pushes instantly. Lowest latency and overhead. The standard for chat. Cost: you must manage millions of stateful connections.</td></tr>
+</table>
+
+<h2>Data model and storage</h2>
+<p>Messages are <strong>append-only</strong> and read by channel in time order, so the natural model is: <code>messages(channel_id, ts, sender_id, body)</code> partitioned by <code>channel_id</code> and sorted by <code>ts</code>. A wide-column store (Cassandra) or sharded SQL fits this write-heavy, time-ordered access pattern.</p>
+<ul>
+  <li><strong>channel_members:</strong> who belongs to each channel — this is the list you fan out to.</li>
+  <li><strong>ts as the ordering key:</strong> a monotonic per-channel timestamp/sequence gives a stable order so all clients agree on message order.</li>
+</ul>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Clients</strong> open a single WebSocket to the <strong>WebSocket Gateway</strong> tier and keep it alive with periodic heartbeats; one gateway box typically holds 100k–1M sockets, so a few hundred boxes cover tens of millions of users.</li>
+  <li>A user sends "hello" in <code>#general</code>; it travels up the existing socket to whichever gateway hosts that client.</li>
+  <li>The gateway forwards the message to the <strong>Channel/Message service</strong>, which assigns a monotonic per-channel sequence number and writes it durably to the <strong>Message store</strong> first.</li>
+  <li>Only after the durable write does it <strong>publish once</strong> to the channel's topic on the <strong>Pub/Sub bus</strong>.</li>
+  <li>Every <strong>WebSocket Gateway</strong> subscribed to that topic receives the single published copy, looks up which of its local sockets belong to <code>#general</code>, and writes the message down each one — that local lookup-and-push is the <strong>fan-out</strong>.</li>
+  <li>In parallel, clients ping the <strong>Presence service</strong>; a missed heartbeat flips a member to "away" with a TTL, never touching the durable store.</li>
+</ol>
+
+<h2>Connections, presence and the gateway tier</h2>
+<p>A user's socket lands on one of many stateless <strong>gateway servers</strong>. But the sender's gateway may not host the recipient's socket. So gateways subscribe to a shared <strong>pub/sub bus</strong> (e.g. Redis pub/sub or Kafka): publish the message once to the channel's topic, and every gateway holding a subscriber delivers it locally. This decouples senders from where recipients happen to be connected.</p>
+<p><strong>Why this scales:</strong> the alternative — a sender's gateway opening a direct connection to every other gateway holding a recipient — is O(N²) in gateway count and re-sends the payload once per gateway. With pub/sub the sender publishes <em>one</em> message regardless of fan-out size, and the bus does the cheap topic-to-subscriber routing. A busy channel with 50k members spread across 300 gateways becomes one publish plus ~300 local socket writes instead of 50k cross-server sends. End-to-end this keeps p99 delivery comfortably under the 200ms target even though each gateway is sustaining hundreds of thousands of idle long-lived TCP connections (the real cost is memory and file descriptors per socket, not CPU).</p>
+<p><strong>Presence</strong> (online/away) is just a heartbeat: clients ping periodically; miss a few and you are marked away. Store it in a fast in-memory store with a TTL, never the main DB.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Computing unread counts by scanning all messages on every page load melts your database. Instead store a per-user <code>last_read_ts</code> per channel; unread = messages with <code>ts &gt; last_read_ts</code>, and keep a cached running count you increment on new messages.</div>
+
+<h2>Delivery guarantees and reconnects</h2>
+<p>WebSockets drop all the time (wifi, tunnels, sleep). So the socket is for <em>speed</em>, not <em>truth</em>. The database is the source of truth. On reconnect the client sends "last message I saw = ts X" and the server replays everything after X. This is why you persist first, then fan out — never the reverse.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Separate the two paths. (1) Durable path: write to the DB and assign the official sequence number. (2) Fast path: publish to pub/sub for instant delivery. The fast path can lose a message with no harm because the durable path + reconnect replay guarantees eventual delivery and correct order.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why WebSockets instead of HTTP requests for chat?</summary><p>Chat needs the server to push messages without the client asking. Plain HTTP is request/response, so the client would have to poll. A WebSocket is a single persistent bidirectional connection, giving the server a channel to push instantly with minimal overhead.</p></details>
+  <details><summary>The sender and receiver are connected to different servers. How does the message reach the receiver?</summary><p>Gateways are stateless and subscribe to a shared pub/sub bus. The receiving gateway publishes the message to the channel's topic once; every gateway holding a subscriber of that channel gets it and writes it down the right local sockets. Senders never need to know where recipients are connected.</p></details>
+  <details><summary>How do you compute unread counts efficiently?</summary><p>Store a per-user, per-channel <code>last_read_ts</code>. Unread messages are those with <code>ts &gt; last_read_ts</code>. Maintain a cached running count incremented on each new message and reset when the user reads, so you never scan the message history on load.</p></details>
+  <details><summary>A user's connection dropped for 30 seconds. How do they not miss messages?</summary><p>The DB is the source of truth and assigns ordered sequence numbers. On reconnect the client reports the last ts it saw and the server replays everything after it. The real-time push is just an optimisation on top of this durable log.</p></details>
+  <details><summary>How do you ensure everyone sees messages in the same order?</summary><p>Assign a monotonic per-channel sequence number/timestamp at write time in the durable path, and have all clients order by it. Even if the fast pub/sub path delivers slightly out of order, clients sort by the authoritative sequence so they converge on one order.</p></details>
+  <details><summary>Why use a pub/sub bus instead of gateways talking to each other directly?</summary><p>Direct gateway-to-gateway delivery is O(N²) in the number of gateways and re-sends the payload once per gateway holding a subscriber. With a pub/sub bus the sender publishes exactly one message to the channel topic regardless of audience size, and the bus handles topic-to-subscriber routing. A 50k-member channel becomes one publish plus a few hundred local socket writes instead of tens of thousands of cross-server sends.</p></details>
+  <details><summary>What actually limits how many connections one gateway can hold?</summary><p>Chat connections are mostly idle, so CPU is rarely the bottleneck — the limits are memory per socket (buffers, TLS state) and OS file descriptors. You tune the kernel (fd limits, socket buffers) and run many stateless gateways behind the pub/sub bus, scaling horizontally to 100k–1M sockets per box.</p></details>
+</div>

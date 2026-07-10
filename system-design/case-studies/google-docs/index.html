@@ -1,0 +1,97 @@
+<h1>How Google Docs Works <span class="tag express">Case Study</span></h1>
+<p>Google Docs lets many people edit the same document at the same time and somehow everyone ends up seeing the identical text. The interesting problem is <strong>conflict resolution</strong>: if two people type into the same place at the same instant, whose change wins, and how do all replicas <em>converge</em> to one final document without anyone's keystroke getting lost?</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 230" role="img" aria-label="Google Docs architecture: clients over WebSockets to a collaboration server running the OT transform engine, which appends to an op log and persists to the document store">
+    <defs>
+      <marker id="arr-google-docs" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="20" y="40" width="120" height="50" rx="9"></rect>
+    <text class="lbl" x="80" y="62" text-anchor="middle">Client A</text>
+    <text class="sub" x="80" y="80" text-anchor="middle">Alice</text>
+
+    <rect class="box" x="20" y="140" width="120" height="50" rx="9"></rect>
+    <text class="lbl" x="80" y="162" text-anchor="middle">Client B</text>
+    <text class="sub" x="80" y="180" text-anchor="middle">Bob</text>
+
+    <rect class="box-accent" x="280" y="86" width="170" height="58" rx="9"></rect>
+    <text class="lbl" x="365" y="109" text-anchor="middle">Collaboration server</text>
+    <text class="sub" x="365" y="127" text-anchor="middle">OT transform + sequencer</text>
+
+    <rect class="box" x="540" y="40" width="150" height="50" rx="9"></rect>
+    <text class="lbl" x="615" y="62" text-anchor="middle">Op log</text>
+    <text class="sub" x="615" y="80" text-anchor="middle">revisions</text>
+
+    <rect class="box" x="540" y="140" width="150" height="50" rx="9"></rect>
+    <text class="lbl" x="615" y="162" text-anchor="middle">Document store</text>
+    <text class="sub" x="615" y="180" text-anchor="middle">snapshots</text>
+
+    <line class="edge" x1="140" y1="68" x2="274" y2="104" marker-end="url(#arr-google-docs)"></line>
+    <text class="cap" x="205" y="78" text-anchor="middle">WebSocket: op + rev</text>
+
+    <line class="edge" x1="140" y1="162" x2="274" y2="126" marker-end="url(#arr-google-docs)"></line>
+    <text class="cap" x="205" y="160" text-anchor="middle">WebSocket: op + rev</text>
+
+    <line class="edge" x1="450" y1="104" x2="534" y2="68" marker-end="url(#arr-google-docs)"></line>
+    <text class="cap" x="492" y="78" text-anchor="middle">append</text>
+
+    <line class="edge" x1="450" y1="126" x2="534" y2="162" marker-end="url(#arr-google-docs)"></line>
+    <text class="cap" x="492" y="160" text-anchor="middle">snapshot</text>
+  </svg>
+  <div class="diagram-cap">Figure: every client sends ops tagged with a base revision; the collaboration server transforms, sequences, appends to the op log, and broadcasts the transformed op back.</div>
+</div>
+
+<h2>Requirements</h2>
+<ul>
+  <li><strong>Functional:</strong> multiple users edit one document live; everyone sees each other's changes within ~100ms; cursors and selections are shared; full edit history / undo.</li>
+  <li><strong>Non-functional:</strong> <strong>convergence</strong> (all replicas end identical), <strong>intention preservation</strong> (your edit means the same after others' edits applied), low latency, works offline then merges on reconnect.</li>
+</ul>
+
+<h2>Why naive last-write-wins fails</h2>
+<p>Imagine the doc is <code>"cat"</code>. Alice inserts <code>"s"</code> at the end to make <code>"cats"</code>; at the same moment Bob inserts <code>"!"</code> at the end. If we just send raw positions, Bob's "insert at position 3" applied after Alice's insert lands in the wrong spot, and the two replicas disagree. Sending the whole document on every keystroke "fixes" it but is unusable at scale and clobbers concurrent edits. We need edits to be <strong>transformed</strong> against each other.</p>
+
+<h2>The core idea: Operational Transformation (OT)</h2>
+<p>OT models every edit as an <strong>operation</strong> like <code>insert("s", pos 3)</code> or <code>delete(pos 0)</code>. When two operations are made concurrently against the same base, before applying the second one you <strong>transform</strong> it against the first so its position accounts for what the first one already did. Then applying them in <em>either</em> order yields the same result. That property is what the demo proves.</p>
+<ul>
+  <li><strong>transform(a, b):</strong> rewrites operation <code>b</code> so it still expresses the user's intent <em>after</em> <code>a</code> has been applied.</li>
+  <li><strong>Example:</strong> Alice inserts at index 1, Bob inserts at index 4. Bob's index must shift to 5, because Alice's insert pushed everything after index 1 one slot to the right.</li>
+</ul>
+
+<h2>OT vs CRDT</h2>
+<table>
+  <tr><th>Operational Transformation (OT)</th><td>What Google Docs uses. Compact operations, but needs a <strong>central server</strong> to order and transform ops. Transform functions are notoriously tricky to get correct for every op pair.</td></tr>
+  <tr><th>CRDT (Conflict-free Replicated Data Type)</th><td>Each character gets a unique, globally-sortable id; merging is automatic and needs <strong>no central authority</strong>, so it is great for peer-to-peer/offline. Cost: more metadata per character and tombstones for deletes.</td></tr>
+</table>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li><strong>Client A (Alice)</strong> types "s"; her editor emits <code>insert("s", pos 3)</code> tagged with the base <strong>revision</strong> she last saw (say rev 41) and sends it over the WebSocket to the <strong>Collaboration server</strong>.</li>
+  <li>Concurrently <strong>Client B (Bob)</strong> emits <code>insert("!", pos 3)</code> also based on rev 41 and sends it over his own WebSocket.</li>
+  <li>The <strong>Collaboration server</strong> (the OT transform engine + sequencer) accepts Alice's op first, assigns it rev 42, and <strong>appends</strong> it to the <strong>Op log</strong>.</li>
+  <li>Bob's op arrives based on rev 41, but the server is now at rev 42, so it <strong>transforms</strong> Bob's op against Alice's accepted op (shifting his index), assigns it rev 43, and appends that to the <strong>Op log</strong>.</li>
+  <li>The server broadcasts each transformed op plus its new revision back over every open WebSocket; Alice receives Bob's transformed op, Bob receives Alice's, and both editors apply them to converge on identical text.</li>
+  <li>Periodically the server folds the op log into a compacted snapshot in the <strong>Document store</strong> so a new joiner loads one snapshot plus a short tail of ops instead of replaying the entire history.</li>
+</ol>
+
+<h2>Architecture: the central sequencer</h2>
+<p>OT relies on a server that assigns each operation a global <strong>revision number</strong>. A client sends an op tagged with the revision it was based on. If the server has since accepted other ops, it transforms the incoming op against them, applies it, broadcasts the transformed op plus the new revision, and clients reconcile. This turns a chaotic free-for-all into a single agreed sequence of operations.</p>
+<p><strong>Scale and the WHY:</strong> the target is sub-100ms echo of remote edits, and a single human types at most ~5–10 ops/sec, so even a doc with 50 simultaneous editors is only a few hundred ops/sec — trivial throughput. The hard part is <em>not</em> volume but <strong>correctness and serialization</strong>: every op for one document must funnel through a single authority so revisions are assigned in a strict total order. That is why each document is pinned to one collaboration-server instance (sharded by doc id); spreading one doc's ops across servers would reintroduce the very ordering ambiguity OT exists to remove. The op log is an append-only sequence, so it is cheap to write and to replay; the document store snapshot exists purely to bound replay cost — without it, opening a year-old doc would mean transforming millions of historical ops.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Sending absolute cursor positions without transforming them is the classic bug. Concurrent inserts before your position silently shift everything, so your "insert at 5" lands in the wrong place and replicas diverge. Always transform positions against concurrent ops.</div>
+
+<h2>Offline editing and convergence</h2>
+<p>When a client goes offline it keeps queuing operations against its last known revision. On reconnect it replays them, transforming each against everything the server accepted while it was away. Because OT guarantees convergence, the offline edits slot into the right places and everyone ends with the same text.</p>
+<div class="callout tip"><strong>Senior tip:</strong> The litmus test for any collaborative algorithm is: do two concurrent ops applied in opposite orders produce the same document? If yes you have convergence. The demo runs Alice-then-Bob and Bob-then-Alice and shows both reach the identical string.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why can't you just use last-write-wins for a shared document?</summary><p>Last-write-wins discards one user's edit entirely, and raw positions become invalid once a concurrent edit shifts the text. You lose keystrokes and replicas diverge. Collaborative editing needs every concurrent edit preserved and repositioned, which is what OT/CRDT provide.</p></details>
+  <details><summary>What does the transform() function do in OT?</summary><p>It rewrites one operation so it still expresses the user's intent after another concurrent operation has been applied. Typically it shifts an insert/delete index to account for characters another op added or removed before that position, so applying both ops in any order converges.</p></details>
+  <details><summary>OT vs CRDT -- when would you pick each?</summary><p>OT is compact but needs a central server to order and transform operations; it suits server-coordinated apps like Google Docs. CRDTs merge automatically without a central authority, ideal for peer-to-peer and offline-first apps, at the cost of extra per-character metadata and tombstones.</p></details>
+  <details><summary>How are concurrent edits ordered consistently across clients?</summary><p>A central sequencer assigns each accepted operation a global revision number. Incoming ops are transformed against any ops accepted since their base revision, applied, then broadcast with the new revision. Every client converges on this single agreed sequence.</p></details>
+  <details><summary>How does offline editing reconcile when the user comes back online?</summary><p>The client queues operations against its last-known revision while offline. On reconnect it replays them, transforming each against everything the server accepted in the meantime. OT's convergence guarantee ensures the merged result matches every other replica.</p></details>
+  <details><summary>Why pin a whole document to a single collaboration-server instance?</summary><p>OT needs one authority to assign revisions in a strict total order. If two servers accepted ops for the same doc independently you would reintroduce ordering ambiguity. Throughput is tiny (humans emit only a handful of ops/sec), so a single instance per doc — sharded by document id — easily handles even dozens of concurrent editors while guaranteeing serialization.</p></details>
+  <details><summary>Why keep both an op log and a document store?</summary><p>The op log is the authoritative append-only sequence of revisions, cheap to write and replay and used for transforms, history, and undo. The document store holds periodic compacted snapshots so opening an old document loads one snapshot plus a short tail of ops, bounding replay cost instead of transforming the entire history from scratch.</p></details>
+</div>

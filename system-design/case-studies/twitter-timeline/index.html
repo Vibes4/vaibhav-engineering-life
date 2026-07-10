@@ -1,0 +1,111 @@
+<h1>How Twitter Timeline Works <span class="tag express">Case Study</span></h1>
+<p>Twitter's home timeline is the list of tweets you see from everyone you follow, newest first. The interesting system-design problem is delivery: when someone tweets, how do their tweets reach the timelines of all their followers fast? The answer hinges on a famous tradeoff — fan-out on write vs fan-out on read — and the painful "celebrity" hot-key problem.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 260" role="img" aria-label="Twitter timeline flow: a tweet write goes through a fan-out service into a queue and is pushed into each follower's Redis timeline cache; the read path pulls from that cache; a dashed celebrity path merges celebrity tweets at read time">
+    <defs>
+      <marker id="arr-twitter-timeline" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <rect class="box" x="16" y="24" width="120" height="54" rx="9"></rect>
+    <text class="lbl" x="76" y="46" text-anchor="middle">Tweet write</text>
+    <text class="sub" x="76" y="63" text-anchor="middle">POST /tweet</text>
+    <rect class="box" x="176" y="24" width="120" height="54" rx="9"></rect>
+    <text class="lbl" x="236" y="46" text-anchor="middle">Fan-out queue</text>
+    <text class="sub" x="236" y="63" text-anchor="middle">async (Kafka)</text>
+    <rect class="box-accent" x="296" y="103" width="148" height="60" rx="9"></rect>
+    <text class="lbl" x="370" y="125" text-anchor="middle">Fan-out service</text>
+    <text class="sub" x="370" y="141" text-anchor="middle">+ Timeline cache</text>
+    <text class="sub" x="370" y="155" text-anchor="middle">per-follower (Redis)</text>
+    <rect class="box" x="296" y="20" width="120" height="40" rx="9"></rect>
+    <text class="lbl" x="356" y="44" text-anchor="middle">Social graph</text>
+    <rect class="box" x="16" y="112" width="120" height="54" rx="9"></rect>
+    <text class="lbl" x="76" y="134" text-anchor="middle">Reader</text>
+    <text class="sub" x="76" y="151" text-anchor="middle">GET /home</text>
+    <rect class="box" x="560" y="103" width="144" height="60" rx="9"></rect>
+    <text class="lbl" x="632" y="125" text-anchor="middle">Tweet store</text>
+    <text class="sub" x="632" y="141" text-anchor="middle">hydrate by id</text>
+    <text class="sub" x="632" y="155" text-anchor="middle">(source of truth)</text>
+    <rect class="box" x="296" y="200" width="148" height="48" rx="9"></rect>
+    <text class="lbl" x="370" y="221" text-anchor="middle">Celebrity tweets</text>
+    <text class="sub" x="370" y="237" text-anchor="middle">recent, by id</text>
+    <line class="edge" x1="136" y1="51" x2="170" y2="51" marker-end="url(#arr-twitter-timeline)"></line>
+    <text class="cap" x="153" y="43" text-anchor="middle">enqueue</text>
+    <line class="edge" x1="236" y1="78" x2="350" y2="99" marker-end="url(#arr-twitter-timeline)"></line>
+    <text class="cap" x="300" y="80" text-anchor="middle">push tweet id</text>
+    <line class="edge" x1="370" y1="103" x2="370" y2="62" marker-end="url(#arr-twitter-timeline)"></line>
+    <text class="cap" x="412" y="86" text-anchor="middle">follower ids</text>
+    <line class="edge" x1="296" y1="139" x2="142" y2="139" marker-end="url(#arr-twitter-timeline)"></line>
+    <text class="cap" x="220" y="131" text-anchor="middle">read timeline (ids)</text>
+    <line class="edge" x1="444" y1="133" x2="554" y2="133" marker-end="url(#arr-twitter-timeline)"></line>
+    <text class="cap" x="499" y="125" text-anchor="middle">hydrate ids</text>
+    <line class="edge-dash" x1="370" y1="200" x2="370" y2="165" marker-end="url(#arr-twitter-timeline)"></line>
+    <text class="cap" x="468" y="186" text-anchor="middle">celebrity = merge on read</text>
+  </svg>
+  <div class="diagram-cap">Figure: write path fans a tweet id into each follower's Redis timeline cache; reads pull ids from the cache and hydrate from the tweet store. Dashed = celebrity tweets merged in at read time instead of pushed.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<ul>
+  <li><strong>Functional:</strong> post a tweet; follow/unfollow users; load your home timeline (merged, reverse-chronological tweets from everyone you follow).</li>
+  <li><strong>Non-functional:</strong> extremely read-heavy (timeline loads vastly outnumber tweets); home timeline must load in tens of milliseconds; handle wildly skewed follower counts (most users have hundreds, some have hundreds of millions).</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> The whole design is driven by one observation: people read their timeline far more often than they tweet. So it's worth doing extra work <em>at write time</em> to make the common operation — reading — almost free.</div>
+
+<h2>The core hard problem: fan-out on write vs read</h2>
+<p>"Fan-out" means spreading one tweet to many timelines. There are two strategies:</p>
+<table>
+  <tr><th>Fan-out on write (push)</th><td>When you tweet, immediately push the tweet id into a precomputed timeline list for every follower. Reading a timeline is then just reading that list — O(1), blazing fast.</td></tr>
+  <tr><th>Fan-out on read (pull)</th><td>Store the tweet once. When a user loads their timeline, fetch recent tweets from everyone they follow and merge them on the fly. Cheap writes, expensive reads.</td></tr>
+</table>
+<p>Push makes reads cheap but writes expensive (one tweet = thousands of list inserts). Pull makes writes cheap but reads expensive (one read = merge across many followees). The right answer is usually a <strong>hybrid</strong>.</p>
+
+<h2>The celebrity / hot-key problem</h2>
+<p>Push falls apart for celebrities. If someone has 100 million followers, a single tweet triggers 100 million list inserts — a "fan-out storm" that can take minutes and hammer the system. That one user's key is a <strong>hot key</strong>.</p>
+<p><strong>Put numbers on the storm.</strong> A push costs one Redis list insert (~tens of microseconds), so a normal user with 500 followers triggers ~500 inserts — trivial. A celebrity with 100M followers triggers <strong>100 million inserts for a single tweet</strong>. Even at 1M inserts/sec across a sharded cluster that is ~100 seconds of write amplification per tweet, and a few such accounts tweeting together can saturate the fan-out tier — the classic <strong>hot key</strong>. The break-even threshold (often somewhere around <strong>tens of thousands to ~1M followers</strong>) is where the cost of pushing exceeds the cost of letting readers pull, which is exactly why those accounts switch strategy.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Pure fan-out-on-write does not scale for celebrities; pure fan-out-on-read does not scale for normal users (every timeline load would merge thousands of accounts). Picking only one strategy is the classic wrong answer.</div>
+
+<h2>The hybrid solution</h2>
+<p>Twitter uses both, chosen per user:</p>
+<ul>
+  <li><strong>Normal users:</strong> fan-out on write. Their tweets get pushed into followers' timelines so reads stay O(1).</li>
+  <li><strong>Celebrities:</strong> fan-out on read. Their tweets are <em>not</em> pushed. Instead, when you load your timeline, the system merges your precomputed list (from normal followees) with a freshly fetched list of recent tweets from the few celebrities you follow.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> This hybrid is a great example of "there is no single right answer — pick per case". You apply the cheap-write strategy exactly where push is too expensive (the long tail of celebrities) and keep the cheap-read strategy everywhere else.</div>
+
+<h2>Step-by-step request flow</h2>
+<p>Trace a tweet from a normal user, then a home-timeline read that also includes a celebrity, using the diagram's components.</p>
+<ol>
+  <li><strong>Write:</strong> a normal user posts via <em>Tweet write</em>. The tweet is saved once to the <em>Tweet store</em> (source of truth) and the write returns immediately; an event is dropped on the <em>Fan-out queue</em>.</li>
+  <li><strong>Resolve followers:</strong> the <em>Fan-out service</em> consumes the event, asks the <em>Social graph</em> for this author's follower ids.</li>
+  <li><strong>Push (fan-out on write):</strong> for each follower it prepends the tweet <em>id</em> to that follower's list in the <em>Timeline cache</em> (Redis), trimming the list to the most recent ~800. Writes are async, so a normal tweet's fan-out finishes within seconds.</li>
+  <li><strong>Read:</strong> a <em>Reader</em> opens their home timeline. The service reads the top ~50 ids straight from that user's precomputed Redis list — an O(1) lookup, no merging across followees.</li>
+  <li><strong>Celebrity merge (fan-out on read):</strong> for the handful of celebrities this user follows, whose tweets were <em>not</em> pushed, the service fetches their recent tweet ids (the dashed path) and merges them by timestamp into the result.</li>
+  <li><strong>Hydrate:</strong> finally the service fetches the actual tweet bodies for just those ~50 ids from the <em>Tweet store</em> (usually cache-backed) and returns the assembled timeline.</li>
+</ol>
+<div class="callout tip"><strong>Why ids, not tweets, in the cache?</strong> The fan-out step writes one tiny id per follower instead of a full tweet object. That keeps the per-follower lists small enough to live entirely in RAM (sub-millisecond reads) and means an edit or delete touches only the single source-of-truth row, not millions of copies.</div>
+
+<h2>Data model / storage choice</h2>
+<table>
+  <tr><th>Tweets (durable store)</th><td>The tweet content itself, stored once. Source of truth.</td></tr>
+  <tr><th>Timelines (Redis lists / sorted sets)</th><td>Per-user precomputed list of tweet ids, capped at the most recent ~800. In-memory so reads are sub-millisecond.</td></tr>
+  <tr><th>Social graph (followers/following)</th><td>Who follows whom; drives the fan-out at write time and the celebrity merge at read time.</td></tr>
+</table>
+<p><strong>Why store only tweet ids in the timeline?</strong> Ids are tiny, so the in-memory lists stay small and cheap to replicate. The actual tweet content is hydrated from the tweet store (often cached) only for the slice you're about to display.</p>
+
+<h2>Scaling and tradeoffs</h2>
+<p>Timelines are capped (you rarely scroll back thousands of tweets), which bounds memory. Fan-out happens asynchronously through a queue, so tweeting feels instant even while the push to followers is still in flight — accepting brief <strong>eventual consistency</strong> (a tweet may take a moment to appear) in exchange for fast writes.</p>
+<p><strong>Sizing the cache.</strong> Suppose ~300M users each keep a capped list of ~800 tweet ids at ~16 bytes each (id + score): that is ~12.8KB/user, so the working set is on the order of <strong>a few TB of RAM</strong> across a sharded Redis cluster — large but tractable, and the reason the cache stores ids, not multi-KB tweet objects (which would balloon it 50–100x). The payoff is a home-timeline read served in <strong>single-digit milliseconds</strong>: one Redis range read plus a batched hydrate, against a read load of <strong>hundreds of thousands of timeline loads/sec</strong>. Tweets themselves arrive far slower (a few thousand/sec), which is precisely why spending extra work at write time to make reads near-free is the correct trade.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Don't store full tweet objects in every follower's timeline list — that multiplies storage by your follower count and makes a tweet edit/delete a nightmare. Store ids and hydrate.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is the difference between fan-out on write and fan-out on read?</summary><p>Fan-out on write (push) copies a tweet id into every follower's precomputed timeline when it's posted, making reads O(1). Fan-out on read (pull) stores the tweet once and merges followees' tweets at read time, making writes cheap but reads expensive.</p></details>
+  <details><summary>Why is reading a timeline O(1) in the push model?</summary><p>Because the work was already done at write time. Each follower has a precomputed list of tweet ids in memory, so loading the timeline is just reading the top of that list — no merging across followees needed.</p></details>
+  <details><summary>Why can't celebrities use fan-out on write?</summary><p>One tweet would fan out to hundreds of millions of timelines — a fan-out storm that's slow and resource-crushing. Their account becomes a hot key. Instead their tweets are pulled (fan-out on read) and merged into followers' timelines at read time.</p></details>
+  <details><summary>How does the hybrid approach assemble a user's home timeline?</summary><p>It merges two sources: the precomputed list pushed by normal followees, plus a freshly fetched set of recent tweets from the small number of celebrities the user follows. The merge is by timestamp, newest first.</p></details>
+  <details><summary>Why store only tweet ids in timelines instead of full tweets?</summary><p>Ids are tiny, keeping the in-memory lists small, cheap to replicate, and easy to cap. The full content lives once in the tweet store and is hydrated (and cached) only for the slice being displayed, which also keeps edits/deletes manageable.</p></details>
+  <details><summary>Roughly where is the threshold to switch a user from push to pull, and why?</summary><p>At the follower count where the write amplification of pushing every tweet (one insert per follower) outweighs the cost of having readers merge the account at read time — often somewhere from tens of thousands up to ~1M followers. Below it, push keeps reads O(1) cheaply; above it, a single tweet would cause a multi-million-insert fan-out storm, so pull is cheaper overall.</p></details>
+  <details><summary>Estimate the memory needed for the timeline cache and justify the id-only choice.</summary><p>With ~300M users each holding ~800 ids at ~16 bytes, that is ~13KB/user, or a few TB of RAM across a sharded Redis cluster. Storing full tweet objects instead would multiply that by ~50–100x and make every edit/delete touch millions of copies, so ids + hydrate-on-read is what keeps the cache affordable and correct.</p></details>
+</div>

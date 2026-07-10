@@ -1,0 +1,107 @@
+<h1>How WhatsApp Works <span class="tag express">Case Study</span></h1>
+<p>WhatsApp delivers tens of billions of messages a day, and yet its own servers can't read a single one. That's the fascinating tension: it must be a reliable post office (store messages, forward them when you come back online, show ticks) while being a post office that <em>cannot open the envelopes</em>. This case study is about end-to-end encryption, offline store-and-forward, and the single/double/blue tick state machine.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 240" role="img" aria-label="Sender device encrypts with shared key, WhatsApp server stores and forwards ciphertext only, recipient device decrypts; private keys never leave the devices">
+    <defs>
+      <marker id="arr-whatsapp" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <rect class="box-accent" x="24" y="92" width="150" height="64" rx="9"></rect>
+    <text class="lbl" x="99" y="116" text-anchor="middle">Sender device</text>
+    <text class="sub" x="99" y="133" text-anchor="middle">encrypts w/ shared key</text>
+    <text class="accent-text" x="99" y="150" text-anchor="middle">keys stay here</text>
+
+    <rect class="box" x="285" y="92" width="150" height="64" rx="9"></rect>
+    <text class="lbl" x="360" y="116" text-anchor="middle">WhatsApp server</text>
+    <text class="sub" x="360" y="133" text-anchor="middle">store &amp; forward</text>
+    <text class="cap" x="360" y="150" text-anchor="middle">ciphertext only</text>
+
+    <rect class="box-accent" x="546" y="92" width="150" height="64" rx="9"></rect>
+    <text class="lbl" x="621" y="116" text-anchor="middle">Recipient device</text>
+    <text class="sub" x="621" y="133" text-anchor="middle">decrypts w/ shared key</text>
+    <text class="accent-text" x="621" y="150" text-anchor="middle">keys stay here</text>
+
+    <line class="edge" x1="174" y1="124" x2="281" y2="124" marker-end="url(#arr-whatsapp)"></line>
+    <text class="cap" x="227" y="116" text-anchor="middle">send ciphertext</text>
+
+    <line class="edge" x1="435" y1="124" x2="542" y2="124" marker-end="url(#arr-whatsapp)"></line>
+    <text class="cap" x="488" y="116" text-anchor="middle">forward ciphertext</text>
+
+    <line class="edge-dash" x1="546" y1="146" x2="178" y2="146" marker-end="url(#arr-whatsapp)"></line>
+    <text class="cap" x="362" y="172" text-anchor="middle">delivery / read ACKs (metadata)</text>
+
+    <text class="accent-text" x="99" y="200" text-anchor="middle">private key</text>
+    <text class="cap" x="360" y="200" text-anchor="middle">no keys, ciphertext at rest</text>
+    <text class="accent-text" x="621" y="200" text-anchor="middle">private key</text>
+    <text class="sub" x="360" y="218" text-anchor="middle">end-to-end: only the two devices can read content</text>
+  </svg>
+  <div class="diagram-cap">Figure: the server is a blind relay that store-and-forwards ciphertext; the keys that can decrypt it live only on the two endpoint devices.</div>
+</div>
+
+<h2>Requirements (functional & non-functional)</h2>
+<ul>
+  <li><strong>Functional:</strong> send a message to another user, deliver it even if they're currently offline, show the sender whether it was sent, delivered, and read.</li>
+  <li><strong>Non-functional:</strong> messages must be readable <em>only</em> by sender and recipient (end-to-end encrypted), delivery must be reliable and ordered, and the system must scale to billions of users with low latency.</li>
+</ul>
+<p>The defining constraint is the security one: <strong>the server is untrusted</strong>. We design as if the server (and anyone who hacks it) is an eavesdropper. That single rule shapes the entire architecture.</p>
+
+<h2>Step-by-step request flow</h2>
+<p>Tracing the three boxes in the diagram, one message travels like this:</p>
+<ol>
+  <li><strong>Sender device</strong> (a star): Alice's app encrypts the plaintext with the symmetric key derived from the shared secret. The plaintext and the private key never leave her phone.</li>
+  <li><strong>WhatsApp server:</strong> receives only ciphertext. If Bob is online it forwards instantly; if he's offline it persists the ciphertext in his queue and (optionally) fires a push notification. It is structurally blind to content.</li>
+  <li><strong>Recipient device</strong> (a star): Bob's app pulls the ciphertext on reconnect and decrypts it locally with his own key material. Only here does plaintext exist again.</li>
+  <li><strong>ACK return path:</strong> Bob's device sends delivery- and read-ACKs back through the server to Alice. These are routing metadata, not encrypted content, and drive the tick state machine.</li>
+</ol>
+
+<h2>The core hard problem: end-to-end encryption without sharing a password</h2>
+<p>If Alice and Bob want a shared secret key to encrypt messages, the obvious idea is "Alice picks a key and sends it to Bob." But the server relays that message — so the server would learn the key and could read everything. We need Alice and Bob to <em>agree on the same secret</em> while only ever sending things over the wire that an eavesdropper can't turn into the secret.</p>
+<p>This is solved by <strong>Diffie-Hellman key exchange</strong>. Each side generates a private key (kept secret, never sent) and a public key (derived from it, safe to send). Through the math of modular exponentiation, Alice can combine <em>her private</em> + <em>Bob's public</em> and Bob can combine <em>his private</em> + <em>Alice's public</em>, and both arrive at the <strong>identical shared secret</strong> — which never traveled across the network.</p>
+<div class="callout tip"><strong>Senior tip:</strong> The intuition for Diffie-Hellman is mixing paint. Everyone agrees on a public base color. Each person mixes in a secret color and shares the mixture (you can't un-mix it). When each adds their own secret color to the other's mixture, both end up with the same final color — but an eavesdropper who only saw the two public mixtures can't reproduce it.</div>
+
+<h2>Encrypting the actual message</h2>
+<p>Diffie-Hellman gives us a shared secret, but it's slow and only run occasionally. The shared secret is used to derive a fast <strong>symmetric key</strong> (AES). Every message is then encrypted with AES, which is fast enough for billions of messages.</p>
+<ul>
+  <li><strong>Asymmetric (DH):</strong> used to agree on a key safely over an open channel. Slow.</li>
+  <li><strong>Symmetric (AES):</strong> used to encrypt the message bodies. Fast. Both sides already share the key, so no key needs to be sent.</li>
+</ul>
+<p>The real Signal Protocol goes further with a "ratchet" that derives a <em>new</em> key for every single message, so cracking one message doesn't reveal past or future ones (forward secrecy). The core idea, though, is exactly the DH + symmetric combo above.</p>
+<div class="callout warn"><strong>Gotcha:</strong> End-to-end encryption protects message <em>content</em>, not <em>metadata</em>. The server still must know who is talking to whom and when, to route messages. Don't claim E2EE hides everything in an interview — it hides the envelope's contents, not the addresses on it.</div>
+
+<h2>Offline delivery: store-and-forward</h2>
+<p>Bob is often offline (phone in pocket, no signal). The server can't just drop Alice's message. It acts as a <strong>store-and-forward</strong> mailbox: it holds the (already encrypted) message in a queue keyed to Bob, and pushes it the instant Bob reconnects.</p>
+<table>
+  <tr><th>Bob online</th><td>Server immediately forwards the ciphertext over Bob's live connection; near-instant delivery.</td></tr>
+  <tr><th>Bob offline</th><td>Server persists the ciphertext in Bob's queue, optionally pings a push notification, and delivers on reconnect. Deletes it after delivery (WhatsApp doesn't keep messages long-term).</td></tr>
+</table>
+<p>Crucially, what's stored is the <em>ciphertext</em>. Even sitting in the server's queue for days, the message is unreadable to the server.</p>
+
+<h2>The tick state machine (sent → delivered → read)</h2>
+<p>Those grey and blue ticks are a small but classic <strong>state machine</strong> driven by acknowledgements bouncing back through the server:</p>
+<ul>
+  <li><strong>Single grey tick (sent):</strong> the server received the message from Alice. That's all Alice knows so far.</li>
+  <li><strong>Double grey tick (delivered):</strong> the message reached Bob's <em>device</em>. Bob's app sends a delivery-ACK back through the server to Alice.</li>
+  <li><strong>Two blue ticks (read):</strong> Bob actually opened the chat. His app sends a read-ACK back to Alice.</li>
+</ul>
+<p>Each transition is one-way and triggered by an ACK travelling the reverse path. Note the receipts are about routing/UI and are <em>not</em> encrypted content — they're metadata the server legitimately handles.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Model receipts as an explicit state machine with idempotent transitions. ACKs can arrive late, out of order, or twice (mobile networks are flaky). "delivered" must never overwrite "read", and a duplicate ACK must be a no-op.</div>
+
+<h2>Tradeoffs to discuss</h2>
+<ul>
+  <li><strong>Persistent connection vs. polling:</strong> WhatsApp keeps a long-lived connection (so it can push instantly), which costs server memory per user but gives real-time delivery. The famous Erlang result: WhatsApp engineers held <strong>~2 million concurrent connections on a single server</strong>, which is the whole reason a small team could serve hundreds of millions of users. At ~2B users, polling every few seconds would mean billions of wasted requests per minute and drained batteries; one idle socket costing a few KB of kernel memory is far cheaper than that churn, and it lets the server push a message the instant it arrives instead of waiting for the next poll.</li>
+  <li><strong>How long to store undelivered messages:</strong> longer = more reliable for users who are offline for weeks, but more storage and a bigger privacy surface. WhatsApp deletes after delivery / a fixed window.</li>
+  <li><strong>Read receipts privacy:</strong> nice for senders, uncomfortable for recipients — hence the option to disable blue ticks, a product tradeoff layered on the technical one.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>How can Alice and Bob agree on a secret key when the server relays everything between them?</summary><p>Diffie-Hellman key exchange. Each generates a private key (never sent) and a public key (safe to send). Alice combines her private with Bob's public; Bob combines his private with Alice's public; the math yields the same shared secret. An eavesdropper sees only the two public keys, from which deriving the secret is computationally infeasible. The secret itself never crosses the wire.</p></details>
+  <details><summary>If Diffie-Hellman is so secure, why also use AES?</summary><p>Asymmetric crypto like DH is computationally expensive and awkward for bulk data. So we use DH once to agree on a shared secret, derive a symmetric AES key from it, and encrypt the actual messages with fast AES. It's the standard hybrid: asymmetric to establish the key, symmetric for the payload.</p></details>
+  <details><summary>What does end-to-end encryption NOT protect?</summary><p>Metadata: who messaged whom, when, message sizes, and online status. The server must see this to route messages and show ticks. E2EE protects message <em>content</em> only. Claiming it hides everything is a common interview mistake.</p></details>
+  <details><summary>How are messages delivered to an offline user?</summary><p>Store-and-forward. The server queues the still-encrypted message keyed to the recipient, optionally fires a push notification, and forwards it the moment the recipient reconnects, then deletes it. The stored payload is ciphertext, so even queued messages are unreadable to the server.</p></details>
+  <details><summary>Why model delivery receipts as an explicit state machine?</summary><p>Because ACKs travel flaky mobile networks and can arrive late, duplicated, or out of order. An explicit state machine (sent → delivered → read) with idempotent, one-directional transitions guarantees correctness: a duplicate "delivered" is a no-op and can never regress a message already marked "read".</p></details>
+  <details><summary>Why hold a persistent connection per user instead of polling, at billions of users?</summary><p>A push model gives instant delivery and avoids the enormous waste of billions of empty poll requests per minute plus the battery drain on every phone. Persistent connections cost memory per user, but it's cheap per socket — WhatsApp famously sustained ~2&nbsp;million concurrent connections on one Erlang server. That density is precisely what let a tiny team serve hundreds of millions of users.</p></details>
+</div>

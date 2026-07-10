@@ -1,0 +1,333 @@
+<h1>Distributed Systems <span class="tag express">Mastery</span></h1>
+<p>A distributed system is a set of independent nodes that appear to the user as one coherent system, coordinating over an <strong>unreliable, asynchronous network</strong> with <strong>partial failures</strong> and <strong>no shared clock</strong>. Everything hard about distributed systems reduces to three facts: the network can drop/delay/reorder messages, nodes can crash at any point, and there is no global "now". This page pushes past definitions into CAP/PACELC, consistency models, replication, consensus (Raft/Paxos), 2PC vs Saga, idempotency, clocks (Lamport/vector/HLC/TrueTime), consistent hashing, failure detection, fencing, and CRDTs.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "A distributed system spreads state and work across machines connected by an unreliable network, so you're always trading off <em>consistency, availability, and latency</em> under failure. CAP says during a network partition you must choose consistency or availability; PACELC adds that even with no partition you trade consistency for latency. The whole discipline is about coping with partial failure and the lack of a global clock — replication for durability, consensus (Raft/Paxos) for agreement, quorums for correctness, idempotency because you can't get exactly-once delivery, and logical clocks because wall-clock time lies."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>Frame it around <strong>three impossibilities and how we work around them</strong>:</p>
+<ul>
+  <li><strong>Impossibility 1 — you can't have C, A and partition-tolerance all at once (CAP).</strong> Partitions <em>will</em> happen (P is not optional), so the real choice under a partition is CP (reject writes to stay consistent, like ZooKeeper/etcd) or AP (accept writes, reconcile later, like Dynamo/Cassandra). PACELC completes the picture: <em>Else</em> (no partition) you still trade Latency vs Consistency — Spanner is CP+PC (pays latency for linearizability), Dynamo is AP+EL (fast, eventually consistent).</li>
+  <li><strong>Impossibility 2 — exactly-once <em>delivery</em> is impossible</strong> (FLP + the two-generals problem). You get at-least-once or at-most-once on the wire. So we build <strong>exactly-once processing</strong> with idempotency keys + dedup stores + fencing tokens.</li>
+  <li><strong>Impossibility 3 — there is no global clock.</strong> NTP gives you ~1–10ms skew that can go negative; so for causality we use <strong>Lamport clocks</strong> (total-ish order, no causality detection), <strong>vector clocks</strong> (detect concurrency), <strong>HLC</strong> (physical + logical), or Google's <strong>TrueTime</strong> (GPS/atomic clocks with a bounded uncertainty interval that Spanner waits out).</li>
+</ul>
+<p>Then name the machinery: <strong>replication</strong> (single-leader / multi-leader / leaderless-quorum with R+W&gt;N), <strong>consensus</strong> (majority quorum to avoid split-brain), <strong>atomic commit</strong> (2PC — blocking; Saga — compensations), <strong>partitioning</strong> (consistent hashing + virtual nodes), <strong>failure detection</strong> (phi-accrual), and <strong>backpressure/load-shedding</strong> to survive overload. Close with the <strong>8 fallacies</strong> as the anti-pattern checklist.</p>
+
+<h2>Internal Working</h2>
+<p>Walk through what actually happens on a single replicated, partitioned write in a leaderless (Dynamo-style) store — this exercises most of the internals at once.</p>
+<ol>
+  <li><strong>Route the key.</strong> Client hashes the key with a stable hash (MD5/Murmur) onto a 2^128 ring. The coordinator walks clockwise to find the first <em>virtual node</em>, then the next N-1 distinct physical nodes = the <strong>preference list</strong> (N replicas). Virtual nodes (100–256 per physical node) smooth the load so adding/removing a node only re-maps 1/N of keys.</li>
+  <li><strong>Attach causality metadata.</strong> The write carries a <strong>vector clock</strong> (or version vector) so concurrent writes can be detected later. HLC timestamps are stamped for ordering.</li>
+  <li><strong>Send to N, wait for W acks.</strong> Coordinator dispatches to all N replicas in the preference list, returns success once <strong>W</strong> replicas ack. With <strong>R + W &gt; N</strong> the read and write quorums overlap, guaranteeing a reader sees at least one node with the latest write.</li>
+  <li><strong>Handle a down replica — hinted handoff.</strong> If a replica is unreachable, a healthy node stores the write with a <em>hint</em> ("this belongs to node C") and replays it when C recovers, so W is still met without sacrificing durability.</li>
+  <li><strong>Read path — read-repair.</strong> A read contacts R replicas; if versions diverge, the coordinator returns the newest (or all concurrent siblings) and asynchronously writes the merged value back — <strong>read-repair</strong>.</li>
+  <li><strong>Background reconciliation — anti-entropy with Merkle trees.</strong> Replicas periodically compare Merkle-tree hashes of their key ranges; only subtrees whose hashes differ are exchanged, so divergence is repaired with O(log n) data transfer instead of full scans.</li>
+  <li><strong>Conflict resolution.</strong> If vector clocks show concurrent (non-ancestor) versions, the store either keeps siblings for app-level merge (Dynamo) or applies LWW by HLC timestamp (Cassandra) or merges deterministically (CRDT).</li>
+</ol>
+<p>For a <strong>leader-based</strong> system the internals are: leader election via consensus → client writes go to leader → leader appends to its <strong>replicated log</strong> → replicates entries to followers → advances the <strong>commit index</strong> once a majority persisted → applies to the state machine → acks client. This is exactly Raft, covered below.</p>
+
+<h2>Why was this built?</h2>
+<p>Single machines hit hard ceilings: finite CPU/RAM/disk, a single failure domain, and a fixed geographic location (latency to far users). Before distributed systems, scaling meant <strong>vertical scaling</strong> (bigger boxes — expensive, still one failure domain) and <strong>manual failover</strong> (a hot standby DB with a human or heartbeat script flipping a VIP — minutes of downtime, split-brain risk).</p>
+<ul>
+  <li><strong>Availability:</strong> replicate so one crash doesn't take you down.</li>
+  <li><strong>Scale:</strong> partition so you can add machines linearly instead of buying a mainframe.</li>
+  <li><strong>Latency:</strong> put replicas near users (multi-region).</li>
+  <li><strong>Durability:</strong> multiple copies survive disk/rack/DC loss.</li>
+</ul>
+<p>The cost is that correctness now depends on agreement across an unreliable network — which is why consensus, quorums and consistency models exist.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>Approach</th><th>What it is</th><th>When it wins</th><th>Why you'd move off it</th></tr>
+  <tr><td>Single big server (scale up)</td><td>One vertically-scaled node</td><td>Simplicity, strong consistency for free, low latency</td><td>Hard ceiling, single failure domain, one region</td></tr>
+  <tr><td>Primary + standby failover</td><td>1 leader, warm replica, manual/auto flip</td><td>Simple HA, familiar (Postgres streaming replication)</td><td>Failover is slow, split-brain risk, no horizontal write scale</td></tr>
+  <tr><td>Single-leader replication</td><td>All writes to leader, async/sync followers</td><td>Strong-ish consistency, simple conflict story</td><td>Leader is a write bottleneck; failover window; cross-region write latency</td></tr>
+  <tr><td>Multi-leader</td><td>Writes accepted at multiple leaders</td><td>Multi-region low-latency writes, offline clients</td><td>Write conflicts you must resolve (LWW/CRDT/app merge)</td></tr>
+  <tr><td>Leaderless quorum (Dynamo)</td><td>R/W quorums, no single leader</td><td>Always-writable, tunable consistency, no failover</td><td>Eventual consistency, sibling/conflict handling, read-repair cost</td></tr>
+  <tr><td>Consensus (Raft/Paxos)</td><td>Majority-agreed replicated log</td><td>Linearizable metadata, leader election, config store</td><td>Majority-quorum latency, throughput capped by leader</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Fault tolerance:</strong> survive node/rack/DC failure with no data loss (replication + quorums).</li>
+  <li><strong>Horizontal scale:</strong> add commodity nodes for near-linear capacity via partitioning.</li>
+  <li><strong>Geographic locality:</strong> serve reads/writes near the user, multi-region.</li>
+  <li><strong>Elasticity:</strong> scale up/down with load; consistent hashing minimizes re-shuffling.</li>
+  <li><strong>Tunable guarantees:</strong> pick consistency vs latency per operation (e.g. Cassandra ONE vs QUORUM vs ALL).</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>Partial failure is the norm</strong> — a call can succeed on one node, fail on another, or time out with unknown outcome. Every RPC needs a timeout, retry, and idempotency story.</li>
+  <li><strong>No global clock</strong> — ordering and "latest" are genuinely ambiguous without logical clocks.</li>
+  <li><strong>Emergent complexity</strong> — debugging spans many nodes; you need distributed tracing, correlation IDs, and clock-aware logs.</li>
+  <li><strong>Consistency is expensive</strong> — linearizability costs round-trips and coordination; strong cross-region consistency costs tens of ms per op.</li>
+  <li><strong>Testing is hard</strong> — bugs hide in timing/partition scenarios; need Jepsen-style fault injection.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><strong>Consistency vs Availability (during partition):</strong> CP rejects writes to stay correct; AP accepts writes and reconciles.</li>
+  <li><strong>Consistency vs Latency (no partition, PACELC):</strong> synchronous replication / read quorums add round-trips; async is fast but can lose recent writes.</li>
+  <li><strong>Latency vs Durability:</strong> <code>acks=all, min.insync.replicas=2</code> (Kafka) ~doubles write latency but survives one broker loss; <code>acks=1</code> is fast but can lose the tail on leader crash.</li>
+  <li><strong>Throughput vs Ordering:</strong> a single leader/partition gives total order but caps throughput; sharding scales throughput but only gives per-key order.</li>
+  <li><strong>Freshness vs Cost:</strong> read-your-writes needs sticky routing or read from leader; eventual reads are cheap but stale.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Distributed is not free — reach for it only when a single node genuinely can't meet availability, scale, or geo requirements. Don't distribute when:
+<ul>
+  <li>Your data fits comfortably on one node and one region SLA is fine — a single Postgres with a replica beats a 5-node cluster you can't operate.</li>
+  <li>You need multi-object ACID transactions across entities constantly — cross-shard 2PC/Saga complexity will dominate; keep it on one node.</li>
+  <li>The team lacks ops maturity for consensus systems, backpressure, and fault injection — an under-operated distributed system is <em>less</em> reliable than a good monolith.</li>
+  <li>Strong consistency + low latency + high availability are all hard requirements simultaneously — physics (CAP/PACELC) says you can't have all three; re-scope.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A realistic multi-region, sharded, replicated deployment: stateless services behind a global load balancer, a leaderless data tier partitioned by consistent hashing with N=3 replicas spread across availability zones, a consensus-backed metadata/coordination service (etcd/ZooKeeper) for leader election and config, and an async event backbone (Kafka) for cross-service state propagation.</p>
+<pre class="mermaid">
+flowchart TD
+  C["Clients"] --> GLB["Global load balancer"]
+  GLB --> R1["Region A services"]
+  GLB --> R2["Region B services"]
+  R1 --> COORD["etcd cluster - consensus"]
+  R1 --> RING["Consistent hash ring"]
+  RING --> N1["Replica AZ1"]
+  RING --> N2["Replica AZ2"]
+  RING --> N3["Replica AZ3"]
+  R1 --> K["Kafka event bus"]
+  K --> R2
+  N1 -. anti-entropy .- N2
+  N2 -. anti-entropy .- N3
+</pre>
+<p>Key points: services are <strong>stateless</strong> so any node handles any request; the <strong>coordination service</strong> holds the single source of truth for leadership and topology (kept tiny, only metadata, so consensus latency doesn't hurt the data path); the <strong>data tier</strong> uses quorum reads/writes and background anti-entropy; and <strong>Kafka</strong> decouples regions/services so a slow consumer applies backpressure instead of collapsing producers.</p>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>Split-brain:</strong> a network partition leaves two nodes each believing they're leader; both accept writes → divergence. Fixed by majority quorum + fencing tokens.</li>
+  <li><strong>Retry storms / metastable failure:</strong> a blip causes timeouts → clients retry → amplified load keeps the system down even after the trigger is gone. Needs jittered backoff, retry budgets, circuit breakers, load shedding.</li>
+  <li><strong>Hot shards:</strong> a celebrity key or monotonic key (timestamp/auto-increment) sends all traffic to one partition. Needs key salting/virtual nodes/re-sharding.</li>
+  <li><strong>Clock skew bugs:</strong> LWW conflict resolution silently drops writes when a node's clock is ahead; NTP jumps break TTLs and leases.</li>
+  <li><strong>Zombie leaders:</strong> a GC-paused or partitioned leader wakes up and writes with a stale lease. Fencing tokens reject it.</li>
+  <li><strong>Cascading failure:</strong> one slow dependency saturates thread pools upstream; no bulkheads → whole call graph stalls.</li>
+  <li><strong>Duplicate processing:</strong> at-least-once delivery + non-idempotent handler = double charge / double email.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<ul>
+  <li><strong>Establish a timeline across nodes:</strong> use a correlation/trace ID on every request; pull traces from Jaeger/Tempo/Zipkin — <code>traceID</code> spans show which hop added latency or errored.</li>
+  <li><strong>Check clock skew first for ordering bugs:</strong> <code>chronyc tracking</code> / <code>ntpq -p</code> on each node; look at <em>offset</em> and <em>root dispersion</em>. Alert if skew &gt; a few ms.</li>
+  <li><strong>Cluster health / leadership:</strong> <code>etcdctl endpoint status --cluster -w table</code> (shows leader, raftIndex, dbSize); <code>etcdctl endpoint health</code>. For Kafka: <code>kafka-topics.sh --describe</code> to see under-replicated partitions and ISR.</li>
+  <li><strong>Quorum / replication lag:</strong> Cassandra <code>nodetool status</code>, <code>nodetool netstats</code>, <code>nodetool tpstats</code> (dropped mutations = overload). Kafka consumer lag via <code>kafka-consumer-groups.sh --describe</code>.</li>
+  <li><strong>Partition suspicion:</strong> <code>ping</code>/<code>mtr</code> between nodes, check phi-accrual detector state / gossip logs for flapping nodes.</li>
+  <li><strong>Find the retry storm:</strong> graph request-rate vs upstream-rate; a downstream at 100% with rising client RPS during an outage = amplification.</li>
+  <li><strong>Reproduce with fault injection:</strong> <code>tc qdisc add dev eth0 root netem delay 200ms loss 5%</code>, or Toxiproxy/Chaos Mesh to inject partitions; Jepsen to test linearizability claims.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+  <tr><th>Metric</th><th>What it means</th><th>Healthy / alert threshold</th></tr>
+  <tr><td>p99 / p999 latency</td><td>Tail latency users actually feel</td><td>Within SLO; alert if p99 &gt; 2x baseline</td></tr>
+  <tr><td>Replication lag</td><td>How far followers trail the leader</td><td>&lt; 1s; alert &gt; 10s (data-loss risk on failover)</td></tr>
+  <tr><td>Under-replicated / ISR shrink</td><td>Partitions below desired replica count</td><td>0; any sustained &gt;0 pages</td></tr>
+  <tr><td>Consumer/queue lag</td><td>Backlog of unprocessed messages</td><td>Flat/near-0; alert on sustained growth</td></tr>
+  <tr><td>Quorum / leader elections per hour</td><td>Leadership churn = instability</td><td>~0; frequent elections = flapping</td></tr>
+  <tr><td>Error rate / timeout rate</td><td>Partial-failure signal</td><td>&lt; 0.1%; alert on spikes</td></tr>
+  <tr><td>Clock offset</td><td>NTP skew per node</td><td>&lt; 5ms; alert &gt; 50ms</td></tr>
+  <tr><td>Dropped mutations / load-shed count</td><td>Overload / backpressure active</td><td>0 steady state; investigate any</td></tr>
+  <tr><td>Saturation (CPU, thread pool, connections)</td><td>Headroom before cascade</td><td>&lt; 70%; alert &gt; 85%</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>Two axes: <strong>vertical</strong> (bigger node — quick, but hits a ceiling and one failure domain) and <strong>horizontal</strong> (more nodes — the real path). Horizontal scale means <strong>partitioning</strong> the keyspace and <strong>replicating</strong> each partition.</p>
+<ul>
+  <li><strong>Consistent hashing + virtual nodes</strong> so adding node N+1 only moves ~1/N of keys, not a full re-hash.</li>
+  <li><strong>Range vs hash partitioning:</strong> hash spreads load evenly but kills range scans; range enables scans but creates hot shards on sequential keys.</li>
+  <li><strong>Replication factor</strong> (N=3 typical) across AZs for durability; read replicas for read-heavy scale.</li>
+  <li><strong>Limits:</strong> a single leader/partition caps write throughput; coordination (consensus) caps at ~majority-round-trip; cross-region adds RTT to every synchronous op.</li>
+  <li><strong>Backpressure &amp; load shedding</strong> are part of scaling — reject/deprioritize excess load (429s, priority queues) so the system degrades gracefully instead of collapsing.</li>
+</ul>
+<pre class="mermaid">
+flowchart LR
+  K["Key space 0 to 2^128"] --> H["Hash function"]
+  H --> V1["vnode set - node A"]
+  H --> V2["vnode set - node B"]
+  H --> V3["vnode set - node C"]
+  V1 --> P["Preference list N=3"]
+  V2 --> P
+  V3 --> P
+  P --> Q["Quorum R + W greater than N"]
+</pre>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>AuthN between services:</strong> mutual TLS (mTLS) with short-lived certs (SPIFFE/SPIRE), or signed service tokens; never trust the network (zero-trust).</li>
+  <li><strong>AuthZ:</strong> per-service RBAC/ABAC; scoped tokens; principle of least privilege on data-tier access.</li>
+  <li><strong>Encryption in transit:</strong> TLS 1.3 on every hop including intra-cluster gossip/replication.</li>
+  <li><strong>Encryption at rest:</strong> disk/volume encryption + per-tenant keys via KMS; rotate keys.</li>
+  <li><strong>Network isolation:</strong> private subnets, security groups, service mesh policies; data tier not internet-reachable.</li>
+  <li><strong>Common CVEs / pitfalls:</strong> unauthenticated coordination endpoints (open etcd/ZooKeeper/Redis on 0.0.0.0 — a classic breach), missing mTLS letting a compromised node join the cluster, replay attacks (mitigated by nonces + fencing tokens), and SSRF into internal service discovery.</li>
+  <li><strong>Auditability:</strong> tamper-evident audit logs; correlation IDs to trace an actor across nodes.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>Latency numbers to anchor on:</strong> same-DC RTT ~0.5ms, cross-region RTT 20–150ms, SSD random read ~100µs, disk fsync 1–10ms. A cross-region synchronous quorum write is dominated by the far-replica RTT.</li>
+  <li><strong>Bottlenecks:</strong> the single leader (all writes funnel through it), fsync durability, network RTT for quorums, lock/coordination contention, and GC pauses (which look like partitions).</li>
+  <li><strong>Tuning knobs:</strong> quorum levels (Cassandra <code>LOCAL_QUORUM</code> to stay in-region), Kafka <code>batch.size</code>/<code>linger.ms</code>/<code>compression</code> for throughput, connection pooling, request hedging (send to 2 replicas, take first) to cut tail latency, and read replicas for read scale.</li>
+  <li><strong>Tail-latency tricks:</strong> hedged requests, tied requests, and adaptive timeouts; a p999 outlier on one node shouldn't stall the whole fan-out.</li>
+  <li><strong>Batching &amp; pipelining</strong> amortize per-request overhead; but batching adds latency — tune <code>linger.ms</code> against your SLO.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Assuming exactly-once delivery.</strong> Fix: at-least-once + idempotency keys + dedup store for exactly-once <em>processing</em>.</li>
+  <li><strong>Non-idempotent retries.</strong> Fix: idempotent handlers keyed by a client-generated request ID; store the result and return it on replay.</li>
+  <li><strong>Trusting wall-clock time for ordering / LWW.</strong> Fix: HLC or logical clocks; never use raw <code>System.currentTimeMillis()</code> to decide "latest".</li>
+  <li><strong>No fencing on locks/leases.</strong> Fix: monotonically increasing fencing token checked by the resource so zombie holders are rejected.</li>
+  <li><strong>Retries without jitter/backoff/budget.</strong> Fix: exponential backoff + full jitter + retry budget + circuit breaker.</li>
+  <li><strong>Unbounded queues / no backpressure.</strong> Fix: bounded queues, load shedding, 429s, priority tiers.</li>
+  <li><strong>Ignoring the 8 fallacies</strong> (network reliable, latency zero, bandwidth infinite, network secure, topology stable, one admin, transport cost zero, homogeneous network). Fix: design for each explicitly.</li>
+  <li><strong>Distributed transactions everywhere.</strong> Fix: model boundaries so most ops are single-shard; use Sagas for the rare cross-service flow.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+  <tr><th>Company</th><th>How they plausibly use it</th></tr>
+  <tr><td>Google</td><td>Spanner uses <strong>TrueTime</strong> (GPS + atomic clocks, bounded uncertainty ε) with commit-wait to give externally-consistent, globally-distributed transactions; Chubby/Paxos for locking &amp; leader election; Bigtable/Colossus for partitioned storage.</td></tr>
+  <tr><td>Amazon</td><td>DynamoDB descends from the Dynamo paper — leaderless, consistent hashing, quorums, hinted handoff, anti-entropy. Also uses cell-based architecture and shuffle sharding to blast-radius-limit failures. Likely 2PC/Saga in order fulfilment.</td></tr>
+  <tr><td>Netflix</td><td>Cassandra (AP, tunable <code>LOCAL_QUORUM</code>) for viewing data; EVCache (memcached) for caching; heavy chaos engineering (Chaos Monkey / Simian Army) and circuit breakers (Hystrix legacy → resilience patterns) for backpressure.</td></tr>
+  <tr><td>Uber</td><td>Ringpop/consistent hashing for sharding stateful services; Schemaless on MySQL; Cadence/Temporal for durable workflow orchestration (Saga-style compensations); geo-partitioning for dispatch by city.</td></tr>
+  <tr><td>Swiggy</td><td>Likely partitions order/delivery state by geography/city, event-driven (Kafka) between order, restaurant, and rider services, with Saga-style compensations for cancellations/refunds and idempotency keys on payment callbacks.</td></tr>
+  <tr><td>PhonePe</td><td>UPI scale needs strong consistency on ledgers — likely sharded transactional stores with idempotent payment processing, exactly-once processing via dedup keys, and consensus-backed coordination; reconciliation jobs for eventual settlement.</td></tr>
+  <tr><td>Razorpay</td><td>Payments demand idempotency keys on every charge, Saga orchestration across gateway/bank/ledger with compensations, and strong audit trails; likely CP stores for balances, async webhooks (at-least-once) with dedup on the merchant side.</td></tr>
+  <tr><td>Atlassian</td><td>Jira/Confluence run multi-tenant, shard-per-tenant on cloud; likely use Kafka for cross-service events, DynamoDB/PostgreSQL, and vertical+horizontal partitioning; realtime collab (Confluence editing) is a CRDT/OT-style eventual-consistency problem.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>Define CAP precisely.
+    <ol><li><em>Answer pointer:</em> During a network partition you can guarantee consistency OR availability, not both; P is not a choice.</li></ol></li>
+  <li>Why is CAP "only during a partition"? What about the rest of the time?
+    <ol><li><em>Answer pointer:</em> With no partition you don't have to sacrifice either — PACELC's "Else": you trade Latency vs Consistency.</li></ol></li>
+  <li>Give me PACELC classifications for Spanner, Dynamo, and MongoDB.
+    <ol><li><em>Answer pointer:</em> Spanner PC/EC(→C), Dynamo/Cassandra PA/EL, MongoDB PA/EC (default) — tunable.</li></ol></li>
+  <li>Walk me down the consistency hierarchy from linearizable to eventual.
+    <ol><li><em>Answer pointer:</em> Linearizable &gt; sequential &gt; causal &gt; read-your-writes/monotonic &gt; eventual; each drops a guarantee for latency/availability.</li></ol></li>
+  <li>What's the difference between linearizability and serializability?
+    <ol><li><em>Answer pointer:</em> Linearizability = single-object real-time recency; serializability = multi-object transaction isolation; strict serializability = both.</li></ol></li>
+  <li>In a leaderless store, why does R+W&gt;N give you consistency, and does it actually?
+    <ol><li><em>Answer pointer:</em> Read and write quorums overlap in ≥1 node; but concurrent writes, sloppy quorums, and read-repair timing weaken it — not truly linearizable.</li></ol></li>
+  <li>How does Raft elect a leader and prevent two leaders?
+    <ol><li><em>Answer pointer:</em> Randomized election timeouts, votes need majority, terms are monotonic; a candidate needs a majority so two leaders in one term is impossible.</li></ol></li>
+  <li>How does Raft commit an entry, and what's the commit index?
+    <ol><li><em>Answer pointer:</em> Leader appends, replicates; once a majority persists, commit index advances; only then applied to state machine and acked.</li></ol></li>
+  <li>Why a majority quorum specifically, not any subset?
+    <ol><li><em>Answer pointer:</em> Any two majorities intersect, so a committed entry is seen by any future leader's majority — prevents lost writes/split-brain.</li></ol></li>
+  <li>Paxos vs Raft — real difference?
+    <ol><li><em>Answer pointer:</em> Same safety; Raft restructures for understandability (strong leader, log contiguity, explicit membership change). Multi-Paxos ≈ Raft in practice.</li></ol></li>
+  <li>2PC vs Saga for a checkout across 4 services?
+    <ol><li><em>Answer pointer:</em> 2PC = atomic but blocking on coordinator failure, holds locks; Saga = compensating transactions, eventually consistent, no locks, needs idempotency.</li></ol></li>
+  <li>Why is exactly-once delivery impossible but exactly-once processing possible?
+    <ol><li><em>Answer pointer:</em> Two-generals/FLP — you can't know the message arrived without an ack that can also be lost; so retry (at-least-once) + dedup by idempotency key at the consumer.</li></ol></li>
+  <li>How do you detect that a node has failed vs is just slow?
+    <ol><li><em>Answer pointer:</em> You can't be certain; phi-accrual gives a suspicion level from heartbeat-interval history instead of a fixed timeout.</li></ol></li>
+  <li>A leader GC-pauses for 10s and its lease expires — what breaks and how do you fix it?
+    <ol><li><em>Answer pointer:</em> Zombie leader may write after a new one is elected → split-brain; fencing tokens (monotonic) rejected by the resource fix it.</li></ol></li>
+  <li>Lamport vs vector clocks — when do you need which?
+    <ol><li><em>Answer pointer:</em> Lamport gives a total order but can't detect concurrency; vector clocks detect causal vs concurrent (needed for conflict detection); size grows with nodes.</li></ol></li>
+  <li>What is TrueTime and how does Spanner use it?
+    <ol><li><em>Answer pointer:</em> An API returning [earliest, latest] bounded by ε; Spanner does commit-wait until ε passes so timestamps respect real-time order → external consistency.</li></ol></li>
+  <li>How do CRDTs avoid coordination, and their limits?
+    <ol><li><em>Answer pointer:</em> Commutative/associative/idempotent merges converge regardless of order; great for counters/sets/text, but can't express arbitrary invariants (e.g. non-negative balance).</li></ol></li>
+  <li>Your system melts under a small blip and stays down — name it and fix it.
+    <ol><li><em>Answer pointer:</em> Metastable failure from retry amplification; fix with backoff+jitter, retry budgets, circuit breakers, load shedding, and reducing work-per-retry.</li></ol></li>
+  <li>How would you prove your store is actually linearizable?
+    <ol><li><em>Answer pointer:</em> Jepsen — inject partitions/clock skew, record a history, check with a linearizability checker (Knossos/Elle).</li></ol></li>
+  <li>How does adding a node reshuffle data, and why virtual nodes?
+    <ol><li><em>Answer pointer:</em> Consistent hashing moves only ~1/N of keys; vnodes spread each physical node across many ring positions for even load and faster rebalancing.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>After CAP/PACELC → databases:</strong> "Which DB is CP vs AP?" Expected angle: etcd/ZK/HBase/Spanner = CP; Cassandra/Dynamo/Riak = AP (tunable); explain the config that shifts it.</li>
+  <li><strong>After consistency models → caching:</strong> "How do you keep cache consistent with the DB?" Angle: TTL vs write-through vs invalidation, thundering herd, and that cache is eventual by nature.</li>
+  <li><strong>After consensus → coordination services:</strong> "When ZooKeeper vs etcd vs Consul?" Angle: all consensus-backed; etcd for k8s/Raft, ZK for older Hadoop/Kafka, Consul for service discovery + health.</li>
+  <li><strong>After 2PC/Saga → messaging:</strong> "Kafka vs RabbitMQ, and exactly-once in Kafka?" Angle: Kafka idempotent producer + transactions give effectively-once within Kafka; still need consumer idempotency for external effects.</li>
+  <li><strong>After idempotency → API design:</strong> "How do you design an idempotent POST?" Angle: client-supplied <code>Idempotency-Key</code> header, server dedup table with stored response + status.</li>
+  <li><strong>After clocks → distributed tracing:</strong> "How do you order events across services with skewed clocks?" Angle: logical/HLC timestamps + trace spans, not wall-clock.</li>
+  <li><strong>After partitioning → hot keys:</strong> "How do you handle a celebrity/hot shard?" Angle: key salting, dedicated replicas, request coalescing, caching.</li>
+  <li><strong>After failure detection → load balancing:</strong> "How does the LB avoid routing to a dead node?" Angle: health checks, outlier detection, EWMA/least-loaded, circuit breaking.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Scenario 1 — Split-brain after a network partition</h3>
+<table>
+  <tr><th>Symptoms</th><td>Two nodes both serving as leader; divergent writes; conflicting reads after heal; duplicate side effects.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td>Check leader-election count spike, <code>etcdctl endpoint status</code> showing two raft leaders across a partition, correlation of divergence timestamps with a network incident (mtr/flow logs).</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Cluster ran without majority-quorum leadership (or with an even node count / no proper term fencing), so each side elected its own leader.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Enforce odd-sized majority quorum; only the majority partition serves writes; add fencing tokens on downstream resources; reconcile divergent data via version vectors.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Use a proven consensus system for leadership; never do custom failover; Jepsen-test partition behavior; monitor election churn.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"Split-brain from a partition without majority quorum. We moved leadership behind Raft so only a majority can elect a leader — any two majorities intersect, so a committed write survives — and added fencing tokens so a stale leader's writes get rejected."</td></tr>
+</table>
+
+<h3>Scenario 2 — Double charges from at-least-once retries</h3>
+<table>
+  <tr><th>Symptoms</th><td>Customers charged twice; payment count &gt; order count; spikes correlate with gateway timeouts.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td>Trace a duplicated <code>traceID</code>: request timed out, client retried, both reached the charge service. Check for missing dedup on the charge handler.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Non-idempotent charge endpoint + automatic retries = exactly-once delivery assumption that doesn't hold.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Client-generated <code>Idempotency-Key</code>; server stores key→result; on replay return the stored result instead of re-charging. Wrap in a dedup table with a unique constraint.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Make all mutating endpoints idempotent by contract; retries only with idempotency keys; add a "duplicate charge" alert.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"Exactly-once delivery is impossible, so retries duplicated charges. We got exactly-once <em>processing</em> with an idempotency key and a dedup store keyed on it, returning the prior result on replay."</td></tr>
+</table>
+
+<h3>Scenario 3 — Lost writes from clock-based LWW</h3>
+<table>
+  <tr><th>Symptoms</th><td>User updates silently disappear; last write doesn't win as expected; issues cluster on one node.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td><code>chronyc tracking</code> shows one node's clock ~2s ahead; that node's older writes have higher timestamps, so newer writes from correct nodes get discarded.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Last-write-wins keyed on wall-clock time + NTP skew → causally-later writes lose to a skewed-clock earlier write.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Switch conflict resolution to HLC / version vectors so causality (not raw wall time) decides; fix the drifting node's NTP.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Never resolve conflicts on physical time alone; monitor clock offset with alerts; prefer CRDTs or app-level merges where possible.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"LWW on wall-clock time plus NTP skew dropped good writes. We moved to hybrid logical clocks so ordering follows causality with a bounded physical component, and alarmed on clock offset."</td></tr>
+</table>
+
+<h3>Scenario 4 — Metastable outage from a retry storm</h3>
+<table>
+  <tr><th>Symptoms</th><td>A 30s DB blip turns into a 40-minute outage; DB pinned at 100% CPU long after the trigger cleared; latency stays maxed.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td>Client RPS to the DB is 5x normal during the outage; each timeout triggers 3 immediate retries with no jitter; connection pool exhausted; work-per-request rose (cache empty).</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Metastable failure: retries create a self-sustaining load loop that keeps the system saturated even after the original cause is gone.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Shed load (return 429), add exponential backoff with full jitter + retry budgets, open circuit breakers, and warm caches before reopening.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Bounded retries/budgets everywhere, jittered backoff, circuit breakers, load shedding, and game-day chaos tests for the amplification loop.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"A metastable failure — retry amplification kept the DB saturated after the blip. We broke the loop with load shedding, jittered backoff, retry budgets, and circuit breakers, then reduced per-retry work by warming caches."</td></tr>
+</table>
+
+<h3>Scenario 5 — Hot shard from a monotonic key</h3>
+<table>
+  <tr><th>Symptoms</th><td>One partition at 100% while others idle; write latency p99 spikes; dropped mutations on that node only.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td><code>nodetool status</code> shows skewed load; partition key is a timestamp/auto-increment, so all recent writes hash to one range/node.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Sequential partition key defeats hashing — the "newest" range is always hot (also happens with celebrity user IDs).</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Re-key with a composite/salted key (prefix a bucket), or hash the key; for celebrity keys add dedicated replicas + request coalescing + caching.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Design keys for even distribution; load-test with realistic skew; monitor per-shard load; use consistent hashing with vnodes.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"A monotonic partition key created a hot shard because every new write landed on the same range. We salted the key to spread writes and added caching/coalescing for celebrity keys, then watched per-shard load."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Explain why "P" in CAP is not optional, and what CP/AP really mean operationally.</summary><p>Partitions are physical reality — packets drop, links fail, GC pauses look like partitions. Since you can't opt out of P, CAP is really a binary choice made <em>during</em> a partition: a CP system (etcd, ZooKeeper, HBase) refuses operations on the minority side to preserve a single consistent view — you get errors/timeouts but never divergence. An AP system (Cassandra, Dynamo) keeps accepting reads/writes on both sides and reconciles afterward (read-repair, anti-entropy, vector clocks) — you stay available but can read stale/conflicting data. Operationally: CP trades availability for correctness; AP trades correctness for availability. The nuance interviewers want: outside a partition neither guarantee must be sacrificed — that's where PACELC's latency-vs-consistency trade governs.</p></details>
+  <details><summary>Derive why a majority quorum guarantees no lost committed writes.</summary><p>Let there be N nodes. A write is committed only when a majority (⌊N/2⌋+1) persists it. A new leader is elected only with votes from a majority. Any two majorities of an N-set must intersect in at least one node (pigeonhole: two sets each &gt;N/2 can't be disjoint). Therefore the electing majority contains at least one node that holds the last committed entry, and Raft's election restriction forces a candidate's log to be at least as up-to-date as that voter's — so a committed entry is never overwritten. This is also why even cluster sizes are wasteful: N=4 tolerates the same 1 failure as N=3 but needs 3 for quorum.</p></details>
+  <details><summary>Why is exactly-once delivery provably impossible, and how do systems still claim it?</summary><p>The two-generals problem: to know a message was delivered you need an ack, but the ack can be lost, and the ack-of-the-ack can be lost, ad infinitum — so no finite protocol guarantees both sides agree over a lossy channel. FLP formalizes that consensus can't be guaranteed in a fully async system with even one crash. So on the wire you pick at-least-once (retry, risk duplicates) or at-most-once (don't retry, risk loss). "Exactly-once" claims (Kafka transactions, Flink) are exactly-once <em>processing/state-update</em>: at-least-once delivery plus deduplication via idempotency keys, sequence numbers (Kafka idempotent producer), and transactional/atomic state commits, so duplicate deliveries don't produce duplicate effects. External side effects (charging a card, sending email) still need consumer-side idempotency.</p></details>
+  <details><summary>Compare Lamport clocks, vector clocks, HLC, and TrueTime — what does each buy and cost?</summary><p>Lamport clocks: single integer, increment on event, take max+1 on receive; give a total order consistent with causality but can't tell you if two events are concurrent or causally related — cheap, O(1). Vector clocks: one counter per node; can decide happened-before vs concurrent (essential for conflict detection in Dynamo) but size grows O(nodes) and needs pruning. HLC (hybrid logical clocks): combines a physical component (close to wall time, useful for humans/TTLs) with a logical counter to preserve causality even under skew — bounded drift from real time, used by CockroachDB. TrueTime: Google's API returning an interval [earliest, latest] with bounded uncertainty ε (few ms, backed by GPS + atomic clocks); Spanner waits out ε (commit-wait) so timestamps respect global real-time order, buying external consistency at the cost of that wait latency and specialized hardware.</p></details>
+  <details><summary>2PC vs Saga: walk through failure modes concretely.</summary><p>2PC: coordinator sends prepare; participants lock resources and vote yes/no; coordinator sends commit/abort. Atomicity is real, but it's <em>blocking</em>: if the coordinator crashes after some participants voted yes, those participants hold locks indefinitely, unsure whether to commit — availability collapses (3PC tries to fix this but adds assumptions and still fails under partition). Saga: model the transaction as a sequence of local transactions each with a compensating action. If step 4 fails, run compensations for steps 3,2,1 (semantic undo — refund, not rollback). No distributed locks, so it's available and scalable, but it's eventually consistent (other readers can see intermediate states) and compensations must be idempotent and commutative-ish. Choreography (events) vs orchestration (a coordinator like Temporal) are the two Saga styles; orchestration is easier to reason about at scale.</p></details>
+  <details><summary>How does a leaderless quorum store repair divergence in the background?</summary><p>Three mechanisms layered: (1) read-repair — on a quorum read, if replicas disagree, the coordinator pushes the newest/merged value back to stale replicas synchronously or async; fixes hot keys naturally. (2) hinted handoff — when a replica is down at write time, another node stores the write with a hint and replays it on recovery, so the write count is still met. (3) anti-entropy with Merkle trees — replicas build a hash tree over their key ranges and exchange top-down; only subtrees whose root hashes differ get drilled into and repaired, so two replicas holding millions of identical keys sync in O(log n) comparisons rather than a full scan. Together they bound the staleness window even for cold keys never read.</p></details>
+  <details><summary>What exactly is a fencing token and why do leases alone fail?</summary><p>A lease (time-bounded lock) fails because the holder can be paused (GC, VM freeze) past the lease expiry without noticing; a new holder is granted the lease, then the old one wakes and writes — two writers. A fencing token is a monotonically increasing number handed out with each lease grant (e.g., from the lock service / Raft index). Every write to the protected resource includes its token; the resource remembers the highest token it has seen and <em>rejects</em> any write with a lower token. So the zombie's stale token is refused at the storage layer — the fix must be enforced by the resource, not by the client trusting its own clock. This is how you make a lock actually safe.</p></details>
+  <details><summary>Why do people say "the network is not reliable" is the first fallacy, and how does it change your code?</summary><p>The 8 fallacies (network reliable, zero latency, infinite bandwidth, secure, stable topology, one admin, zero transport cost, homogeneous) are the assumptions that quietly creep into code and blow up in prod. "Network reliable" changes everything: every remote call needs a timeout (never infinite), a bounded retry with jittered backoff, idempotency so retries are safe, a circuit breaker so a dead dependency doesn't cascade, and a fallback/degraded path. It means you never treat an RPC like a local function call, you design for the "unknown outcome" (timed out — did it apply?), and you make partial failure a first-class state in your data model, not an exception you log and ignore.</p></details>
+  <details><summary>How do you decide sync vs async replication, and what's the data-loss math?</summary><p>Sync replication: the write isn't acked until ≥K replicas persist it — zero data loss up to K-1 simultaneous failures, but every write pays the slowest replica's latency (tail-latency sensitive; cross-region is brutal). Async: leader acks immediately, ships to followers in the background — fast, but a leader crash loses the un-shipped tail (bounded by replication lag). Semi-sync (Kafka <code>acks=all</code> + <code>min.insync.replicas=2</code>) is the pragmatic middle: durable against one broker loss, roughly 2x latency vs <code>acks=1</code>. The decision is your RPO: if RPO=0 you need sync (and accept the latency and the availability hit when a replica is down); if you can tolerate seconds of loss, async with lag monitoring is far cheaper and faster.</p></details>
+  <details><summary>What is linearizability, and why can't you get it "for free" with R+W&gt;N?</summary><p>Linearizability: every operation appears to take effect atomically at some instant between its invocation and response, and once a write is acknowledged all later reads (by real time) see it or a later value — it's the single-object "as if there's one copy" guarantee. R+W&gt;N only guarantees the read and write quorums overlap in one node, but that node might return an <em>in-progress</em> write, concurrent writes create siblings the quorum can't linearize, sloppy quorums (hinted handoff to non-preference nodes) break the overlap, and read-repair races mean a value can appear then disappear across successive reads. Achieving true linearizability needs consensus on every operation (like a Raft log) or read-modify-write with quorum + read-repair blocking — which is why Dynamo-style stores are explicitly eventually consistent, not linearizable.</p></details>
+  <details><summary>How does consistent hashing with virtual nodes actually balance load and speed rebalancing?</summary><p>Plain consistent hashing places each node at one random point on a ring; keys map to the next node clockwise. Problem: with few nodes the arcs are uneven (some nodes own huge ranges) and removing a node dumps its entire range onto a single neighbor. Virtual nodes fix both: each physical node is hashed to many points (100–256), so its ownership is the sum of many small arcs → statistically even load, and when a node dies its many small ranges scatter across many neighbors (not one), spreading the rebalancing load and speeding recovery. Adding a node steals ~1/N of keys total, drawn evenly from everyone. Weighted nodes (heterogeneous hardware) just get more vnodes. This is why Cassandra, DynamoDB, and Riak all use vnodes.</p></details>
+  <details><summary>Explain phi-accrual failure detection and why it beats a fixed timeout.</summary><p>A fixed heartbeat timeout is a binary, brittle choice: too short → false positives during transient slowness (triggers needless failovers/rebalances); too long → slow detection of real failures. Phi-accrual (used by Cassandra, Akka) instead outputs a continuous suspicion value φ derived from the statistical distribution (mean + variance) of recent inter-arrival times. φ = -log10(probability that a heartbeat this late is still "normal"). Apps set a threshold (e.g. φ=8 ≈ 1-in-10^8 chance of false positive) and can even use different thresholds for different actions (low φ to stop routing reads, high φ to trigger expensive rebalancing). It adapts automatically to a link that's normally 5ms vs one that's normally 50ms, giving far fewer false positives without sacrificing detection speed.</p></details>
+  <details><summary>When do CRDTs shine and where do they fall down?</summary><p>CRDTs (Conflict-free Replicated Data Types) are structures whose merge is commutative, associative, and idempotent, so replicas converge to the same value regardless of message order/duplication/delay — no coordination needed. State-based (CvRDT) ship whole state and merge via a join (lattice); op-based (CmRDT) ship operations that must be commutative. Great for: G-counters/PN-counters (likes, view counts), OR-sets (shopping carts, add/remove), LWW-registers, and sequence CRDTs (RGA/Logoot) powering collaborative editors like Figma/Confluence. Where they fall down: they only guarantee convergence, not arbitrary invariants — you can't express "balance must stay ≥0" or "at most 100 seats" because two replicas can independently make valid decisions that violate the global constraint after merge. They also carry metadata overhead (tombstones for removed elements) that must be garbage-collected. Use them for eventual-consistency data where any converged value is acceptable, not for invariants that need consensus.</p></details>
+  <details><summary>Describe how you'd verify a distributed store is actually correct, not just "seems fine".</summary><p>Unit tests can't catch timing/partition bugs, so you use property-based, fault-injecting verification. Jepsen is the standard: it drives concurrent client operations against a real cluster while a "nemesis" injects partitions, clock skew (bumping NTP), process pauses/kills, and packet loss (via <code>iptables</code>/<code>tc netem</code>); it records the full history of invocations/responses and then runs a checker (Knossos for linearizability, Elle for transactional isolation anomalies like G2/write-skew) to find any history that no legal single-copy execution could produce. Complement with chaos engineering in prod (Chaos Monkey/Chaos Mesh) under real traffic, deterministic simulation testing (FoundationDB's approach — run the whole system on a simulated network/clock so failures are reproducible), and continuous invariant checks (reconciliation jobs comparing replicas). The mindset: you can't prove correctness by testing the happy path — you have to actively inject the failures the system claims to survive.</p></details>
+  <details><summary>How does Spanner give globally-consistent transactions, and what's the catch?</summary><p>Spanner combines Paxos (per shard/"split", for replication and leader election), two-phase commit across shards (for multi-shard transactions), and TrueTime for ordering. On commit it picks a timestamp ≥ TrueTime.now().latest, then does <em>commit-wait</em>: it holds locks and waits until TrueTime.now().earliest &gt; that timestamp — i.e., until it's certain the chosen timestamp is in the real past everywhere. This guarantees external (strict-serializable) consistency: if T1 commits before T2 starts in real time, T1's timestamp &lt; T2's. The catch: latency. Commit-wait is proportional to TrueTime uncertainty ε (a few ms, kept small by GPS + atomic clocks in every datacenter), so every read-write transaction pays roughly 2ε plus cross-region Paxos/2PC round-trips. It's a deliberate PACELC PC/EC choice — pay latency to never give up consistency — and it's only feasible because Google built the clock infrastructure to keep ε tiny and bounded.</p></details>
+  <details><summary>What is backpressure and load shedding, and how are they different from just autoscaling?</summary><p>Autoscaling adds capacity over minutes — useless against a sub-second overload spike, and it can't scale a bottleneck like a single DB. Backpressure is flow control: a slow consumer signals upstream to slow down (bounded queues that block/reject when full, TCP-style windows, reactive streams' request(n), gRPC flow control) so producers don't overwhelm consumers and memory doesn't blow up. Load shedding is the last line: when you're already over capacity, deliberately drop or reject the lowest-value work (return 429/503, drop low-priority requests, degrade features) so the system serves <em>some</em> requests well instead of serving <em>all</em> requests badly (or dying). Together they prevent the metastable collapse where unbounded queues + retries turn a spike into an outage. The principle: it's better to reject 10% of traffic fast than to accept 100% and fail everything — and you should shed at the edge, cheaply, before the work consumes scarce resources.</p></details>
+</div>

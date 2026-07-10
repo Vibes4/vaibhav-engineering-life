@@ -1,0 +1,370 @@
+<h1>Infrastructure <span class="tag express">Mastery</span></h1>
+<p>Infrastructure is everything between "here is my compiled artifact" and "a user got a 200 in 40ms": the isolation primitives (namespaces/cgroups), the packaging (OCI images), the delivery (CI/CD), the ingress (reverse proxy/mesh), the secrets, and the observability that tells you it all still works. This page is the Staff-level drill-down.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Modern infra is <em>immutable, declarative and isolated</em>. We package the app once as an OCI image built on overlay layers, run it isolated by Linux namespaces and bounded by cgroups v2, and describe the whole platform as code in Terraform so every environment is reproducible from a state file. CI/CD turns a git SHA into a signed artifact and rolls it out with canary or blue-green so a bad deploy is contained. Ingress is an L7 proxy (Envoy/nginx) doing TLS termination and rate limiting, service-to-service traffic is mTLS through a mesh with retries/timeouts/circuit-breaking, secrets come from Vault/KMS with rotation, and everything emits metrics, logs and traces into Prometheus/Grafana/OpenTelemetry so we can debug from a single trace ID."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>Break it into layers, and for each name the concrete mechanism:</p>
+<ul>
+  <li><strong>Isolation.</strong> A container is <em>not</em> a VM. There is no guest kernel — it's a normal Linux process whose view of the world is trimmed by 7 <strong>namespaces</strong> (pid, net, mnt, uts, ipc, user, cgroup) and whose resource ceiling is enforced by <strong>cgroups v2</strong> (<code>cpu.max</code>, <code>memory.max</code>). A VM virtualises hardware (hypervisor + guest kernel, ~seconds to boot, hundreds of MB); a container shares the host kernel (~tens of ms, tens of MB).</li>
+  <li><strong>Packaging.</strong> The image is a stack of read-only <strong>overlayfs</strong> layers described by an OCI manifest; the running container adds one writable layer via copy-up. Layers are content-addressed by digest, deduplicated in the registry, and pulled by digest for immutability.</li>
+  <li><strong>Provisioning.</strong> <strong>Terraform</strong> keeps a <em>state file</em> mapping declared resources to real cloud IDs, diffs desired-vs-actual on <code>plan</code>, and reconciles on <code>apply</code>. Declarative, so drift is detectable.</li>
+  <li><strong>Delivery.</strong> CI/CD: build → test → produce a versioned artifact → deploy. Rollout strategy (rolling / blue-green / canary) decides blast radius.</li>
+  <li><strong>Runtime networking.</strong> Reverse proxy / API gateway at the edge (TLS, rate limit, auth), <strong>service mesh</strong> (Envoy sidecars) for east-west mTLS, retries, timeouts, circuit breaking and traffic shifting.</li>
+  <li><strong>Secrets &amp; config.</strong> Vault/KMS with short-lived, rotated credentials; secrets mounted as tmpfs files, not baked into images.</li>
+  <li><strong>Observability.</strong> The three pillars — metrics (Prometheus), logs (Loki/ELK), traces (OpenTelemetry → Jaeger/Tempo) — correlated by trace/span IDs.</li>
+</ul>
+
+<h2>Internal Working</h2>
+<p>Trace a single deploy end-to-end and name what each layer actually does:</p>
+<ol>
+  <li><strong>Build.</strong> <code>docker build</code> reads the Dockerfile; each instruction (<code>RUN</code>, <code>COPY</code>) produces a new filesystem layer via the builder's snapshotter. BuildKit computes a content hash per step and reuses cached layers when inputs are unchanged.</li>
+  <li><strong>Image assembly.</strong> Layers are tar+gzip blobs; a <em>config</em> JSON records the rootfs diff-ids and the run config; a <em>manifest</em> lists layer digests. The manifest digest (<code>sha256:...</code>) <em>is</em> the immutable image identity.</li>
+  <li><strong>Push.</strong> Client pushes blobs the registry doesn't already have (deduped by digest) then the manifest. A multi-arch <em>manifest list</em> points to per-platform manifests.</li>
+  <li><strong>Schedule &amp; pull.</strong> Orchestrator picks a node; <strong>containerd</strong> pulls missing layers and unpacks them into the snapshotter, stacking them as read-only overlay <code>lowerdir</code>s with a fresh writable <code>upperdir</code>.</li>
+  <li><strong>Namespace setup.</strong> containerd hands an OCI runtime spec to <strong>runc</strong>, which calls <code>clone()</code>/<code>unshare()</code> with <code>CLONE_NEWPID|NEWNET|NEWNS|NEWUTS|NEWIPC|NEWUSER</code>, sets up the cgroup, applies seccomp/AppArmor/capabilities, <code>pivot_root</code>s into the overlay mount, then <code>execve()</code>s the entrypoint. runc exits; the process is reparented to the containerd-shim.</li>
+  <li><strong>Resource enforcement.</strong> The kernel scheduler honours <code>cpu.max</code> (quota/period throttling) and the memory controller kills the process (OOM) if it exceeds <code>memory.max</code>.</li>
+  <li><strong>Networking.</strong> A CNI plugin creates a veth pair, one end in the container's net namespace, assigns an IP, programs routes; DNS-based service discovery resolves service names to virtual IPs; kube-proxy/IPVS or the mesh load-balances to endpoints.</li>
+  <li><strong>Ingress &amp; mesh.</strong> Edge proxy terminates TLS and routes by host/path; the sidecar intercepts outbound traffic (iptables redirect to Envoy), applies mTLS, timeouts, retries and circuit breakers.</li>
+  <li><strong>Telemetry.</strong> The app/sidecar emits OpenTelemetry spans and Prometheus metrics scraped every 15–30s; logs stream to a collector. A trace ID threads the whole request.</li>
+</ol>
+
+<h2>Why was this built?</h2>
+<p>Before containers and IaC we had <em>pets, not cattle</em>:</p>
+<ul>
+  <li><strong>"Works on my machine."</strong> Apps depended on host-installed libs, JVM/Node versions, OS packages. Deploy = SSH in, run a shell script, pray. Containers bundle the app <em>and</em> its userland into one immutable artifact so dev==staging==prod.</li>
+  <li><strong>Full VMs were heavy.</strong> A VM per service wasted GBs of RAM on duplicate guest kernels and booted in minutes. Containers share the host kernel: tens of ms, tens of MB, 10–100x denser packing.</li>
+  <li><strong>Snowflake servers.</strong> Manually-tuned boxes drifted; no one could rebuild them. IaC (Terraform) made infra reproducible and reviewable in git; immutable infra made "fix in place" obsolete — you rebuild and replace.</li>
+  <li><strong>Manual deploys were risky.</strong> CI/CD automated build/test/deploy so releases became boring, frequent and reversible.</li>
+</ul>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>Option</th><th>What it is</th><th>When it wins</th><th>When it loses</th></tr>
+  <tr><td>Bare metal + config mgmt (Ansible/Chef)</td><td>Mutate long-lived hosts to a desired state</td><td>Ultra-low-latency, hardware-specific, or licensing-bound workloads</td><td>Drift, slow provisioning, no clean rollback</td></tr>
+  <tr><td>Full VMs</td><td>Hardware virtualisation, guest kernel</td><td>Strong isolation / multi-tenant untrusted code / different kernels</td><td>Heavy, slow boot, low density</td></tr>
+  <tr><td>Containers (OCI)</td><td>Kernel-shared process isolation</td><td>Microservices, fast scaling, dense packing, CI/CD</td><td>Shared-kernel blast radius; not for hostile multi-tenancy alone</td></tr>
+  <tr><td>MicroVMs (Firecracker/Kata)</td><td>Tiny VM per container</td><td>Untrusted multi-tenant (serverless, Lambda) with container ergonomics</td><td>Slightly higher overhead than raw containers</td></tr>
+  <tr><td>Serverless (FaaS)</td><td>Vendor runs the runtime</td><td>Spiky/event-driven, low ops appetite</td><td>Cold starts, vendor lock-in, 15-min limits, hard to debug</td></tr>
+  <tr><td>PaaS (Heroku/App Engine)</td><td>Push code, platform runs it</td><td>Small teams, speed over control</td><td>Cost at scale, limited knobs</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "Containers for trusted first-party microservices; microVMs (Firecracker) when I run untrusted tenant code but want container speed; full VMs only when I need a different kernel or hard isolation."</div>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Reproducibility.</strong> Same image digest runs identically everywhere; IaC rebuilds the whole platform.</li>
+  <li><strong>Density &amp; cost.</strong> Bin-pack many containers per node; cgroups give fair sharing.</li>
+  <li><strong>Fast, safe rollout.</strong> Immutable artifacts + canary/blue-green = instant rollback (repoint traffic, no rebuild).</li>
+  <li><strong>Isolation with low overhead.</strong> Namespaces + cgroups without a hypervisor tax.</li>
+  <li><strong>Auditability.</strong> Every change is a git commit / signed artifact; drift is detectable.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>Shared-kernel blast radius.</strong> A kernel CVE (e.g. Dirty Pipe) can escape all containers on a host.</li>
+  <li><strong>Operational complexity.</strong> Registry, orchestrator, mesh, IaC, secrets, observability — a lot of moving parts and YAML.</li>
+  <li><strong>State is awkward.</strong> Terraform state files and container-based stateful workloads need care (locking, volumes).</li>
+  <li><strong>Cgroup pitfalls.</strong> CPU-throttling and OOM-kills surprise teams that mis-size limits.</li>
+  <li><strong>Supply-chain surface.</strong> Base images and transitive deps pull in CVEs you didn't write.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><strong>Isolation vs density.</strong> Stronger isolation (VMs/microVMs) costs RAM and boot time; containers trade some isolation for packing efficiency.</li>
+  <li><strong>Immutability vs iteration speed.</strong> Rebuild-and-replace is safe but slower than hot-patching; you gain reproducibility, lose in-place hotfixes.</li>
+  <li><strong>Declarative (Terraform) vs imperative (scripts).</strong> Declarative gives drift detection and idempotency but a steeper mental model and state-file management.</li>
+  <li><strong>Canary vs blue-green.</strong> Canary limits blast radius but needs good metrics and takes longer; blue-green flips instantly but doubles resource cost during cutover.</li>
+  <li><strong>Sidecar mesh vs library.</strong> Sidecars give language-agnostic mTLS/retries but add ~1ms/hop latency and per-pod memory; in-process libraries are faster but couple every service to a language SDK.</li>
+  <li><strong>Env-var secrets vs mounted secrets.</strong> Env vars leak into <code>/proc</code>, crash dumps and child processes; mounted tmpfs files are safer but need rotation-aware apps.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't reach for the full container/mesh/IaC stack when:
+<ul>
+  <li><strong>A single monolith on one box</strong> serves your traffic fine — a mesh and multi-cluster IaC is pure overhead.</li>
+  <li><strong>Hard multi-tenant isolation of untrusted code</strong> is the requirement and you only have plain containers — use microVMs or VMs.</li>
+  <li><strong>Ultra-low-latency / kernel-bypass</strong> workloads (HFT, DPDK) where hypervisor/namespace overhead or noisy neighbours are unacceptable — bare metal.</li>
+  <li><strong>Heavy stateful DBs</strong> with strict IO SLAs — often better on dedicated nodes/managed services than co-scheduled containers.</li>
+  <li><strong>A tiny team early on</strong> — a PaaS gets you to market faster than building a platform.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical multi-AZ, mesh-enabled deployment: edge L7 proxy terminates TLS and rate-limits, routes into a Kubernetes cluster where each pod runs an app container plus an Envoy sidecar; sidecars form the data plane governed by a control plane; secrets come from Vault; images from a private registry; everything emits telemetry.</p>
+<pre class="mermaid">
+flowchart TD
+  U["Users"] --> DNS["DNS GeoLB"]
+  DNS --> EDGE["Edge proxy Envoy TLS termination rate limit"]
+  EDGE --> ING["Ingress gateway"]
+  ING --> SVCA["Service A pod app plus sidecar"]
+  SVCA -->|mTLS| SVCB["Service B pod app plus sidecar"]
+  SVCB --> DB["Managed database"]
+  VAULT["Vault secrets"] -.-> SVCA
+  VAULT -.-> SVCB
+  REG["OCI registry"] -.-> SVCA
+  SVCA -.-> OTEL["OTel collector metrics logs traces"]
+  SVCB -.-> OTEL
+  OTEL --> OBS["Prometheus Grafana Jaeger"]
+</pre>
+<p>Key points: TLS terminates at the edge but re-encrypts inside via mesh mTLS (zero-trust); the registry and Vault are dependencies of pod startup; the OTel collector is the single telemetry funnel so you can trace a request across every hop.</p>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>CPU throttling from tight <code>cpu.max</code>.</strong> A service with a low CPU limit gets throttled during bursts; p99 latency spikes even though average CPU looks fine. Check <code>cpu.stat</code> <code>nr_throttled</code>/<code>throttled_usec</code>.</li>
+  <li><strong>OOMKilled (exit 137).</strong> RSS exceeds <code>memory.max</code>; kernel kills the largest process. JVM/Node heaps that ignore cgroup limits are the classic cause.</li>
+  <li><strong>Terraform state lock stuck.</strong> A killed <code>apply</code> leaves a DynamoDB/GCS lock; the next run blocks. Needs <code>force-unlock</code>.</li>
+  <li><strong>Image pull backoff.</strong> Registry auth expiry, rate limits (Docker Hub 100–200 pulls/6h), or missing arch in the manifest list.</li>
+  <li><strong>Retry storms / metastable failure.</strong> Mesh retries amplify load during a partial outage; a slow dependency gets 3x traffic and never recovers without a circuit breaker.</li>
+  <li><strong>Secret rotation breakage.</strong> App caches a Vault lease that expires; DB rejects the stale credential mid-flight.</li>
+  <li><strong>DNS TTL / stale endpoints.</strong> Service discovery caches a dead pod IP; requests hang until the timeout.</li>
+  <li><strong>Cardinality explosion in Prometheus.</strong> A label with user IDs blows up series count and OOMs the TSDB.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Which cgroup limits and throttling is a container hitting?
+cat /sys/fs/cgroup/cpu.max              # quota period
+cat /sys/fs/cgroup/cpu.stat             # nr_throttled throttled_usec
+cat /sys/fs/cgroup/memory.max
+cat /sys/fs/cgroup/memory.events        # oom oom_kill counts
+
+# Inspect namespaces of a process
+ls -l /proc/&lt;pid&gt;/ns                     # net mnt pid uts ipc user cgroup
+
+# Container runtime level (bypass kubectl)
+crictl ps ; crictl inspect &lt;id&gt;
+ctr -n k8s.io images ls
+runc list ; runc state &lt;id&gt;
+
+# Image layers and history
+docker history --no-trunc &lt;image&gt;
+docker inspect &lt;image&gt; | jq '.[0].RootFS.Layers'
+
+# Kubernetes triage
+kubectl describe pod &lt;p&gt;                 # Events OOMKilled ImagePullBackOff
+kubectl get pod &lt;p&gt; -o jsonpath='{.status.containerStatuses[0].lastState}'
+kubectl logs &lt;p&gt; --previous             # crash-loop previous container
+
+# Terraform drift and locks
+terraform plan -detailed-exitcode        # exit 2 == drift
+terraform force-unlock &lt;LOCK_ID&gt;
+terraform state list ; terraform state show &lt;addr&gt;
+
+# Mesh / connectivity
+istioctl proxy-config cluster &lt;pod&gt;
+istioctl proxy-config endpoint &lt;pod&gt;     # are endpoints healthy?
+openssl s_client -connect host:443 -servername host   # TLS chain
+
+# Trace a request end-to-end
+# grep the trace-id across services -> open in Jaeger/Tempo</code></pre>
+<div class="callout tip"><strong>Say this:</strong> "First question on any container weirdness: is it throttled or OOM-killed? <code>cpu.stat</code> and <code>memory.events</code> answer it in seconds before I even look at app logs."</div>
+
+<h2>Monitoring</h2>
+<table>
+  <tr><th>Metric</th><th>Meaning</th><th>Healthy / alert threshold</th></tr>
+  <tr><td><code>container_cpu_cfs_throttled_periods / periods</code></td><td>Fraction of scheduling periods throttled</td><td>&lt;1% ok; &gt;25% = raise CPU limit</td></tr>
+  <tr><td><code>container_memory_working_set_bytes / limit</code></td><td>Live memory vs cgroup ceiling</td><td>&lt;80% ok; &gt;90% = OOM risk</td></tr>
+  <tr><td>OOMKill count</td><td>Kernel killed a container</td><td>Any = page</td></tr>
+  <tr><td>Pod restart rate</td><td>Crash-looping</td><td>&gt;0 sustained = alert</td></tr>
+  <tr><td>Request rate / error rate / duration (RED)</td><td>Golden signals per service</td><td>Error &gt;1%, p99 &gt; SLO = alert</td></tr>
+  <tr><td>USE (Utilisation, Saturation, Errors)</td><td>Per-resource health</td><td>Saturation queue &gt;0 sustained</td></tr>
+  <tr><td>Mesh 5xx / retry rate</td><td>East-west failures</td><td>Retry surge = brewing outage</td></tr>
+  <tr><td>Certificate expiry days</td><td>TLS/mTLS certs</td><td>&lt;14 days = alert</td></tr>
+  <tr><td>Prometheus active series</td><td>Cardinality</td><td>Sudden jump = label explosion</td></tr>
+  <tr><td>Deploy → error-budget burn rate</td><td>SLO burn after release</td><td>&gt;2x = auto-rollback trigger</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<ul>
+  <li><strong>Vertical (up).</strong> Bigger nodes / higher cgroup limits; VPA right-sizes requests. Hits a per-node ceiling.</li>
+  <li><strong>Horizontal (out).</strong> HPA scales replicas on CPU/custom metrics; Cluster Autoscaler / Karpenter adds nodes. Stateless services scale linearly.</li>
+  <li><strong>Sharding/partitioning.</strong> Stateful tiers shard by key; cells/bulkheads isolate blast radius so one shard's failure doesn't sink the fleet.</li>
+  <li><strong>Registry &amp; build scale.</strong> Layer caching + distributed build cache keeps CI fast; regional registry mirrors avoid pull bottlenecks.</li>
+  <li><strong>Control-plane limits.</strong> A single Kubernetes cluster tops out around ~5,000 nodes / 150k pods — beyond that, multi-cluster + federation.</li>
+</ul>
+<pre class="mermaid">
+flowchart LR
+  M["Metrics CPU or RPS"] --> HPA["HPA scales replicas"]
+  HPA --> PODS["Pod replicas 3 to N"]
+  PODS --> CA["Cluster autoscaler"]
+  CA --> NODES["Nodes across AZs"]
+  NODES --> BINPACK["Bin packed by requests"]
+</pre>
+<div class="callout warn"><strong>Watch out:</strong> Set CPU <em>requests</em> for scheduling but be careful with CPU <em>limits</em> — aggressive limits cause CFS throttling that HPA can't fix because average CPU stays low while p99 explodes.</div>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>AuthN/Z between services:</strong> mesh mTLS with SPIFFE identities; authorization policies scoped per service (zero-trust — no implicit trust from network location).</li>
+  <li><strong>Edge auth:</strong> gateway validates JWT/OIDC, enforces rate limits and WAF rules before traffic reaches services.</li>
+  <li><strong>Encryption in transit:</strong> TLS 1.3 at edge, mTLS inside; encryption at rest via KMS-managed keys / envelope encryption on volumes and object storage.</li>
+  <li><strong>Secrets:</strong> Vault dynamic secrets (short TTL, auto-rotated); mount as tmpfs, never bake into images or logs; use IAM roles / workload identity instead of static keys.</li>
+  <li><strong>Container hardening:</strong> run as non-root, read-only rootfs, drop Linux capabilities, seccomp + AppArmor/SELinux profiles, no privileged mode, user namespaces to remap root.</li>
+  <li><strong>Supply chain:</strong> scan images (Trivy/Grype), pin by digest, sign with cosign / verify SLSA provenance, use an SBOM, minimal/distroless base images.</li>
+  <li><strong>Network isolation:</strong> NetworkPolicies / security groups default-deny; private subnets; no public IPs on workloads.</li>
+</ul>
+<div class="callout warn"><strong>Watch out:</strong> A shared-kernel container escape (privileged pod + kernel CVE, or a mounted docker socket) compromises the whole node. Never mount <code>/var/run/docker.sock</code> into an untrusted container.</div>
+
+<h2>Performance</h2>
+<table>
+  <tr><th>Container cold start (image cached)</th><td>~10–100 ms (namespace + cgroup + exec)</td></tr>
+  <tr><td>VM boot</td><td>seconds to minutes</td></tr>
+  <tr><td>Firecracker microVM boot</td><td>~125 ms</td></tr>
+  <tr><td>Image pull (cold, per 100MB layer)</td><td>hundreds of ms–seconds, network-bound</td></tr>
+  <tr><td>Envoy sidecar hop overhead</td><td>~0.3–1 ms + a few MB RSS per pod</td></tr>
+  <tr><td>mTLS handshake</td><td>~1–2 ms extra on connection setup (amortised by keep-alive)</td></tr>
+  <tr><td>Prometheus scrape interval</td><td>15–30 s default</td></tr>
+</table>
+<p><strong>Tuning levers:</strong> multi-stage builds + distroless to shrink images (faster pulls); order Dockerfile layers cheap→volatile for cache hits; pre-pull/warm images on nodes; keep-alive + connection pooling to amortise mTLS; set CPU <em>requests</em> not tight limits to avoid throttling; use eStargz/lazy pulling for huge images; tune GC/heap to respect cgroup memory (<code>-XX:MaxRAMPercentage</code>, Node <code>--max-old-space-size</code>).</p>
+<div class="callout tip"><strong>Say this:</strong> "The single biggest infra latency win I've shipped: shrinking a 1.2GB image to 90MB distroless cut cold-scale time from ~40s to ~4s because layer pull dominated."</div>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Latest tag in prod.</strong> <code>image:latest</code> is mutable → non-reproducible deploys. Fix: pin by digest.</li>
+  <li><strong>Tight CPU limits.</strong> Causes CFS throttling. Fix: set requests, drop or loosen limits.</li>
+  <li><strong>JVM/Node ignoring cgroup memory.</strong> Heap grows past <code>memory.max</code> → OOMKill. Fix: container-aware flags.</li>
+  <li><strong>Secrets in env vars / images.</strong> Leak into logs and layers (they persist in layer history even if deleted!). Fix: mounted secrets / Vault.</li>
+  <li><strong>No circuit breaker with retries.</strong> Retry storms. Fix: budgeted retries + breaker + timeouts.</li>
+  <li><strong>Committing Terraform state to git.</strong> Contains secrets and causes conflicts. Fix: remote backend with locking (S3+DynamoDB/GCS).</li>
+  <li><strong>Running as root.</strong> Fix: non-root user, drop caps, read-only rootfs.</li>
+  <li><strong>High-cardinality metric labels.</strong> Kills Prometheus. Fix: bounded label values, use exemplars/traces for per-request detail.</li>
+  <li><strong>No health/readiness probes.</strong> Traffic hits a pod before it's ready. Fix: separate liveness vs readiness probes.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+  <tr><th>Company</th><th>How they plausibly use this</th></tr>
+  <tr><td>Google</td><td>Borg → Kubernetes lineage; everything in containers on Borg, gVisor for sandboxed multi-tenant isolation, Blaze/Bazel for hermetic builds, global Maglev/Envoy L7 load balancing. Kubernetes and Envoy are Google-originated.</td></tr>
+  <tr><td>Amazon</td><td>Firecracker microVMs power Lambda and Fargate (strong isolation at container speed); ECS/EKS, ECR registry, CloudFormation/CDK as IaC, KMS for envelope encryption, App Mesh (Envoy).</td></tr>
+  <tr><td>Netflix</td><td>Immutable "golden AMIs" baked by Adrian's Aminator/Spinnaker; Spinnaker pipelines with red/black (blue-green) deploys; Titus container platform; Eureka service discovery; Atlas metrics; chaos engineering to validate resilience.</td></tr>
+  <tr><td>Uber</td><td>Massive microservice fleet on containers; likely mesh-based mTLS and traffic shifting; heavy investment in observability (M3 time-series DB, Jaeger — Uber open-sourced Jaeger) for tracing across thousands of services.</td></tr>
+  <tr><td>Swiggy</td><td>Likely AWS EKS-based microservices for order/delivery/logistics; blue-green or canary for the ordering path during peak dinner surges; feature flags + autoscaling for demand spikes; Prometheus/Grafana observability.</td></tr>
+  <tr><td>PhonePe</td><td>Runs its own data centers at UPI scale; containerised microservices with strict isolation and encryption for payments (PCI/RBI compliance); likely cell-based architecture to bound blast radius across billions of transactions.</td></tr>
+  <tr><td>Razorpay</td><td>Payments platform on Kubernetes (public case studies); canary deploys for the payment gateway, Vault for secrets, strong at-rest/in-transit encryption for PCI-DSS, service mesh for internal mTLS.</td></tr>
+  <tr><td>Atlassian</td><td>Migrated to AWS with a "Micros" internal PaaS on ECS/containers; Terraform-style IaC, per-tenant isolation for Jira/Confluence Cloud, blue-green deploys, centralised observability across thousands of services.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>What exactly makes a container different from a VM?
+    <ol><li><em>Answer pointer:</em> shared host kernel + namespaces/cgroups vs hypervisor + guest kernel; boot time and density differences.</li></ol></li>
+  <li>Name the Linux namespaces and what each isolates.
+    <ol><li><em>Answer pointer:</em> pid, net, mnt, uts, ipc, user, cgroup — process view, network stack, mounts, hostname, IPC, UID mapping, cgroup view.</li></ol></li>
+  <li>How does cgroups v2 enforce a CPU limit, and what's the failure symptom?
+    <ol><li><em>Answer pointer:</em> CFS quota/period in <code>cpu.max</code>; symptom is throttling (<code>nr_throttled</code>) and p99 latency spikes.</li></ol></li>
+  <li>What happens on an OOM kill and how do you diagnose it?
+    <ol><li><em>Answer pointer:</em> memory controller kills the process, exit 137; check <code>memory.events</code> and <code>kubectl describe</code>.</li></ol></li>
+  <li>How does an overlay filesystem give you copy-on-write?
+    <ol><li><em>Answer pointer:</em> read-only lowerdirs + writable upperdir; copy-up on first write to a file.</li></ol></li>
+  <li>Walk me through what runc does when starting a container.
+    <ol><li><em>Answer pointer:</em> clone/unshare namespaces, set cgroup, apply seccomp/caps, pivot_root, execve; shim reparents.</li></ol></li>
+  <li>Why pull images by digest instead of tag?
+    <ol><li><em>Answer pointer:</em> tags are mutable; digest is content-addressed and immutable → reproducibility + tamper detection.</li></ol></li>
+  <li>What's in a Terraform state file and why is it dangerous?
+    <ol><li><em>Answer pointer:</em> resource→cloud-ID mapping, sometimes secrets; needs remote backend + locking, never in git.</li></ol></li>
+  <li>How does Terraform detect drift?
+    <ol><li><em>Answer pointer:</em> refresh real state, diff against desired; <code>plan -detailed-exitcode</code> returns 2.</li></ol></li>
+  <li>Canary vs blue-green vs rolling — when each?
+    <ol><li><em>Answer pointer:</em> canary = smallest blast radius, needs metrics; blue-green = instant flip, 2x cost; rolling = default, gradual.</li></ol></li>
+  <li>How does the mesh prevent a retry storm from taking you down?
+    <ol><li><em>Answer pointer:</em> retry budgets, per-try timeouts, circuit breakers (outlier detection ejects bad hosts).</li></ol></li>
+  <li>Env-var vs mounted secrets — which and why?
+    <ol><li><em>Answer pointer:</em> mounted tmpfs; env vars leak via /proc, dumps, child procs; enables rotation.</li></ol></li>
+  <li>How do dynamic secrets and rotation work without downtime?
+    <ol><li><em>Answer pointer:</em> Vault leases with TTL, app renews/re-reads; overlap old+new during rotation window.</li></ol></li>
+  <li>How does mTLS establish service identity?
+    <ol><li><em>Answer pointer:</em> SPIFFE SVIDs, cert issued per workload by mesh CA, mutual verification.</li></ol></li>
+  <li>You deployed and error rate rose but only for 5% of traffic — what happened and what do you do?
+    <ol><li><em>Answer pointer:</em> canary caught it; halt rollout, auto-rollback on error-budget burn, inspect trace.</li></ol></li>
+  <li>Prometheus is OOMing after a deploy — root cause?
+    <ol><li><em>Answer pointer:</em> label cardinality explosion (unbounded label like user ID); drop the label.</li></ol></li>
+  <li>How would you contain a kernel CVE that allows container escape?
+    <ol><li><em>Answer pointer:</em> gVisor/Kata sandbox, patch nodes, seccomp, non-privileged, drain affected nodes.</li></ol></li>
+  <li>How do you scale beyond a single Kubernetes cluster?
+    <ol><li><em>Answer pointer:</em> multi-cluster + federation / cell architecture; ~5k node ceiling per cluster.</li></ol></li>
+  <li>How do you make your build supply chain tamper-proof?
+    <ol><li><em>Answer pointer:</em> hermetic builds, SBOM, cosign signatures, SLSA provenance, digest pinning, scanning.</li></ol></li>
+  <li>Trace a request from user to DB naming every infra hop.
+    <ol><li><em>Answer pointer:</em> DNS → edge proxy (TLS) → ingress → sidecar (mTLS) → app → sidecar → DB, with trace ID throughout.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>After containers → orchestration:</strong> "How does Kubernetes schedule and self-heal?" Angle: requests/limits bin-packing, controllers reconciling desired state, probes.</li>
+  <li><strong>After IaC → state &amp; GitOps:</strong> "How do you manage multi-env Terraform / why ArgoCD?" Angle: workspaces/modules, remote state, pull-based GitOps reconciliation.</li>
+  <li><strong>After CI/CD → progressive delivery:</strong> "How do you automate rollback?" Angle: SLO burn-rate alerts, Argo Rollouts/Flagger analysis, feature flags.</li>
+  <li><strong>After mesh → networking:</strong> "How does service discovery + load balancing actually resolve?" Angle: DNS/EDS, endpoint health, locality-aware LB.</li>
+  <li><strong>After secrets → identity:</strong> "How does workload identity replace static keys?" Angle: IRSA/workload identity federation, SPIFFE, short-lived tokens.</li>
+  <li><strong>After observability → SRE:</strong> "SLI/SLO/error budgets and alerting philosophy?" Angle: symptom-based alerts, RED/USE, burn-rate multi-window.</li>
+  <li><strong>After images → supply chain security:</strong> "How do you trust a third-party base image?" Angle: scanning, signing, SBOM, provenance.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Scenario 1 — Latency spikes with low average CPU</h3>
+<table>
+  <tr><th>Symptoms</th><td>p99 latency 5x normal, dashboards show CPU at ~40%, no errors.</td></tr>
+  <tr><th>Investigation</th><td>Checked <code>cpu.stat</code>: <code>nr_throttled</code> climbing, <code>throttled_usec</code> high. HPA not scaling because average CPU is low.</td></tr>
+  <tr><th>Root Cause</th><td>Tight <code>cpu.max</code> limit; bursty workload hits the CFS quota each 100ms period and gets parked until next period.</td></tr>
+  <tr><th>Solution</th><td>Raised/removed the CPU limit (kept requests), latency normalised immediately.</td></tr>
+  <tr><th>Prevention</th><td>Alert on throttled ratio &gt;25%; avoid CPU limits for latency-sensitive services; load test with bursty traffic.</td></tr>
+  <tr><th>Interview Answer</th><td>"Average CPU lies for bursty apps — the kernel throttles you inside each 100ms period. I read <code>cpu.stat</code>, saw throttling, dropped the limit, and p99 recovered. Now we alert on throttled ratio, not just utilisation."</td></tr>
+</table>
+
+<h3>Scenario 2 — Retry storm turns a blip into an outage</h3>
+<table>
+  <tr><th>Symptoms</th><td>One slow downstream dependency; suddenly the whole call graph browns out and doesn't recover even after the dependency heals.</td></tr>
+  <tr><th>Investigation</th><td>Mesh dashboards show request rate to the dependency at 3x normal; traces show each hop retrying 3 times with no budget.</td></tr>
+  <tr><th>Root Cause</th><td>Layered retries multiplied load (metastable failure); no circuit breaker, so the dependency stayed saturated.</td></tr>
+  <tr><th>Solution</th><td>Added retry budget (cap at 10% extra), per-try timeouts, and outlier-detection circuit breaking to eject slow hosts; shed load to break the loop.</td></tr>
+  <tr><th>Prevention</th><td>Retries only at one layer, always budgeted; breakers everywhere; chaos-test dependency slowdowns.</td></tr>
+  <tr><th>Interview Answer</th><td>"Classic metastable failure: retries amplified a transient slowdown into a self-sustaining overload. Fix is a retry budget plus circuit breaking so the system sheds load and recovers instead of hammering a dying dependency."</td></tr>
+</table>
+
+<h3>Scenario 3 — CrashLoopBackOff after a deploy (exit 137)</h3>
+<table>
+  <tr><th>Symptoms</th><td>New version crash-loops; <code>kubectl describe</code> shows OOMKilled, exit 137.</td></tr>
+  <tr><th>Investigation</th><td>New release bumped a dependency that increased heap; JVM defaulted to 1/4 host RAM ignoring the cgroup <code>memory.max</code>.</td></tr>
+  <tr><th>Root Cause</th><td>Runtime not container-aware; RSS exceeded the cgroup limit → kernel OOM.</td></tr>
+  <tr><th>Solution</th><td>Set <code>-XX:MaxRAMPercentage=75</code> (or Node <code>--max-old-space-size</code>), right-sized <code>memory.max</code>; rolled forward.</td></tr>
+  <tr><th>Prevention</th><td>Load-test memory before release; alert on working-set/limit &gt;90%; container-aware runtime flags as a baseline.</td></tr>
+  <tr><th>Interview Answer</th><td>"Exit 137 is the kernel OOM killer. The JVM wasn't cgroup-aware and sized its heap to the host, not the limit. I set MaxRAMPercentage and right-sized the limit. Prevention is memory load-testing plus a working-set alert."</td></tr>
+</table>
+
+<h3>Scenario 4 — Terraform apply blocks on a stale state lock</h3>
+<table>
+  <tr><th>Symptoms</th><td>CI deploy hangs: "Error acquiring the state lock."</td></tr>
+  <tr><th>Investigation</th><td>Previous pipeline run was killed mid-apply; the DynamoDB lock record was never released. Confirmed the holder was dead.</td></tr>
+  <tr><th>Root Cause</th><td>Interrupted apply left a dangling lock; no other apply could proceed.</td></tr>
+  <tr><th>Solution</th><td>Verified no apply was actually running, then <code>terraform force-unlock &lt;ID&gt;</code>; re-ran plan to confirm no partial state corruption.</td></tr>
+  <tr><th>Prevention</th><td>Serialise applies in CI, add apply timeouts + cleanup traps, use remote backend with lock TTLs, never <code>-lock=false</code>.</td></tr>
+  <tr><th>Interview Answer</th><td>"State locking prevents concurrent applies corrupting state; the flip side is a dead run leaves a stale lock. I confirm nothing is actually running, force-unlock, then re-plan to check state integrity before applying."</td></tr>
+</table>
+
+<h3>Scenario 5 — Secret rotation causes mid-day auth failures</h3>
+<table>
+  <tr><th>Symptoms</th><td>DB "authentication failed" errors spike hours after a healthy deploy, no code change.</td></tr>
+  <tr><th>Investigation</th><td>Vault dynamic DB credential lease expired; app had cached the credential at startup and never renewed.</td></tr>
+  <tr><th>Root Cause</th><td>App not lease-aware; stale credential rejected when Vault rotated the underlying DB user.</td></tr>
+  <tr><th>Solution</th><td>Made the client renew leases / re-read the mounted secret on rotation; added overlap window so old and new creds are both valid during cutover.</td></tr>
+  <tr><th>Prevention</th><td>Rotation drills in staging; alert on lease TTL &lt; threshold; treat secrets as dynamic, not startup-only.</td></tr>
+  <tr><th>Interview Answer</th><td>"Dynamic secrets have TTLs — if the app caches a credential at boot it dies at rotation. The fix is lease-aware clients that re-read on rotation plus an overlap window, and I rehearse rotation in staging so prod rotation is a non-event."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Explain precisely how a container achieves isolation at the syscall level.</summary><p>At start, the runtime (runc) calls <code>clone()</code>/<code>unshare()</code> with the namespace flags (<code>CLONE_NEWPID</code>, <code>NEWNET</code>, <code>NEWNS</code>, <code>NEWUTS</code>, <code>NEWIPC</code>, <code>NEWUSER</code>, plus cgroup ns). Each namespace gives the process a private view of one kernel subsystem: its own PID 1, its own network stack/interfaces, its own mount tree, hostname, System V IPC, and UID/GID mapping. It writes the process into a cgroup (v2 unified hierarchy) that caps CPU (<code>cpu.max</code> quota/period), memory (<code>memory.max</code>), IO and pids. It applies a seccomp filter (blocking ~44 dangerous syscalls by default), drops Linux capabilities, sets an AppArmor/SELinux profile, then <code>pivot_root</code>s into the overlay rootfs and <code>execve</code>s the entrypoint. Crucially there's still exactly one kernel — isolation is a policy the shared kernel enforces, which is why a kernel bug can break out.</p></details>
+  <details><summary>Why is copy-on-write via overlayfs both a feature and a footgun?</summary><p>Feature: image layers are read-only and shared across every container that uses them, so N containers from one image cost one copy of the base plus tiny per-container writable upperdirs — huge density and fast start. Footgun: the first write to any file triggers a full <em>copy-up</em> of that file into the upperdir, so rewriting a large file or heavy random writes to the container FS are surprisingly slow and consume space; also anything written to the container layer is ephemeral and lost on restart. The fix is to put mutable/hot data on a proper volume, not the overlay, and to keep images layered so cheap stable layers cache and only volatile layers rebuild.</p></details>
+  <details><summary>Declarative vs imperative IaC — argue the trade-off with Terraform specifics.</summary><p>Imperative (shell/Ansible playbooks in order) tells the machine <em>how</em>: run these steps. It's intuitive but non-idempotent and drift-blind — you can't ask "what would change?" Declarative (Terraform) states desired end-state; the engine builds a dependency graph, diffs desired vs the state file's record of reality, and computes the minimal set of create/update/destroy ops. Benefits: idempotency, <code>plan</code> as a dry-run/diff, drift detection, and a reviewable graph. Costs: you manage a state file (locking, secrets, backend), the diff engine can surprise you (a change forces resource replacement), and ordering/dependency bugs are subtler. For infra you want declarative; for one-off procedural glue, imperative is fine.</p></details>
+  <details><summary>Walk through a full CI/CD pipeline and where caching and safety live.</summary><p>Trigger on git push → checkout at SHA → restore dependency cache (keyed by lockfile hash) → build (BuildKit with layer + remote build cache) → unit/integration tests (fail fast) → static analysis + image vuln scan (Trivy) → produce a versioned, signed artifact (cosign) pushed to the registry keyed by SHA/digest → deploy to staging → smoke tests → progressive rollout to prod (canary: shift 5%→25%→100% gated by SLO analysis, or blue-green: deploy green, flip traffic, keep blue for rollback). Safety lives in: immutable digest-pinned artifacts (no rebuild between envs), automated gates (tests, scans, SLO burn), and instant rollback (repoint traffic / redeploy previous digest). Caching lives in dependency cache, Docker layer cache, and a shared remote build cache to keep builds under a couple of minutes.</p></details>
+  <details><summary>Canary vs blue-green vs rolling — give the decision criteria with numbers.</summary><p>Rolling (default): replace pods in batches (e.g. maxSurge 25%, maxUnavailable 0); gradual, no extra full fleet, but both versions serve simultaneously and rollback is another rolling wave. Blue-green: stand up a full parallel "green" fleet, run smoke tests, flip the load balancer atomically; rollback is instant (flip back) but you pay ~2x resources during cutover and DB migrations must be backward-compatible. Canary: route a small % (start 1–5%) to the new version, watch RED metrics/error budget, then ramp; smallest blast radius and catches real-traffic bugs, but slowest and needs solid metrics + automated analysis (Flagger/Argo Rollouts). Rule: canary for high-risk user-facing paths with good telemetry; blue-green when you need instant rollback and can afford 2x; rolling for routine low-risk internal services.</p></details>
+  <details><summary>How does a service mesh implement circuit breaking, and why does it prevent metastable failure?</summary><p>The Envoy sidecar tracks per-upstream-host health via <em>outlier detection</em>: consecutive 5xx or gateway failures beyond a threshold eject the host from the load-balancing pool for a base ejection time (backing off on repeated ejection). Combined with connection/pending-request limits (the actual "circuit breaker" thresholds) and per-try timeouts + a retry <em>budget</em> (cap retries at e.g. 20% of requests), it stops the amplification loop: without it, a slow dependency triggers retries that multiply its load 2–3x, keeping it saturated forever even after the trigger clears (metastable failure). The breaker sheds/fails fast so the dependency drains its queue and recovers, and the budget ensures retries can't dominate traffic.</p></details>
+  <details><summary>Env-var vs mounted secrets — why do senior engineers insist on mounts?</summary><p>Env vars are readable via <code>/proc/&lt;pid&gt;/environ</code>, inherited by every child process, dumped into crash reports/core dumps and often accidentally logged (many frameworks log the environment on boot). They're also fixed at process start, so rotation requires a restart. Mounted secrets are tmpfs-backed files (never on disk), scoped to the container, not inherited by unrelated child processes, and can be updated in place — a rotation-aware app re-reads the file without a restart. With Vault Agent / CSI driver the secret is fetched with the pod's identity at runtime, so it isn't in the image, the manifest, or the registry. The env-var convenience isn't worth the leak surface for anything sensitive.</p></details>
+  <details><summary>Design secret rotation with zero downtime.</summary><p>Use dynamic secrets with a TTL and a rotation with overlap. For a DB credential: Vault's database secrets engine issues a short-lived user per app instance; the app renews the lease before expiry and re-reads on renewal failure. For a rotated shared secret (API key), rotate in two phases: (1) create the new secret and make both old and new valid on the server side (grace window ≥ your longest cache/lease TTL), (2) roll the new value to clients (mounted file update or rolling restart), (3) revoke the old only after all clients confirm the new. Alert on lease TTL nearing zero, and rehearse rotation in staging. The invariant: there is always a window where <em>both</em> credentials work, so no in-flight request fails at the switch.</p></details>
+  <details><summary>How does DNS-based service discovery actually resolve to a healthy pod?</summary><p>In Kubernetes, a Service gets a stable ClusterIP and a DNS name (<code>svc.ns.svc.cluster.local</code>) served by CoreDNS. CoreDNS resolves the name to the ClusterIP (or, for headless services, directly to pod IPs). Traffic to the ClusterIP is intercepted by kube-proxy (iptables or IPVS) which DNATs to one of the <em>Endpoints</em> — and the EndpointSlice only lists pods that pass their readiness probe, so unready/dead pods are removed. In a mesh, Envoy gets endpoints via EDS from the control plane and load-balances with active/passive health checking and locality awareness. The failure mode: DNS or endpoint caching (TTL) briefly points at a terminated pod, so you need short TTLs, readiness gating, and connection retries/timeouts to route around it.</p></details>
+  <details><summary>Your Prometheus fell over after a deploy. Diagnose and fix cardinality.</summary><p>Root cause is almost always a new high-cardinality label — a metric labelled with something unbounded like user ID, request ID, or full URL path, which creates a distinct time series per value and explodes memory (each series ~ few KB; millions of series = many GB). Diagnose: <code>topk(10, count by (__name__)({__name__=~".+"}))</code> to find the offending metric, and check <code>prometheus_tsdb_head_series</code> trend against the deploy time. Fix: drop or relabel the offending label with <code>metric_relabel_configs</code> (drop action), aggregate at emission, and put per-request detail in <em>traces/exemplars</em> not labels. Prevention: enforce a label allowlist, set sample/series limits per target, and review new metrics in code review. Metrics are for bounded dimensions; unbounded identity belongs in logs/traces.</p></details>
+  <details><summary>How do you make the software supply chain tamper-evident end-to-end?</summary><p>Layers: (1) hermetic, reproducible builds (Bazel/BuildKit with pinned inputs) so the same source yields the same digest; (2) generate an SBOM (CycloneDX/SPDX) listing every component; (3) scan for CVEs (Trivy/Grype) and fail the build on criticals; (4) sign the image and its SBOM with cosign (keyless via OIDC + Fulcio/Rekor transparency log); (5) emit SLSA provenance attesting <em>what built it from what source</em>; (6) at deploy, an admission controller (Kyverno/OPA/sigstore-policy) verifies the signature and provenance and rejects unsigned or untrusted-base images; (7) pin everything by digest and use minimal/distroless bases to shrink attack surface. Now a compromised artifact fails verification and never runs.</p></details>
+  <details><summary>Contrast Firecracker microVMs with containers and gVisor for isolating untrusted code.</summary><p>Plain containers share the host kernel — a kernel exploit escapes to the host, so they're weak for hostile multi-tenancy. gVisor interposes a userspace kernel (Sentry) that reimplements syscalls, drastically shrinking the host kernel attack surface at a syscall-performance cost. Firecracker runs each workload in a minimal KVM microVM with its own guest kernel and a tiny device model (only virtio-net/block, no BIOS), booting in ~125ms with a few MB overhead — near-container speed with real VM isolation; it powers AWS Lambda and Fargate exactly because they run arbitrary customer code. Decision: trusted first-party → containers; untrusted-but-you-want-speed → Firecracker (or Kata); need syscall-level defence without a VM → gVisor.</p></details>
+  <details><summary>How do CPU requests, limits, HPA and the scheduler interact — and where's the trap?</summary><p><em>Requests</em> are what the scheduler reserves for bin-packing and what guarantees a floor; <em>limits</em> are the cgroup <code>cpu.max</code> ceiling enforced by CFS throttling. HPA scales replicas on utilisation = usage/request. The trap: set a tight CPU limit and a bursty service gets throttled inside each 100ms period, so p99 latency explodes — but average utilisation stays low, so HPA never scales up and you can't see it on a CPU dashboard. Correct pattern: always set requests (for scheduling + HPA baseline), be very cautious with CPU limits for latency-sensitive services (often omit them), rely on requests + node capacity for fairness, and alert on the throttled-periods ratio, not just utilisation. Memory limits, by contrast, you <em>do</em> set because memory is incompressible and overcommit leads to OOM kills.</p></details>
+  <details><summary>What breaks when you naively containerise a stateful database, and how do you do it right?</summary><p>Naive problems: writes to the overlay layer are ephemeral and slow (copy-up), so data vanishes on reschedule; the scheduler may move the pod to another node losing its local disk; noisy neighbours steal IO/CPU; and a stateless-style rolling deploy can restart the primary. Right way: use a StatefulSet (stable network identity + ordered rollout) with PersistentVolumes backed by network/replicated storage (or local-PV pinned to a node), configure pod anti-affinity across AZs, set proper readiness so traffic waits for replica sync, use an operator (e.g. for Postgres/Cassandra) that understands failover, back up out-of-band, and treat storage IOPS as a first-class resource. Often the honest answer in an interview is "use a managed DB unless there's a strong reason not to" — co-scheduling databases with stateless apps is where teams get burned.</p></details>
+  <details><summary>Design an observability strategy that lets you debug a single slow request across 20 services.</summary><p>Instrument every service with OpenTelemetry: a trace ID is generated at the edge and propagated via W3C <code>traceparent</code> headers (and through the mesh sidecars) so each hop creates a child span with timing. Traces go to Jaeger/Tempo; you open the trace and immediately see which of the 20 hops ate the latency and whether it was network, queueing, or downstream. Metrics (Prometheus, RED per service) tell you <em>that</em> something is slow and how widespread; logs (structured, carrying the same trace ID) give the <em>why</em> at the offending span. Correlate all three by trace ID: alert fires on metrics → jump to an exemplar trace → pivot to logs for that span. Add span attributes for key dimensions (route, tenant tier) but keep them bounded. The payoff: mean-time-to-locate drops from grepping 20 log streams to one click on a flame graph.</p></details>
+  <details><summary>Immutable infrastructure and golden images — what problem do they kill and what do they cost?</summary><p>They kill configuration drift: instead of SSHing in to patch a running box (which makes every server a unique snowflake nobody can reproduce), you bake a versioned "golden image" (AMI/OCI) in CI with everything pre-installed, and to change anything you build a new image and <em>replace</em> the instance — never mutate in place. Benefits: every instance from an image is byte-identical and reproducible, rollback is redeploying the previous image, and provisioning is fast because nothing is installed at boot. Costs: a full rebuild+redeploy cycle for even small changes (no hotfix in place), image build/bake time, and you must externalise all state (config, secrets, data) since the instance is disposable. The mental shift is "servers are cattle, not pets" — and it's the foundation that makes reliable canary/blue-green rollbacks possible.</p></details>
+</div>

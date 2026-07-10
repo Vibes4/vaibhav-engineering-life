@@ -1,0 +1,362 @@
+<h1>Auth · OAuth2 / OIDC / JWT / mTLS <span class="tag express">Mastery</span></h1>
+<p>Authentication proves <em>who you are</em>; authorization decides <em>what you may do</em>. This page pushes past "we use JWTs and OAuth" into the token bytes, the signing algorithms, the PKCE dance, the revocation problem, JWKS key rotation, mTLS/SPIFFE for service-to-service, and the war-stories — the <code>alg:none</code> bypass, the token-in-localStorage XSS bleed, the OAuth mix-up attack — that separate an SDE2 from a Staff answer.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Authentication is proving identity; authorization is granting access. Modern systems delegate both. <strong>OAuth2</strong> is an <em>authorization-delegation</em> framework — a client gets a scoped <em>access token</em> to call an API on the user's behalf without ever seeing their password; the default flow is <strong>Authorization Code + PKCE</strong>. <strong>OIDC</strong> layers <em>authentication</em> on top of OAuth2 by adding an <strong>ID token</strong> — a JWT that describes who the user is. A <strong>JWT</strong> is a signed <code>header.payload.signature</code>, base64url-encoded, verified with a shared secret (HS256) or a public key from a JWKS endpoint (RS256/ES256), so any service can validate it statelessly. For service-to-service we use <strong>mTLS</strong>, where both sides present X.509 certs — often SPIFFE identities in a service mesh. The core trade-off is stateless JWTs (fast, no lookup, hard to revoke) versus opaque server-side sessions (instant revocation, needs a shared store)."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The fuller answer names the internals the interviewer is fishing for:</p>
+<ul>
+<li><strong>AuthN vs AuthZ.</strong> Authentication answers "who are you" (login, MFA, OIDC ID token). Authorization answers "what can you do" (scopes, RBAC roles, ABAC policies). OAuth2 is fundamentally about authorization <em>delegation</em>; people bolt authentication onto it with OIDC.</li>
+<li><strong>Sessions vs tokens.</strong> Classic sessions store state server-side and hand the browser an opaque, high-entropy <em>session id</em> in an <code>httpOnly Secure SameSite</code> cookie. Revocation is trivial — delete the row. The cost: every request hits a shared session store (Redis) so it scales horizontally. JWTs flip this: the token <em>is</em> the state, self-contained and signed, so any service verifies it with zero lookups — but you cannot un-issue it before <code>exp</code> without extra machinery.</li>
+<li><strong>JWT anatomy.</strong> Three base64url segments: header (<code>alg</code>, <code>kid</code>, <code>typ</code>), payload (registered claims <code>iss/sub/aud/exp/nbf/iat/jti</code> plus custom), and a signature over <code>base64url(header) + "." + base64url(payload)</code>. HS256 uses one shared secret (symmetric); RS256/ES256 sign with a private key and let anyone verify with the public key published at a <code>/.well-known/jwks.json</code> endpoint keyed by <code>kid</code>.</li>
+<li><strong>The revocation problem.</strong> Because a JWT is valid until <code>exp</code>, the industry answer is short-lived access tokens (5–15 min) plus a long-lived <em>refresh token</em> that is rotated on every use and can be denylisted; theft of a refresh token is detected when an already-used token is replayed.</li>
+<li><strong>OAuth2 roles &amp; grants.</strong> Resource owner (user), client (app), authorization server (issues tokens), resource server (the API). Authorization Code + PKCE is the default for web/SPA/mobile; Client Credentials is for machine-to-machine; Implicit and Resource-Owner-Password grants are deprecated.</li>
+<li><strong>OIDC additions.</strong> ID token, <code>userinfo</code> endpoint, standard scopes (<code>openid profile email</code>), and a discovery document. mTLS handles the trust between microservices where there is no human, typically via SPIFFE SVIDs issued by a service mesh.</li>
+</ul>
+
+<h2>Internal Working</h2>
+<p>End-to-end, the Authorization Code + PKCE flow plus JWT validation, step by step:</p>
+<ol>
+<li><strong>PKCE prep.</strong> The client generates a random <code>code_verifier</code> (43–128 chars, high entropy) and derives <code>code_challenge = base64url(SHA256(code_verifier))</code> with <code>code_challenge_method=S256</code>. This binds the eventual token exchange to <em>this</em> client instance, defeating authorization-code interception.</li>
+<li><strong>Authorization request.</strong> Browser is redirected to the authorization server's <code>/authorize</code> with <code>response_type=code</code>, <code>client_id</code>, <code>redirect_uri</code>, <code>scope</code>, <code>state</code> (CSRF/round-trip binding), <code>nonce</code> (replay binding for the ID token), and the <code>code_challenge</code>.</li>
+<li><strong>User authenticates.</strong> The authorization server runs its own login (password + MFA/TOTP, or an existing SSO session), obtains consent for the requested scopes, and 302-redirects back to <code>redirect_uri</code> with a short-lived, single-use <code>code</code> and the original <code>state</code>.</li>
+<li><strong>Token exchange (back channel).</strong> The client POSTs to <code>/token</code> with <code>grant_type=authorization_code</code>, the <code>code</code>, <code>redirect_uri</code>, and the raw <code>code_verifier</code>. The server recomputes the SHA-256 and compares to the stored challenge. On match it returns <code>access_token</code>, <code>refresh_token</code>, and (for OIDC) <code>id_token</code>.</li>
+<li><strong>JWKS fetch.</strong> The resource server reads the token header's <code>kid</code>, looks it up in a cached copy of <code>/.well-known/jwks.json</code> (a set of public keys). Cache-miss or unknown kid triggers a refetch — this is how key rotation works without redeploys.</li>
+<li><strong>Signature verification.</strong> Recompute the signature over <code>header.payload</code> with the public key (RS256 = RSASSA-PKCS1-v1_5 + SHA-256; ES256 = ECDSA P-256 + SHA-256) and constant-time compare. <strong>Pin the expected <code>alg</code></strong> from server config — never trust the token's own header, which is how <code>alg:none</code> and the RS256→HS256 confusion attack work.</li>
+<li><strong>Claim validation.</strong> Check <code>exp &gt; now</code> (with small leeway, e.g. 60s), <code>nbf &lt;= now</code>, <code>iss</code> equals the expected issuer, and <code>aud</code> contains this resource server. Optionally check <code>jti</code> against a replay/denylist cache.</li>
+<li><strong>Authorization decision.</strong> Map scopes/roles/claims to a permission decision (RBAC role check or ABAC policy evaluation), then serve the request. No database call needed for identity — that is the entire point.</li>
+</ol>
+<div class="callout warn"><strong>Watch out:</strong> The signature proves integrity, not freshness. A stolen but unexpired token is fully valid. Short TTLs and token binding (DPoP / mTLS-bound tokens) are the only real mitigations.</div>
+
+<h2>Why was this built?</h2>
+<p>Before OAuth, the "password anti-pattern" reigned: to let a third-party app read your Gmail contacts, you literally handed the app your Google password. It could then do <em>anything</em>, forever, and you could only revoke by changing your password (breaking every other app). OAuth 1.0 (2007, HMAC request signing) fixed delegation but was painful to implement. OAuth 2.0 (RFC 6749, 2012) simplified it by leaning on TLS and bearer tokens.</p>
+<p>Separately, stateful sessions worked fine for a single monolith but became a bottleneck in microservices and horizontally-scaled fleets: every service needed to hit the session store on every request, and sticky sessions broke elastic autoscaling. Self-contained signed tokens (JWT, JWS/JWE from the JOSE family) let any service verify identity locally. OIDC (2014) then standardized the "log in with X" flow because everyone was abusing OAuth2 for authentication in subtly insecure ways. mTLS/SPIFFE emerged because in a zero-trust mesh you cannot assume the network is safe — every service call must be mutually authenticated.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>When it wins</th><th>When it loses</th></tr>
+<tr><td>Server-side sessions</td><td>Opaque id in cookie, state in Redis/DB</td><td>Need instant revocation, single trust domain, browser apps</td><td>Cross-service fan-out, multi-region, stateless APIs</td></tr>
+<tr><td>JWT (stateless)</td><td>Signed self-contained token, local verify</td><td>Microservices, high RPS, no shared store</td><td>Revocation, large claim sets, secrets in payload</td></tr>
+<tr><td>API keys</td><td>Static long-lived secret string</td><td>Simple server-to-server, low security bar</td><td>No expiry, no scoping, no user context, leak = full access</td></tr>
+<tr><td>OAuth2 + OIDC</td><td>Delegated authZ + standardized authN</td><td>Third-party access, SSO, "login with"</td><td>Simple first-party login where sessions suffice — overkill</td></tr>
+<tr><td>SAML</td><td>XML assertions, browser POST</td><td>Legacy enterprise SSO, existing IdP</td><td>Mobile/SPA/API (verbose XML, no native token for APIs)</td></tr>
+<tr><td>mTLS</td><td>Both peers present X.509 certs</td><td>Service-to-service, zero-trust mesh, no human</td><td>End-user browser auth (cert distribution is brutal)</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Stateless verification.</strong> JWTs verify with a public key in microseconds; no round-trip to a session store, so services scale independently and survive store outages.</li>
+<li><strong>Delegation without password sharing.</strong> OAuth2 gives third parties scoped, revocable, time-limited access — the user's credentials never leave the authorization server.</li>
+<li><strong>Standardized &amp; interoperable.</strong> OIDC discovery, JWKS, standard claims mean libraries interoperate across Auth0, Okta, Keycloak, Cognito, Google without custom glue.</li>
+<li><strong>Key rotation without downtime.</strong> The <code>kid</code> + JWKS pattern lets the IdP roll signing keys; verifiers pick up new keys automatically.</li>
+<li><strong>Fine-grained scoping.</strong> Scopes and audiences constrain a token to exactly one API and one set of operations.</li>
+<li><strong>mTLS = mutual trust + encryption</strong> in one handshake for the service tier, with SPIFFE giving portable, short-lived workload identity.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>Revocation is hard.</strong> A valid JWT cannot be recalled before <code>exp</code> without a denylist — which reintroduces the stateful lookup you were avoiding.</li>
+<li><strong>Token size.</strong> A fat JWT (many claims/roles) can be 1–4 KB, sent on every request; it inflates headers and can blow past proxy header limits (nginx <code>large_client_header_buffers</code>).</li>
+<li><strong>Client-side storage is a minefield.</strong> localStorage is XSS-readable; cookies invite CSRF. There is no perfectly safe browser storage.</li>
+<li><strong>Clock skew &amp; JWKS caching bugs</strong> cause intermittent "invalid token" errors that are painful to debug.</li>
+<li><strong>OAuth is a framework, not a protocol</strong> — dozens of extensions (PKCE, PAR, DPoP, token introspection), and easy to implement subtly wrong (mix-up, open redirect).</li>
+<li><strong>mTLS operational cost.</strong> Cert issuance, rotation, and revocation (CRL/OCSP) at scale need a full PKI or a mesh CA.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+<li><strong>Statelessness vs revocability.</strong> Long JWT TTL = fewer refreshes but wider blast radius on theft. Short TTL = safer but more refresh traffic and more IdP load. Typical sweet spot: 5–15 min access token, 8–30 day rotating refresh token.</li>
+<li><strong>HS256 vs RS256/ES256.</strong> HS256 is faster and simpler but the verifier holds the signing secret — any verifier can forge tokens. Asymmetric keeps signing capability at the IdP only; mandatory the moment more than one party verifies. ES256 is smaller/faster than RS256 for equivalent strength.</li>
+<li><strong>Cookie vs Authorization header.</strong> Cookies get automatic CSRF exposure but <code>httpOnly</code> XSS protection; bearer headers avoid CSRF but require JS to hold the token (XSS exposure).</li>
+<li><strong>Access token in JWT vs opaque + introspection.</strong> JWT = fast local verify, stale until expiry; opaque + <code>/introspect</code> = instant revocation but a network hop per request.</li>
+<li><strong>Central gateway auth vs per-service.</strong> Gateway verifies once (simple, single choke point); per-service verify is defense-in-depth for zero-trust but duplicates JWKS handling.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Do not reach for OAuth2/JWT when a plain session cookie is correct.
+<ul>
+<li><strong>Simple first-party monolith login</strong> — a server-side session in Redis is simpler, instantly revocable, and has none of the JWT revocation pain. Don't build an OAuth server to log into your own app.</li>
+<li><strong>Storing sensitive data in the JWT payload</strong> — it is signed, not encrypted; anyone can base64-decode it. No PII, no secrets, no PANs.</li>
+<li><strong>Long-lived JWTs as "sessions"</strong> — a 30-day access token with no revocation path is a security incident waiting to happen.</li>
+<li><strong>mTLS for end-user browsers</strong> — distributing and rotating client certs to millions of users is operationally infeasible; use OIDC.</li>
+<li><strong>JWT as a database of record</strong> — putting mutable authorization state (roles that change often) in a token means stale permissions until expiry.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical topology: an edge gateway terminates TLS and does coarse token validation; an identity provider owns login and token issuance; services do fine-grained authZ and talk to each other over mTLS inside a mesh.</p>
+<pre class="mermaid">
+flowchart TD
+  U["Browser or SPA"] --> GW["API Gateway"]
+  GW -->|"redirect to login"| IDP["Auth Server / OIDC IdP"]
+  IDP -->|"JWKS public keys"| GW
+  GW -->|"verified JWT"| SVC1["Orders Service"]
+  SVC1 -->|"mTLS SPIFFE"| SVC2["Payments Service"]
+  SVC1 -->|"mTLS SPIFFE"| SVC3["Inventory Service"]
+  IDP --> RS["Refresh + session store Redis"]
+  GW --> DENY["Denylist cache Redis"]
+</pre>
+<p>The gateway holds a cached JWKS and rejects unsigned/expired tokens at the edge, shedding bad traffic early. Valid requests carry the JWT (or a gateway-minted internal token) downstream. Service-to-service hops use mTLS with SPIFFE SVIDs issued by the mesh CA (Istio/Linkerd/SPIRE), so even inside the cluster every call is mutually authenticated and encrypted — zero-trust. The refresh-token store and the denylist live in Redis; revocation writes a <code>jti</code> to the denylist which the gateway checks for the short access-token window.</p>
+
+<h3>The refresh + rotation loop</h3>
+<pre class="mermaid">
+sequenceDiagram
+  participant C as "Client"
+  participant A as "Auth Server"
+  participant R as "Redis Store"
+  C->>A: POST token grant_type refresh_token RT1
+  A->>R: check RT1 valid and unused
+  R-->>A: ok
+  A->>R: invalidate RT1 store RT2
+  A-->>C: new access token plus RT2
+  C->>A: replay old RT1 stolen
+  A->>R: RT1 already used
+  A-->>C: reject and revoke whole family
+</pre>
+<p>This is <strong>refresh-token rotation with reuse detection</strong>: each refresh issues a new refresh token and invalidates the old one. If an already-consumed refresh token is ever presented, the server assumes theft and revokes the entire token family, forcing re-login.</p>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>JWKS unavailable / stale.</strong> IdP rotates keys, verifiers have a stale cache with no <code>kid</code> match, and every request 401s. Fix: cache with TTL + on-miss refetch + negative-cache backoff, and overlap-publish new keys before signing with them.</li>
+<li><strong>Clock skew.</strong> A verifier's clock is 90s fast; freshly issued tokens fail <code>nbf</code>/<code>iat</code> checks. Fix: NTP everywhere + small validation leeway.</li>
+<li><strong>Token bloat 431/502.</strong> Roles baked into the JWT grow; header exceeds proxy limits, causing "431 Request Header Fields Too Large" or upstream 502s. Fix: keep claims lean, move roles behind a lookup.</li>
+<li><strong>Refresh storms.</strong> Access TTL too short + many tabs → thundering herd on <code>/token</code>. Fix: jittered refresh, single-flight refresh per client, silent-renew coordination.</li>
+<li><strong>Redirect URI / open redirect abuse.</strong> Loose <code>redirect_uri</code> matching leaks codes/tokens. Fix: exact-match allowlist, no wildcards.</li>
+<li><strong>mTLS cert expiry.</strong> A workload cert expires mid-deploy and the whole service tier starts refusing connections. Fix: short SVIDs with automated rotation well before expiry (rotate at ~50% of lifetime).</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<p>Exact tools and signals:</p>
+<pre><code># Decode a JWT without verifying (inspect header/claims)
+echo "$TOKEN" | cut -d. -f1 | base64 -d 2>/dev/null   # header: alg, kid
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null   # payload: iss/aud/exp
+
+# Human-friendly decode + verify against JWKS
+jwt decode "$TOKEN"                     # mike-engel/jwt-cli
+step crypto jwt verify --jwks jwks.json --iss "$ISS" --aud "$AUD" &amp;lt; token
+
+# See the IdP config and keys
+curl -s https://idp.example.com/.well-known/openid-configuration | jq .
+curl -s https://idp.example.com/.well-known/jwks.json | jq '.keys[].kid'
+
+# Introspect an opaque/reference token
+curl -s -u "$CID:$SECRET" -d "token=$TOKEN" https://idp/introspect | jq .
+
+# Inspect an mTLS handshake and peer cert
+openssl s_client -connect svc:8443 -cert client.pem -key client.key -CAfile ca.pem
+openssl x509 -in cert.pem -noout -dates -subject -ext subjectAltName</code></pre>
+<ul>
+<li><strong>401 with valid-looking token</strong> → compare token <code>kid</code> to JWKS kids; check <code>exp</code> vs server clock; confirm <code>aud</code> matches this service.</li>
+<li><strong>Intermittent 401s</strong> → almost always JWKS cache/rotation or clock skew across a fleet.</li>
+<li><strong>mTLS "certificate verify failed"</strong> → check CA chain, SAN/SPIFFE ID mismatch, and cert dates.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>What it means</th><th>Healthy / alert threshold</th></tr>
+<tr><td>auth_token_validation_errors_rate</td><td>Signature/claim failures</td><td>&amp;lt;0.1%; spike = rotation or attack</td></tr>
+<tr><td>jwks_fetch_failures</td><td>Verifier can't reach IdP keys</td><td>0; any sustained &amp;gt;0 pages</td></tr>
+<tr><td>jwks_cache_age_seconds</td><td>Staleness of cached keys</td><td>&amp;lt; cache TTL; alert if &amp;gt; 2× TTL</td></tr>
+<tr><td>token_refresh_rate</td><td>Refresh calls per second</td><td>Baseline ± 3σ; sudden spike = storm/leak</td></tr>
+<tr><td>refresh_reuse_detected</td><td>Replayed refresh tokens</td><td>0; any &amp;gt;0 = possible theft, investigate</td></tr>
+<tr><td>p99_token_verify_latency</td><td>Local verify cost</td><td>&amp;lt;2ms RS256; &amp;gt;10ms = key/CPU issue</td></tr>
+<tr><td>mtls_handshake_failures</td><td>Failed mutual TLS</td><td>&amp;lt;0.01%; spike = cert expiry/rotation</td></tr>
+<tr><td>cert_expiry_seconds</td><td>Time to workload cert expiry</td><td>Alert at &amp;lt;25% of lifetime remaining</td></tr>
+<tr><td>login_failure_ratio</td><td>Failed / total logins</td><td>Baseline; spike = credential stuffing</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>JWT verification is CPU-bound and embarrassingly parallel — each service verifies locally, so throughput scales with the fleet with no shared bottleneck. The stateful pieces (refresh store, denylist, session store) are what you must scale.</p>
+<pre class="mermaid">
+flowchart LR
+  LB["Load Balancer"] --> G1["Gateway 1 JWKS cache"]
+  LB --> G2["Gateway 2 JWKS cache"]
+  LB --> G3["Gateway 3 JWKS cache"]
+  G1 --> RC["Redis Cluster refresh and denylist"]
+  G2 --> RC
+  G3 --> RC
+  G1 --> IDP["IdP autoscaled"]
+</pre>
+<ul>
+<li><strong>Cache JWKS aggressively</strong> so the IdP is not on the hot path — verifiers only fetch keys on rotation.</li>
+<li><strong>Denylist stays small</strong> because access tokens are short-lived: entries expire at token <code>exp</code>, so it never grows unbounded.</li>
+<li><strong>Refresh/session store</strong> is the real scaling concern — shard Redis, or use Redis Cluster, and keep values small.</li>
+<li><strong>IdP is the choke point for logins</strong>, not for API traffic — scale it for peak login/refresh rate, not request rate.</li>
+<li><strong>Prefer ES256 over RS256</strong> at extreme scale: smaller signatures, faster verify, less header bytes.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+<li><strong>alg confusion / alg:none.</strong> Attacker sets header <code>alg:none</code> (no signature) or swaps RS256→HS256 so the RSA public key is used as an HMAC secret. Mitigation: pin the accepted algorithm(s) server-side; never derive it from the token.</li>
+<li><strong>Weak HS256 secret.</strong> Short shared secrets are brute-forceable offline. Use ≥256-bit random secrets, or better, asymmetric keys.</li>
+<li><strong>Token leakage.</strong> Tokens in URLs (query strings) end up in access logs, referrer headers, and browser history. Keep them in headers/bodies; scrub tokens from logs.</li>
+<li><strong>XSS vs CSRF.</strong> localStorage tokens are stolen by any XSS; <code>httpOnly Secure SameSite=Lax/Strict</code> cookies resist both XSS reads and cross-site CSRF. Add anti-CSRF tokens if you must relax SameSite.</li>
+<li><strong>OAuth mix-up &amp; open redirect.</strong> Validate <code>state</code>, <code>iss</code> in the response, and exact-match <code>redirect_uri</code>. Use PKCE even for confidential clients.</li>
+<li><strong>Replay.</strong> Bind tokens with <code>jti</code> + nonce, short TTLs, and consider sender-constrained tokens (DPoP, mTLS-bound tokens).</li>
+<li><strong>Password storage.</strong> Never plaintext, never fast hashes (MD5/SHA). Use <strong>argon2id</strong> (or bcrypt/scrypt), per-user salt, tuned work factor (bcrypt cost 12+, argon2 ~64MB memory), and pepper if feasible.</li>
+<li><strong>MFA/TOTP.</strong> RFC 6238 time-based codes over a shared secret; enforce for privileged actions. WebAuthn/passkeys are phishing-resistant and superior.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>Verify latency.</strong> RS256 verify ≈ 0.1–1 ms; ES256 similar or faster; HS256 fastest (~microseconds). The bottleneck is rarely crypto — it is JWKS fetch, JSON parsing, and denylist lookups. Cache the parsed key object, not just the JWKS JSON.</li>
+<li><strong>Signing cost.</strong> RS256 signing is ~10–50× slower than verifying (RSA math); this hits the IdP, not verifiers — size the IdP for token-issuance rate.</li>
+<li><strong>Token size on the wire.</strong> Every request carries the token; a 2 KB JWT × millions of RPS is real bandwidth. Trim claims; ES256 signatures are ~64 bytes vs RS256 ~256+.</li>
+<li><strong>mTLS handshake.</strong> A full TLS 1.3 handshake with client auth adds ~1 RTT; amortize with connection reuse / keep-alive / session resumption so it is paid once per connection, not per request.</li>
+<li><strong>bcrypt/argon2 by design are slow</strong> (tens to hundreds of ms) — this is a feature for password checks, but never put them on a hot per-request path; they run at login only.</li>
+<li><strong>Tuning:</strong> raise JWKS cache TTL, keep denylist in local + Redis two-tier cache, batch introspection, and use ES256 to shrink both CPU and bytes.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Not verifying <code>aud</code>/<code>iss</code>.</strong> A token minted for service A is accepted by service B. Fix: always assert audience and issuer.</li>
+<li><strong>Trusting the token's <code>alg</code>.</strong> Enables alg:none / confusion. Fix: allowlist algorithms in verifier config.</li>
+<li><strong>Putting secrets/PII in the payload.</strong> It's public. Fix: only identifiers and claims; encrypt (JWE) if you truly must carry sensitive data.</li>
+<li><strong>Long-lived access tokens with no revocation.</strong> Fix: short access TTL + rotating refresh + denylist.</li>
+<li><strong>Storing tokens in localStorage.</strong> XSS = full account takeover. Fix: httpOnly Secure SameSite cookies, or in-memory + silent refresh.</li>
+<li><strong>Skipping PKCE / using Implicit grant.</strong> Fix: Authorization Code + PKCE everywhere, including SPAs.</li>
+<li><strong>Wildcard <code>redirect_uri</code>.</strong> Fix: exact-match allowlist.</li>
+<li><strong>Fast password hashing.</strong> Fix: argon2id/bcrypt with proper cost.</li>
+<li><strong>No key rotation.</strong> A single static signing key forever. Fix: <code>kid</code> + JWKS + scheduled rotation.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they plausibly use it</th></tr>
+<tr><td>Google</td><td>Runs a canonical OIDC provider (accounts.google.com) with RS256 JWTs and a public JWKS; internally uses <em>ALTS/BeyondCorp</em> zero-trust with mutual authentication for service-to-service — the model much of the industry copied.</td></tr>
+<tr><td>Amazon</td><td>Cognito issues OIDC ID/access tokens (JWT, JWKS); IAM roles + STS temporary credentials are effectively short-lived scoped tokens; SigV4 request signing for API auth. Likely mTLS internally via their service framework.</td></tr>
+<tr><td>Netflix</td><td>Historically edge auth at Zuul/gateway minting internal tokens; strong push on mutual TLS and a metatron-style PKI for service identity; short-lived tokens with a central identity service.</td></tr>
+<tr><td>Uber</td><td>Service mesh with mTLS/SPIFFE-style workload identity for thousands of microservices; OAuth2/OIDC for rider/driver/partner apps; scoped tokens for third-party API access.</td></tr>
+<tr><td>Swiggy</td><td>Likely OAuth2 + OIDC for customer/partner/delivery apps, JWT access tokens verified at an API gateway, refresh-token rotation for long-lived mobile sessions, and OTP-based login (TOTP/SMS) common in India.</td></tr>
+<tr><td>PhonePe</td><td>Regulated fintech: strong MFA, device binding, short-lived tokens, and likely mTLS between payment services; UPI flows demand replay-resistant, signed requests and strict audience scoping.</td></tr>
+<tr><td>Razorpay</td><td>Merchant-facing API keys + OAuth2 for partner/marketplace access, HMAC webhook signatures for integrity, scoped tokens per merchant, and mTLS to bank/switch integrations (likely).</td></tr>
+<tr><td>Atlassian</td><td>OAuth2 + OIDC across Jira/Confluence/Bitbucket, scoped 3LO tokens for apps/Forge, SAML/SSO for enterprise IdPs, and JWT-signed iframe/Connect app requests with shared-secret validation.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What is the difference between authentication and authorization?
+  <ol><li>AuthN = who you are (login, ID token); AuthZ = what you can do (scopes/RBAC/ABAC).</li></ol></li>
+<li>Walk me through a JWT byte by byte.
+  <ol><li>base64url(header).base64url(payload).signature; header has alg/kid, payload has iss/sub/aud/exp/iat/jti.</li></ol></li>
+<li>HS256 vs RS256 — when each?
+  <ol><li>HS256 shared secret, one trust party; RS256 asymmetric, mandatory when multiple parties verify.</li></ol></li>
+<li>How does the verifier get the public key?
+  <ol><li>Reads <code>kid</code>, fetches cached JWKS at <code>/.well-known/jwks.json</code>, refetches on unknown kid.</li></ol></li>
+<li>What exactly do you validate on a JWT?
+  <ol><li>Signature (pinned alg), exp/nbf, iss, aud, optionally jti against denylist.</li></ol></li>
+<li>What is the alg:none attack?
+  <ol><li>Token declares no signature; naive libs accept it. Fix: allowlist algorithms server-side.</li></ol></li>
+<li>Why can't you just revoke a JWT?
+  <ol><li>It's self-contained and valid until exp; need a denylist or short TTL + rotation.</li></ol></li>
+<li>Explain access vs refresh tokens.
+  <ol><li>Short-lived access token for API calls; long-lived refresh token to mint new access tokens, rotated on use.</li></ol></li>
+<li>What is PKCE and what does it prevent?
+  <ol><li>code_verifier/challenge binds the code exchange to the client; stops authorization-code interception.</li></ol></li>
+<li>Which OAuth2 grant for a mobile app? For a cron job?
+  <ol><li>Authorization Code + PKCE for the app; Client Credentials for the cron/machine.</li></ol></li>
+<li>Why are Implicit and Password grants deprecated?
+  <ol><li>Implicit leaks tokens via redirect/URL; Password grant makes the client handle credentials — both unsafe.</li></ol></li>
+<li>How does OIDC differ from OAuth2?
+  <ol><li>OIDC adds authentication: ID token (JWT about the user), userinfo endpoint, standard scopes.</li></ol></li>
+<li>Sessions vs JWTs — trade-offs?
+  <ol><li>Sessions: revocable, stateful, shared store. JWTs: stateless, fast, hard to revoke.</li></ol></li>
+<li>How do you store tokens in a browser safely?
+  <ol><li>httpOnly Secure SameSite cookies (or in-memory + silent refresh); never localStorage.</li></ol></li>
+<li>How does mTLS establish service identity?
+  <ol><li>Both peers present X.509 certs; SPIFFE SVID encodes workload identity; mesh CA issues/rotates.</li></ol></li>
+<li>RBAC vs ABAC?
+  <ol><li>RBAC = roles→permissions; ABAC = policy over attributes (user, resource, context) — finer but complex.</li></ol></li>
+<li>How do you handle signing-key rotation with zero downtime?
+  <ol><li>Publish new key in JWKS first, then start signing with new kid; verifiers pick it up via kid lookup.</li></ol></li>
+<li>How do you detect refresh-token theft?
+  <ol><li>Rotation + reuse detection: a replayed old refresh token revokes the whole family.</li></ol></li>
+<li>What breaks under clock skew?
+  <ol><li>exp/nbf/iat checks fail intermittently; fix with NTP + validation leeway.</li></ol></li>
+<li>How do you scale token verification to millions of RPS?
+  <ol><li>Local stateless verify + cached JWKS; only the refresh/denylist store needs scaling.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>Cryptography:</strong> "Explain RSA vs ECDSA, HMAC, constant-time comparison." Angle: asymmetric signing keeps the private key at the IdP; timing attacks on signature compare.</li>
+<li><strong>Web security:</strong> "XSS, CSRF, SameSite, CORS." Angle: why cookie flags and CSRF tokens matter for token storage.</li>
+<li><strong>Distributed systems:</strong> "How do you propagate identity across services?" Angle: token/claims propagation, gateway vs per-service verify, mTLS.</li>
+<li><strong>Caching:</strong> "How do you cache JWKS/introspection?" Angle: TTL, negative caching, stampede protection.</li>
+<li><strong>Databases:</strong> "How do you store passwords and sessions?" Angle: argon2 + salt; Redis session/refresh store.</li>
+<li><strong>Networking / TLS:</strong> "TLS 1.3 handshake, mutual auth, session resumption." Angle: the extra RTT and how mTLS reuses connections.</li>
+<li><strong>PKI / service mesh:</strong> "SPIFFE/SPIRE, cert rotation, CRL/OCSP." Angle: workload identity and short-lived certs.</li>
+<li><strong>Compliance:</strong> "PCI/GDPR implications of tokens." Angle: no PII in JWT, token logging, data residency.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Incident 1 — Fleet-wide 401 storm after key rotation</h3>
+<table>
+<tr><th>Symptoms</th><td>All services start returning 401; error rate spikes to ~100% within seconds of an IdP deploy.</td></tr>
+<tr><td>Investigation</td><td>Decode a failing token: its <code>kid</code> is not present in the verifiers' cached JWKS. IdP rotated the signing key and began signing with a new kid immediately.</td></tr>
+<tr><td>Root Cause</td><td>New key was not published to JWKS before it was used for signing; verifiers' cache had no matching key and did not refetch fast enough.</td></tr>
+<tr><td>Solution</td><td>Force JWKS refetch on all verifiers; roll IdP back to overlap-publishing keys.</td></tr>
+<tr><td>Prevention</td><td>Publish-then-sign: add new key to JWKS, wait past cache TTL, then switch signing. Verifiers refetch on unknown kid with backoff.</td></tr>
+<tr><td>Interview Answer</td><td>"Key rotation must publish the public key before signing with it, and verifiers must refetch JWKS on an unknown kid — otherwise there's a window where valid tokens can't be verified."</td></tr>
+</table>
+
+<h3>Incident 2 — Account takeovers via stolen tokens</h3>
+<table>
+<tr><th>Symptoms</th><td>Support reports users seeing others' data; fraud spikes from a range of IPs.</td></tr>
+<tr><td>Investigation</td><td>Tokens found in an SPA's localStorage; a third-party script had an XSS sink exfiltrating them. Access tokens were also long-lived (24h).</td></tr>
+<tr><td>Root Cause</td><td>Tokens stored in localStorage (XSS-readable) + long TTL + no revocation.</td></tr>
+<tr><td>Solution</td><td>Move tokens to httpOnly Secure SameSite cookies, cut access TTL to 10 min, add refresh rotation + denylist, rotate signing keys to invalidate outstanding tokens.</td></tr>
+<tr><td>Prevention</td><td>CSP to limit script origins, no tokens in JS-accessible storage, short TTLs, subresource integrity.</td></tr>
+<tr><td>Interview Answer</td><td>"localStorage tokens are one XSS away from mass takeover. httpOnly cookies + short TTL + rotation shrink the blast radius and let you actually revoke."</td></tr>
+</table>
+
+<h3>Incident 3 — Service tier goes dark at midnight</h3>
+<table>
+<tr><th>Symptoms</th><td>At 00:00 UTC, half the microservices start failing all outbound calls with TLS handshake errors.</td></tr>
+<tr><td>Investigation</td><td><code>openssl s_client</code> shows peer certs expired at midnight; mesh cert rotation job had silently failed the day before.</td></tr>
+<tr><td>Root Cause</td><td>mTLS workload certs expired; automated rotation broke and there was no expiry alerting.</td></tr>
+<tr><td>Solution</td><td>Manually reissue SVIDs / restart SPIRE agents to re-mint certs; restore connectivity.</td></tr>
+<tr><td>Prevention</td><td>Rotate at ~50% of cert lifetime, alert on <code>cert_expiry_seconds</code> at 25% remaining, and monitor the rotation job itself.</td></tr>
+<tr><td>Interview Answer</td><td>"Short-lived certs are safer but demand reliable rotation and expiry alerting; rotate at half-life, never at the edge of expiry."</td></tr>
+</table>
+
+<h3>Incident 4 — OAuth mix-up leaks authorization codes</h3>
+<table>
+<tr><th>Symptoms</th><td>Security researcher reports that codes can be redirected to an attacker-controlled endpoint.</td></tr>
+<tr><td>Investigation</td><td>App supported multiple IdPs and did not validate which issuer returned the code; <code>redirect_uri</code> matching used a prefix wildcard.</td></tr>
+<tr><td>Root Cause</td><td>Missing issuer/state validation (mix-up attack) + loose redirect URI allowing an open redirect.</td></tr>
+<tr><td>Solution</td><td>Validate <code>state</code> and the returned <code>iss</code>, enforce exact-match <code>redirect_uri</code>, require PKCE.</td></tr>
+<tr><td>Prevention</td><td>Per-IdP state binding, exact redirect allowlist, PKCE mandatory, adopt PAR where available.</td></tr>
+<tr><td>Interview Answer</td><td>"Mix-up attacks exploit multi-IdP clients that don't check which issuer replied; bind state, verify iss, and never wildcard redirect URIs."</td></tr>
+</table>
+
+<h3>Incident 5 — Refresh storm melts the IdP</h3>
+<table>
+<tr><th>Symptoms</th><td>IdP <code>/token</code> latency spikes, CPU saturates, cascading login failures during morning peak.</td></tr>
+<tr><td>Investigation</td><td>Access TTL was set to 60s; every open tab refreshed simultaneously with no jitter, and RSA signing is CPU-heavy.</td></tr>
+<tr><td>Root Cause</td><td>Too-short access TTL + synchronized, un-jittered refreshes + expensive RS256 signing.</td></tr>
+<tr><td>Solution</td><td>Raise access TTL to ~10 min, add jittered/single-flight refresh in the client SDK, scale IdP, consider ES256.</td></tr>
+<tr><td>Prevention</td><td>Sensible TTLs, jitter, single-flight refresh, capacity plan the IdP for issuance rate.</td></tr>
+<tr><td>Interview Answer</td><td>"Ultra-short TTLs push all cost onto the IdP's signing path; balance TTL against refresh load and add jitter + single-flight."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Why is a JWT signed but not encrypted, and what are the consequences?</summary><p>A standard JWT is a JWS — signed for integrity/authenticity, not confidentiality. The payload is base64url, trivially decodable by anyone who holds the token. Consequence: never put secrets or PII in it. If you genuinely need confidential claims you use JWE (encrypted), but that's rare because the token flows over TLS anyway; the usual answer is "carry identifiers, not secrets." The signature guarantees the claims weren't tampered with; it says nothing about who can read them.</p></details>
+  <details><summary>Explain the RS256→HS256 algorithm-confusion attack in detail.</summary><p>If a verifier picks the algorithm from the token header and looks up "the key" generically, an attacker takes the server's <em>public</em> RSA key (which is public), sets the header to <code>alg:HS256</code>, and signs the token using that public key as the HMAC secret. The verifier, seeing HS256, does HMAC with the same public key and it validates. The fix is to pin the expected algorithm(s) from configuration and select the key type accordingly — RS256 tokens must be verified only with the RSA public key using RSA verification, never HMAC. Modern libraries require you to pass the allowed algorithms explicitly for exactly this reason.</p></details>
+  <details><summary>How do you actually revoke a JWT before it expires?</summary><p>Three layers. (1) Keep access tokens short (5–15 min) so the exposure window is small. (2) Maintain a denylist of <code>jti</code> values in Redis with a TTL equal to the token's remaining lifetime — checked at the gateway; it stays small because entries auto-expire. (3) For "log out everywhere" or key compromise, rotate the signing key (invalidates all tokens signed with the old kid) or bump a per-user token version claim that you check against a fast lookup. Refresh tokens are revoked directly since they're stored server-side.</p></details>
+  <details><summary>Walk through PKCE and why confidential clients should also use it.</summary><p>Client generates <code>code_verifier</code>, sends <code>code_challenge=SHA256(verifier)</code> on /authorize. On /token it sends the raw verifier; the server hashes and compares. An attacker who intercepts the authorization code (e.g., via a malicious app registered for the same custom URI scheme on mobile, or a leaked redirect) can't exchange it without the verifier, which never left the client. Even confidential clients (with a secret) benefit because it defends against code injection/replay independent of the client secret, and it's now recommended by OAuth 2.1 for all clients.</p></details>
+  <details><summary>Sessions vs JWTs — give me the honest engineering answer, not the marketing one.</summary><p>For a single first-party app, server-side sessions are usually the <em>better</em> choice: instant revocation, no key management, no revocation gymnastics, and Redis is cheap. JWTs win specifically when you have many independent services that must verify identity without a shared store, or cross-organization delegation. The common mistake is adopting JWTs for statelessness and then bolting on a denylist — at which point you've reinvented sessions with worse revocation. Pick JWTs for the microservice/delegation case; pick sessions for the monolith.</p></details>
+  <details><summary>How does JWKS key rotation work end to end?</summary><p>The IdP holds a keyset; each key has a <code>kid</code>. Tokens carry the signing kid in their header. Rotation is: generate a new keypair, add its public key to the JWKS document (now the set has both old and new), wait longer than the max verifier cache TTL so everyone has both keys, then switch the IdP to sign with the new kid. Old tokens still verify against the old key until they expire; then you retire the old key from JWKS. Verifiers fetch JWKS on startup, refresh on a TTL, and force-refresh when they see an unknown kid (with backoff to avoid stampeding the IdP).</p></details>
+  <details><summary>What's the difference between the ID token and the access token in OIDC?</summary><p>The ID token is for the <em>client</em> — it authenticates the user to the app (claims like sub, name, email, <code>nonce</code> to prevent replay, <code>aud</code>=client_id). You should not send it to APIs. The access token is for the <em>resource server</em> — it authorizes API calls (scopes, <code>aud</code>=API). Confusing them (sending the ID token to APIs) is a classic bug; APIs must reject tokens whose audience isn't them. The access token may be opaque or a JWT; the ID token is always a JWT.</p></details>
+  <details><summary>Why is Client Credentials the right grant for service-to-service, and how does it differ from mTLS?</summary><p>Client Credentials: a service authenticates with its own client_id/secret (no user) to get a scoped access token from the IdP, then calls APIs with it — good when you want centralized scoping and audit through the IdP. mTLS authenticates at the transport layer with certs and gives you mutual identity + encryption for the channel itself, with no IdP round-trip per token. They compose: mTLS for channel/workload identity in the mesh, plus a Client Credentials token carrying scopes for application-level authorization. Use both in a mature zero-trust setup.</p></details>
+  <details><summary>How do you safely store tokens in a SPA?</summary><p>Best: keep no long-lived token in JS at all — use the BFF (backend-for-frontend) pattern where the server holds tokens and the browser gets an httpOnly Secure SameSite session cookie; the BFF attaches the real token server-side. If you must hold a token client-side, keep the access token in memory only (lost on refresh, re-obtained via silent renew) and the refresh token in an httpOnly cookie. Never localStorage/sessionStorage — any XSS reads them. Pair with a strict CSP.</p></details>
+  <details><summary>Explain SameSite cookie modes and how they relate to CSRF.</summary><p>CSRF works because browsers auto-attach cookies to cross-site requests. <code>SameSite=Strict</code> withholds the cookie on all cross-site requests (breaks inbound links to authed pages). <code>SameSite=Lax</code> (default in modern browsers) sends it on top-level GET navigations but not on cross-site POST/XHR, killing most CSRF. <code>SameSite=None</code> (requires Secure) sends it everywhere — needed for cross-site embeds but reopens CSRF, so you add anti-CSRF tokens. Combine Lax + httpOnly + Secure for a solid default.</p></details>
+  <details><summary>What is SPIFFE/SVID and why does a mesh need it?</summary><p>SPIFFE is a standard for workload identity; an SVID is the credential — typically a short-lived X.509 cert whose SAN is a SPIFFE ID like <code>spiffe://cluster/ns/orders/sa/orders-svc</code>. SPIRE (the reference implementation) attests workloads (via k8s service account, node identity, etc.) and issues SVIDs that rotate automatically every few minutes to an hour. The mesh needs it because IP-based trust is meaningless in a dynamic cluster — pods come and go — so identity must be cryptographic and portable, and mTLS between services uses these SVIDs to mutually authenticate every call.</p></details>
+  <details><summary>How should passwords be stored, and why not SHA-256?</summary><p>Use a memory-hard, deliberately-slow adaptive hash: argon2id (preferred), scrypt, or bcrypt — each with a per-user random salt and a tuned cost so a single hash takes ~100–250ms. SHA-256 is a <em>fast</em> hash: a GPU computes billions per second, so a leaked table is cracked quickly. bcrypt/argon2 are slow and (argon2/scrypt) memory-hard, defeating GPU/ASIC parallelism. Add a server-side pepper (secret not in the DB) for defense in depth, and migrate cost factors upward over time. Never store plaintext, never reversible encryption.</p></details>
+  <details><summary>RBAC vs ABAC — when do you outgrow RBAC?</summary><p>RBAC maps users→roles→permissions; simple, cacheable, auditable. You outgrow it when access depends on <em>attributes</em>: resource ownership ("edit only your own docs"), context (time, IP, device posture), or relationships ("manager of the requester"). ABAC evaluates a policy over subject/resource/action/environment attributes (often with a policy engine like OPA/Cedar). The cost is complexity and harder reasoning about "who can access what." Many systems do RBAC for coarse gates + ABAC/ReBAC (relationship-based, like Google Zanzibar) for fine-grained resource access.</p></details>
+  <details><summary>What's the token-introspection endpoint and when do you use it instead of local JWT verification?</summary><p><code>/introspect</code> (RFC 7662) lets a resource server send an opaque or reference token to the authorization server and get back <code>{active, scope, sub, exp, ...}</code>. You use it when tokens are opaque (not JWTs) or when you need <em>real-time</em> revocation checks that local JWT verification can't give. The cost is a network hop per request, so you cache introspection results for a few seconds. The design trade-off is the classic one: JWT = fast, stale until expiry; introspection = fresh, but a dependency and latency per call.</p></details>
+  <details><summary>How do you propagate user identity across a chain of microservices?</summary><p>Two patterns. (1) Token passthrough: forward the original access token downstream; each service verifies it and checks its own audience — clean but the token must be audienced for all of them, or you accept broad audiences. (2) Token exchange (RFC 8693): the gateway/service swaps the user token for a narrowly-scoped downstream token, preserving the original subject as an <code>act</code>/<code>may_act</code> claim — better least-privilege and clear delegation chains. Both ride over mTLS. Avoid the anti-pattern of stripping identity at the edge and trusting the network internally.</p></details>
+  <details><summary>What breaks with clock skew and how do you make validation robust?</summary><p>JWT time claims (<code>exp</code>, <code>nbf</code>, <code>iat</code>) are absolute epoch seconds compared against the verifier's clock. If a verifier is fast, freshly-issued tokens fail <code>nbf</code>/<code>iat</code>; if slow, expired tokens are wrongly accepted. Fixes: run NTP/chrony on every host, allow a small clock-skew leeway (30–60s) in the validation library, and keep access-token TTLs comfortably larger than expected skew. In multi-region fleets skew is the most common cause of "works on some pods, fails on others" 401s.</p></details>
+</div>

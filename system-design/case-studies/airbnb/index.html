@@ -1,0 +1,107 @@
+<h1>How Airbnb Works <span class="tag express">Case Study</span></h1>
+<p>Airbnb is a two-sided marketplace connecting hosts (who list places) with guests (who book them). The interesting system-design problem is search and booking: find available places matching a location and a date range, rank them, and — crucially — guarantee that two guests can never book the same place for overlapping nights.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 250" role="img" aria-label="Airbnb request flow: client through an API gateway to a Search service backed by a geo and availability index in Elasticsearch, and a Booking service that writes to the Bookings database under a row lock">
+    <defs>
+      <marker id="arr-airbnb" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+    <rect class="box" x="16" y="98" width="118" height="56" rx="9"></rect>
+    <text class="lbl" x="75" y="122" text-anchor="middle">Client</text>
+    <text class="sub" x="75" y="140" text-anchor="middle">web / mobile</text>
+    <rect class="box" x="174" y="98" width="118" height="56" rx="9"></rect>
+    <text class="lbl" x="233" y="122" text-anchor="middle">API Gateway</text>
+    <text class="sub" x="233" y="140" text-anchor="middle">auth, routing</text>
+    <rect class="box" x="332" y="20" width="130" height="56" rx="9"></rect>
+    <text class="lbl" x="397" y="44" text-anchor="middle">Search service</text>
+    <text class="sub" x="397" y="62" text-anchor="middle">geo + filter</text>
+    <rect class="box-accent" x="332" y="172" width="130" height="56" rx="9"></rect>
+    <text class="lbl" x="397" y="196" text-anchor="middle">Booking service</text>
+    <text class="sub" x="397" y="214" text-anchor="middle">check &amp; write</text>
+    <rect class="box" x="540" y="20" width="164" height="56" rx="9"></rect>
+    <text class="lbl" x="622" y="42" text-anchor="middle">Geo + availability index</text>
+    <text class="sub" x="622" y="60" text-anchor="middle">Elasticsearch</text>
+    <rect class="box" x="540" y="172" width="164" height="56" rx="9"></rect>
+    <text class="lbl" x="622" y="194" text-anchor="middle">Bookings DB</text>
+    <text class="sub" x="622" y="212" text-anchor="middle">Postgres + row lock</text>
+    <line class="edge" x1="134" y1="126" x2="168" y2="126" marker-end="url(#arr-airbnb)"></line>
+    <text class="cap" x="151" y="118" text-anchor="middle">HTTPS</text>
+    <line class="edge" x1="292" y1="116" x2="326" y2="60" marker-end="url(#arr-airbnb)"></line>
+    <text class="cap" x="300" y="86" text-anchor="middle">search</text>
+    <line class="edge" x1="292" y1="136" x2="326" y2="194" marker-end="url(#arr-airbnb)"></line>
+    <text class="cap" x="300" y="170" text-anchor="middle">book</text>
+    <line class="edge" x1="462" y1="48" x2="534" y2="48" marker-end="url(#arr-airbnb)"></line>
+    <text class="cap" x="498" y="40" text-anchor="middle">geo query</text>
+    <line class="edge" x1="462" y1="200" x2="534" y2="200" marker-end="url(#arr-airbnb)"></line>
+    <text class="cap" x="498" y="192" text-anchor="middle">SELECT…FOR UPDATE</text>
+    <line class="edge-dash" x1="622" y1="172" x2="622" y2="76" marker-end="url(#arr-airbnb)"></line>
+    <text class="cap" x="660" y="128" text-anchor="middle">async index</text>
+  </svg>
+  <div class="diagram-cap">Figure: search path (gateway &rarr; Search service &rarr; Elasticsearch geo index) and booking path (gateway &rarr; Booking service &rarr; Bookings DB under a row lock); listing changes flow asynchronously into the search index.</div>
+</div>
+
+<h2>Requirements (functional &amp; non-functional)</h2>
+<p>Separate what the system does from how well it must do it.</p>
+<ul>
+  <li><strong>Functional:</strong> hosts create listings with availability; guests search by location + check-in/check-out dates; guests book; the system blocks double-bookings.</li>
+  <li><strong>Non-functional:</strong> search must be fast and geo-aware; booking must be <em>strongly consistent</em> (no double-booking, ever); high availability; handle bursty demand for popular listings/dates.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Notice search and booking have <em>opposite</em> consistency needs. Search can be eventually consistent (a stale result is annoying, not catastrophic). Booking must be strongly consistent (a double-booking is a real-world disaster). Design each path to its own requirement.</div>
+
+<h2>The core hard problem: preventing double-booking</h2>
+<p>The heart of the system is an <strong>interval-overlap check</strong>. A booking is a date range [checkIn, checkOut). A new booking for a listing is only allowed if it overlaps with <em>none</em> of that listing's existing confirmed bookings.</p>
+<p>Two ranges [aStart, aEnd) and [bStart, bEnd) overlap if and only if <code>aStart &lt; bEnd AND bStart &lt; aEnd</code>. This one line is the whole game — memorize it. Note we use half-open ranges so a checkout day can be someone else's check-in day.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Checking "is it available?" and then "write the booking" as two separate steps creates a race condition: two guests both read "available" before either writes. You must make the check-and-write <em>atomic</em> (a DB transaction with a row lock, or a unique constraint), or you will sell the same night twice.</div>
+
+<h2>Step-by-step request flow</h2>
+<p>Walk through the critical operation — a guest booking a listing — using the components in the diagram. This is where double-booking must be prevented.</p>
+<ol>
+  <li><strong>Search first:</strong> the <em>Client</em> sends a search ("Lisbon, 12–15 Aug") over <strong>HTTPS</strong> through the <em>API Gateway</em> to the <em>Search service</em>, which runs a geo + availability query against the <em>Elasticsearch index</em> and returns ranked candidates in tens of milliseconds.</li>
+  <li><strong>Guest picks one:</strong> the client sends a booking request for a specific listing and date range to the <em>Booking service</em> via the gateway.</li>
+  <li><strong>Open a transaction:</strong> the Booking service begins an ACID transaction on the <em>Bookings DB</em> and issues <code>SELECT ... FOR UPDATE</code> on that listing's booking rows, acquiring a <strong>row lock</strong>. Any concurrent booking for the same listing now blocks here.</li>
+  <li><strong>Overlap check:</strong> inside the lock, it checks the candidate range against existing confirmed bookings using <code>aStart &lt; bEnd AND bStart &lt; aEnd</code>. If any overlap exists, it aborts and returns "no longer available".</li>
+  <li><strong>Commit:</strong> if clear, it inserts the booking row and commits, which releases the lock. The check and the write happened atomically, so the second guest — who was blocked at step 3 — now sees the new row and is correctly rejected.</li>
+  <li><strong>Propagate:</strong> the new booking eventually updates the listing's availability calendar, which is pushed <em>asynchronously</em> into the Elasticsearch index so future searches reflect it.</li>
+</ol>
+<div class="callout warn"><strong>Why the lock spans the whole transaction:</strong> if you released the lock between the check (step 4) and the write (step 5), two transactions could both pass the check before either writes. Holding the row lock from <code>FOR UPDATE</code> through <code>COMMIT</code> is exactly what serializes competing bookings on the same listing.</div>
+
+<h2>Data model / storage choice</h2>
+<table>
+  <tr><th>Listings (relational)</th><td>Host, location (lat/lng), price, amenities. Source of truth, queried by search.</td></tr>
+  <tr><th>Bookings (relational, transactional)</th><td>listing_id + date range + status. The overlap check and write happen inside one ACID transaction so consistency is guaranteed.</td></tr>
+  <tr><th>Search index (e.g. Elasticsearch)</th><td>Denormalized copy of listings optimized for geo + filter queries. Updated asynchronously from the source of truth.</td></tr>
+</table>
+<p><strong>Why a separate search index?</strong> A relational DB is great for the transactional booking write but poor at "find all listings within 5km of these coordinates, available these dates, sorted by relevance". A purpose-built search engine handles geo and ranking far better.</p>
+
+<h2>Geo + date search</h2>
+<p>Search has two filters that work differently:</p>
+<ul>
+  <li><strong>Geo:</strong> use a spatial index (geohash or quadtree) so "near these coordinates" is a fast prefix/range lookup instead of computing distance to every listing on Earth.</li>
+  <li><strong>Dates:</strong> filter out listings already booked for the requested range. Often precomputed as an availability calendar per listing so the check is a quick lookup.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Do the cheap, highly-selective filter first. Geo usually eliminates 99.99% of listings instantly, leaving a small candidate set on which the more expensive availability and ranking work is cheap. Filter order is a real performance lever.</div>
+<p><strong>Put numbers on it.</strong> Say there are ~7M active listings worldwide. A search bounded to a city neighborhood (a geohash prefix covering a few km²) typically narrows that to <strong>a few hundred to a few thousand</strong> candidates — a 1000x–10000x reduction before any date or ranking work runs. The search service should answer in a <strong>&lt;100ms</strong> budget: the geo lookup is a sub-millisecond index range scan, leaving headroom for the availability filter and scoring. Search traffic is bursty and read-only — easily <strong>tens of thousands of QPS</strong> at peak — which is exactly why it lives on a horizontally scalable, replicated Elasticsearch tier instead of the transactional DB.</p>
+
+<h2>Ranking listings</h2>
+<p>Once you have available candidates, order them. Ranking signals include price, review score, distance from the searched area, host responsiveness, and personalization. Like Reddit's "Hot", this is a blended score — but here it directly drives revenue, so it is heavily A/B tested and tuned.</p>
+
+<h2>Scaling and tradeoffs</h2>
+<table>
+  <tr><th>Pessimistic locking (SELECT ... FOR UPDATE)</th><td>Lock the listing's booking rows during the transaction. Simple and safe; can reduce throughput under heavy contention on one hot listing.</td></tr>
+  <tr><th>Unique constraint / exclusion</th><td>Let the database reject overlapping ranges (e.g. Postgres exclusion constraint). Very safe; the loser just gets an error to retry.</td></tr>
+</table>
+<p><strong>Scale and the why behind the choice.</strong> Bookings are far rarer than searches — perhaps a few hundred writes/sec globally — so the booking path can afford strong consistency that a high-QPS read path could not. Contention is also <em>local</em>: the row lock only serializes bookings for the <em>same</em> listing, so two guests booking different homes never block each other, and lock hold time is just the few milliseconds of one transaction. The danger is a "hot" listing (a Super Bowl weekend) where many guests race for the same nights; there the unique/exclusion constraint shines because the loser simply gets a retryable error instead of waiting on a contended lock. This is the deliberate inverse of the search tier: <strong>partition consistency by path</strong> — relax it where reads dominate, enforce it where money and real-world allocation are at stake.</p>
+<div class="callout warn"><strong>Gotcha:</strong> Don't try to enforce no-double-booking purely in application code across multiple servers — without a single point of truth (the DB transaction/constraint), concurrent app instances will still collide. Let the database be the referee.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What's the exact condition for two date ranges overlapping?</summary><p>[aStart, aEnd) and [bStart, bEnd) overlap iff <code>aStart &lt; bEnd AND bStart &lt; aEnd</code>. Using half-open intervals lets a guest check out on the same day another checks in without a false conflict.</p></details>
+  <details><summary>How do you prevent two guests booking the same listing for the same nights?</summary><p>Make the overlap check and the booking insert atomic: do them in one DB transaction with a row lock (SELECT ... FOR UPDATE), or rely on a database exclusion/unique constraint that rejects overlapping ranges. Never check-then-write as two separate, racy steps.</p></details>
+  <details><summary>Why separate the search index from the bookings database?</summary><p>They have different jobs. The bookings DB needs ACID transactions for consistency; search needs fast geo and ranking queries. A dedicated search engine, updated asynchronously, serves reads well without burdening the transactional store.</p></details>
+  <details><summary>Search and booking have different consistency requirements — explain.</summary><p>Search can be eventually consistent: a momentarily stale listing is acceptable. Booking must be strongly consistent: a double-booking is a real-world failure. You design each path to its own requirement rather than forcing one model on both.</p></details>
+  <details><summary>How do you make geo + date search fast at scale?</summary><p>Use a spatial index (geohash/quadtree) so "near these coordinates" is a prefix/range lookup, and apply the most selective filter (usually geo) first to shrink the candidate set before running the cheaper availability check and ranking.</p></details>
+  <details><summary>Walk me through the exact sequence of a booking that prevents a double-book.</summary><p>Begin a transaction on the Bookings DB; <code>SELECT ... FOR UPDATE</code> on the listing's rows to take a row lock; run the overlap check inside the lock; if clear, insert the booking and commit (releasing the lock). A competing request for the same listing blocks at the <code>FOR UPDATE</code> until commit, then sees the new row and is rejected. Check and write are one atomic unit.</p></details>
+  <details><summary>Why can the booking path afford strong consistency when the search path can't?</summary><p>Because of volume and locality. Bookings are rare (hundreds/sec) and the lock only serializes the same listing, so the cost of strong consistency is tiny and contention is local. Search is tens of thousands of QPS and read-only, so forcing it through a transactional store would be far too expensive — you partition consistency by path.</p></details>
+</div>

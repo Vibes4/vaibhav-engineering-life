@@ -1,0 +1,106 @@
+<h1>How Bluesky Works <span class="tag express">Case Study</span></h1>
+<p>Bluesky is a social network, but unlike Twitter your data and your feed are <strong>not</strong> owned by one company. It runs on the <strong>AT Protocol</strong>: your posts live in a portable <em>repository</em> you own, identified by a <strong>DID</strong>, and the algorithm that builds your timeline is a swappable plug-in called a <strong>feed generator</strong> that anyone can write. The interesting problem is making a social graph work when no single server owns everything.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 250" role="img" aria-label="Bluesky AT Protocol architecture: a user's PDS emits records into the relay firehose, which feeds the App View index and pluggable feed generators that serve ranked references to the client; a third-party feed generator also subscribes to the firehose">
+    <defs>
+      <marker id="arr-bluesky" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="16" y="92" width="124" height="56" rx="9"></rect>
+    <text class="lbl" x="78" y="114" text-anchor="middle">PDS</text>
+    <text class="sub" x="78" y="132" text-anchor="middle">your data repo</text>
+
+    <rect class="box" x="196" y="92" width="140" height="56" rx="9"></rect>
+    <text class="lbl" x="266" y="114" text-anchor="middle">Relay / Firehose</text>
+    <text class="sub" x="266" y="132" text-anchor="middle">event stream</text>
+
+    <rect class="box" x="394" y="20" width="150" height="50" rx="9"></rect>
+    <text class="lbl" x="469" y="42" text-anchor="middle">App View</text>
+    <text class="sub" x="469" y="60" text-anchor="middle">index / counts</text>
+
+    <rect class="box-accent" x="394" y="100" width="150" height="56" rx="9"></rect>
+    <text class="lbl" x="469" y="123" text-anchor="middle">Feed Generators</text>
+    <text class="sub" x="469" y="141" text-anchor="middle">pluggable feeds</text>
+
+    <rect class="box" x="394" y="186" width="200" height="48" rx="9"></rect>
+    <text class="lbl" x="494" y="208" text-anchor="middle">3rd-party feed generator</text>
+    <text class="sub" x="494" y="225" text-anchor="middle">anyone can run one</text>
+
+    <rect class="box" x="600" y="100" width="104" height="56" rx="9"></rect>
+    <text class="lbl" x="652" y="124" text-anchor="middle">Client</text>
+    <text class="sub" x="652" y="142" text-anchor="middle">app</text>
+
+    <line class="edge" x1="140" y1="120" x2="190" y2="120" marker-end="url(#arr-bluesky)"></line>
+    <text class="cap" x="165" y="112" text-anchor="middle">emit</text>
+
+    <line class="edge" x1="336" y1="112" x2="388" y2="48" marker-end="url(#arr-bluesky)"></line>
+    <text class="cap" x="378" y="78" text-anchor="middle">index</text>
+
+    <line class="edge" x1="336" y1="124" x2="388" y2="126" marker-end="url(#arr-bluesky)"></line>
+    <text class="cap" x="362" y="118" text-anchor="middle">subscribe</text>
+
+    <line class="edge-dash" x1="300" y1="148" x2="430" y2="182" marker-end="url(#arr-bluesky)"></line>
+    <text class="cap" x="340" y="178" text-anchor="middle">subscribe (3rd party)</text>
+
+    <line class="edge" x1="544" y1="128" x2="594" y2="128" marker-end="url(#arr-bluesky)"></line>
+    <text class="cap" x="569" y="120" text-anchor="middle">post refs</text>
+  </svg>
+  <div class="diagram-cap">Figure: storage (PDS), aggregation (relay/firehose), and ranking (feed generators) are separate pieces; the dashed edge shows any third party subscribing to the same open firehose.</div>
+</div>
+
+<h2>Requirements</h2>
+<ul>
+  <li><strong>Functional:</strong> post, follow, like; build a home timeline; let users <strong>choose</strong> among many feed algorithms; portable identity so users can move servers without losing followers.</li>
+  <li><strong>Non-functional:</strong> decentralised (no single owner), federated across servers, account portability, and an open <strong>firehose</strong> of all events others can build on.</li>
+</ul>
+
+<h2>The building blocks: DIDs, repos, PDS</h2>
+<ul>
+  <li><strong>DID (Decentralised Identifier):</strong> your permanent, server-independent user id (e.g. <code>did:plc:abc123</code>). Your human handle (<code>@vibhav.bsky.social</code>) can change; the DID never does. This is what makes identity portable.</li>
+  <li><strong>Repository (repo):</strong> a signed, append-only collection of <em>your</em> records — posts, likes, follows. You own it. Think a personal git repo for your social data.</li>
+  <li><strong>PDS (Personal Data Server):</strong> the server that hosts your repo. You can host your own or use Bluesky's; either way the data is portable because it is keyed by your DID, not by the server.</li>
+</ul>
+
+<h2>The core problem: building a timeline without owning the data</h2>
+<p>If everyone's data lives in their own repo on different servers, how do you build one timeline? AT Protocol's answer is to <strong>separate storage from views</strong>. PDSes emit every new record into a public <strong>firehose</strong> — a real-time stream of all events across the network. Anyone can consume the firehose, index it, and compute views from it.</p>
+<table>
+  <tr><th>Centralised (Twitter)</th><td>One company owns posts, the graph, and the ranking algorithm. Simple and fast, but you cannot leave with your followers or change how the feed ranks.</td></tr>
+  <tr><th>Federated (AT Protocol)</th><td>Storage (PDS), aggregation (firehose), and ranking (feed generators) are separate, independently runnable pieces. Portable and open, but you must reassemble a global view from many sources.</td></tr>
+</table>
+
+<h2>Step-by-step request flow</h2>
+<ol>
+  <li>A user writes a post; it is signed and appended to their repo on their <strong>PDS</strong>, which immediately <strong>emits</strong> the new record onto the <strong>Relay/Firehose</strong>.</li>
+  <li>The <strong>Relay</strong> aggregates events from many PDSes into one ordered public stream — millions of events per day flowing as a continuous WebSocket the whole network can tap.</li>
+  <li>The <strong>App View</strong> subscribes and indexes the firehose into query-friendly stores (who-follows-whom, like and reply counts) so profiles and posts hydrate fast.</li>
+  <li>A <strong>Feed Generator</strong> also subscribes to the firehose and maintains its own ranked index for a named feed (e.g. <em>Cat Pics</em>).</li>
+  <li>When the <strong>Client</strong> opens that feed, it calls the generator, which returns a page of <strong>post refs</strong> (URIs) — not content.</li>
+  <li>The Client hydrates those URIs into full posts via the App View / the owning repos, so post content stays authoritative in its owner's PDS.</li>
+  <li>Independently, a <strong>3rd-party feed generator</strong> subscribes to the very same firehose (dashed edge) and can publish a competing feed without any permission from or coordination with Bluesky.</li>
+</ol>
+
+<h2>Feed generators: pluggable algorithms</h2>
+<p>A <strong>feed generator</strong> is a small service that consumes the firehose and returns a ranked list of post ids for a given feed. Bluesky's app asks the generator "give me the next slice of <em>Cat Pics</em>" and hydrates the returned ids into full posts. Because feeds are just services, <strong>users pick their algorithm</strong> instead of being stuck with one. This is the demo: the same pool of posts, run through two different generators, produces two different timelines.</p>
+<div class="callout tip"><strong>Senior tip:</strong> The clever decoupling is that a feed generator only returns <em>references</em> (post URIs), not post content. The client hydrates them. This keeps generators cheap and stateless-ish, lets any third party build a feed without copying everyone's data, and keeps post content authoritative in the owner's repo.</div>
+
+<h2>Identity and portability under the hood</h2>
+<p>Because every record is signed and addressed by DID, you can move your whole repo to a new PDS and your followers still resolve to you — they follow your DID, not a URL. Moving servers on Twitter is impossible; on AT Protocol it is a data migration. This is the practical payoff of decentralised identity.</p>
+<div class="callout warn"><strong>Gotcha:</strong> A pluggable, open firehose means feed generators see <em>everything</em> and ranking is not centrally controlled. So spam filtering, moderation, and labelling have to be separate composable services (labelers) layered on top — you cannot assume the platform pre-filtered the stream for you.</div>
+
+<h2>Scaling the view layer</h2>
+<p>Reading the raw firehose per user would not scale, so Bluesky runs an <strong>App View</strong>: a big aggregator that indexes the firehose into query-friendly stores (who-follows-whom, post counts, like counts) so feeds and profiles load fast. Storage stays decentralised; the heavy read indexes are a cache/materialised view that anyone could, in principle, rebuild from the firehose.</p>
+<p><strong>Why a shared firehose plus per-consumer indexes:</strong> the network already pushes well over 100M events/day, and every read — a timeline scroll, a profile open, a feed page — would otherwise have to scan the raw stream, which is hopeless. Instead the firehose is a single ordered write-side channel (one producer-side fan-out), and each consumer (App View, each feed generator) builds <em>its own</em> read-optimised index sized to its query pattern. This is classic CQRS: one event log, many materialised views. The payoff is independent scaling — a viral feed generator can shard and cache however it likes without touching the App View or anyone's PDS — and the firehose stays a thin, replayable backbone rather than a database everyone queries directly. A consumer that falls behind simply resumes from its last cursor on the ordered stream, so backpressure is local, not global.</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What problem does a DID solve that a username does not?</summary><p>A username/handle is mutable and tied to a server. A DID is a permanent, server-independent identifier, so your identity, posts, and followers survive a handle change or a move to a different server. Followers follow your DID, not a URL, which is what makes accounts portable.</p></details>
+  <details><summary>How can you build one timeline when everyone's data is on different servers?</summary><p>AT Protocol separates storage from views. Each PDS emits records into a public firehose; aggregators and feed generators consume that stream and compute views. The timeline is a materialised view assembled from many independent repos rather than a single owned database.</p></details>
+  <details><summary>What is a feed generator and why does it matter?</summary><p>It is a service that consumes the firehose and returns a ranked list of post references for a named feed. Because ranking is a swappable external service, users choose their own algorithm instead of being locked into the platform's one feed. Different generators over the same posts yield different timelines.</p></details>
+  <details><summary>Why do feed generators return post URIs instead of full posts?</summary><p>Returning only references keeps generators lightweight and avoids copying everyone's content. The client hydrates the URIs into full posts from the authoritative repos. This decoupling lets any third party build a feed cheaply while post content stays owned by its author.</p></details>
+  <details><summary>If the firehose is open and unfiltered, how is moderation handled?</summary><p>Moderation is composable rather than baked into storage. Separate labeler services annotate content (spam, NSFW, abuse) and clients/feed generators apply those labels. You cannot assume the stream is pre-filtered, so filtering is layered on top as its own pluggable service.</p></details>
+  <details><summary>How does a third party build a feed without Bluesky's permission?</summary><p>The firehose is a public ordered event stream. A third-party feed generator simply subscribes to it (the dashed edge in the diagram), builds its own ranked index, and exposes an endpoint that returns post URIs. The client can register that feed and hydrate the refs itself. No data is copied from anyone's PDS and no coordination with Bluesky is required.</p></details>
+  <details><summary>Why is a shared firehose with per-consumer indexes better than one central database?</summary><p>It is CQRS at network scale: one ordered write-side log, many independent read-side materialised views. With 100M+ events/day, having every read scan the raw stream is hopeless, so each consumer builds an index sized to its own query pattern and scales independently. A consumer that lags just resumes from its last cursor, keeping backpressure local instead of degrading the whole system.</p></details>
+</div>

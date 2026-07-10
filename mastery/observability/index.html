@@ -1,0 +1,326 @@
+<h1>Observability <span class="tag express">Mastery</span></h1>
+<p>Observability is the property that lets you ask <em>arbitrary new questions</em> about a running system from its telemetry — without shipping new code — so you can debug the failures you never anticipated. It is built on high-cardinality, high-dimensionality data across three pillars: metrics, logs, and traces.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Monitoring answers known-unknowns — I pre-decide the dashboard and alert on thresholds I already thought of. Observability lets me answer <em>unknown-unknowns</em>: I emit wide, high-cardinality events and can slice them by user, region, build SHA, or endpoint at query time to explain a novel failure. Three pillars — metrics for cheap aggregate trends, structured logs for detailed events, distributed traces for causality across services — all stitched by a shared trace ID so I can pivot metric → trace → log and cut MTTR."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The control-theory root: a system is observable if you can infer its internal state from its outputs. In practice that means emitting enough telemetry that a novel question ("why is p99 latency 3s only for Android users in Mumbai on build 4a2f?") is answerable from stored data alone.</p>
+<ul>
+<li><strong>Metrics</strong> — numeric time series, pre-aggregated, cheap to store (a few bytes/sample). Types: <em>counter</em> (monotonic, use <code>rate()</code>), <em>gauge</em> (up/down), <em>histogram</em> (bucketed, server computes percentiles via <code>histogram_quantile</code>), <em>summary</em> (client-computed quantiles, not aggregatable). Great for trends and alerting, terrible for high cardinality.</li>
+<li><strong>Logs</strong> — discrete events, ideally structured JSON with levels and a <code>trace_id</code>. Rich but expensive; sampled and retention-capped. Aggregated in ELK/OpenSearch or Loki (index labels only).</li>
+<li><strong>Traces</strong> — a tree of spans across services, tied by W3C <code>traceparent</code> context propagation. Show causality and where latency actually goes. OpenTelemetry SDK + Collector + OTLP is the standard; backends are Jaeger/Tempo/Grafana.</li>
+</ul>
+<p>On top: <strong>SLIs/SLOs/error budgets</strong> drive alerting via multi-window multi-burn-rate rules, and you alert on <em>symptoms</em> (the four golden signals: latency, traffic, errors, saturation) not causes. <strong>Exemplars</strong> link a metric bucket directly to a sample trace, so a latency spike on a dashboard is one click from the exact slow request.</p>
+
+<h2>Internal Working</h2>
+<ol>
+<li><strong>Instrumentation.</strong> Code emits telemetry via an SDK. Auto-instrumentation monkey-patches libraries (HTTP client/server, DB drivers, gRPC) to create spans and metrics; manual instrumentation adds custom spans and business attributes.</li>
+<li><strong>Context creation.</strong> On an inbound request with no context, the SDK generates a 16-byte <code>trace_id</code> and 8-byte <code>span_id</code>, builds a root span, and stores it in a context object (Node.js AsyncLocalStorage, Java ThreadLocal / Context).</li>
+<li><strong>Propagation.</strong> Outbound calls inject <code>traceparent: 00-{trace_id}-{span_id}-{flags}</code> and <code>tracestate</code> headers (W3C Trace Context). The downstream service extracts them and makes its root span a child — this is how the tree links across process boundaries.</li>
+<li><strong>Metric aggregation.</strong> Counters/gauges/histograms live in-process. A histogram increments the bucket <code>le</code> (less-than-or-equal) counter plus <code>_sum</code> and <code>_count</code>. Prometheus later computes <code>histogram_quantile(0.99, rate(http_req_bucket[5m]))</code> by interpolating within buckets.</li>
+<li><strong>Collection.</strong> Prometheus <em>pulls</em> <code>/metrics</code> every <code>scrape_interval</code> (typically 15s) from targets found via service discovery (Kubernetes SD, Consul, EC2). Traces/logs are <em>pushed</em> over OTLP/gRPC to an OpenTelemetry Collector.</li>
+<li><strong>Processing/sampling.</strong> The Collector batches, enriches (adds k8s resource attributes), and samples. Head-based sampling decides at the root; tail-based sampling buffers a whole trace and keeps it if any span errored or was slow.</li>
+<li><strong>Storage.</strong> Metrics → TSDB (Prometheus/Mimir/Thanos) with delta-of-delta + XOR compression (~1.3 bytes/sample). Traces → Tempo/Jaeger (object storage, indexed by trace_id). Logs → Loki (label index + compressed chunks) or Elasticsearch (inverted index).</li>
+<li><strong>Correlation & query.</strong> Grafana/PromQL/LogQL/TraceQL query the stores. Exemplars and shared trace_id let you pivot: alert fires on a metric → jump to exemplar trace → open the error log line by trace_id.</li>
+</ol>
+
+<h2>Why was this built?</h2>
+<p>In monoliths, a single stack trace and one host's logs explained almost any failure. Microservices broke that: one user request fans out to 20+ services across pods that are rescheduled every few minutes, so there is no single log file and no single stack trace. Aggregate CPU dashboards ("the box is fine") coexisted with users seeing 500s.</p>
+<ul>
+<li><strong>Before:</strong> Nagios/Zabbix host checks, grep over SSH, per-service Munin graphs, and static threshold alerts that fired on causes ("CPU &gt; 80%") producing pager fatigue.</li>
+<li><strong>The shift:</strong> Google's Dapper (2010) introduced distributed tracing; Prometheus (2012, ex-Borgmon) brought dimensional metrics + pull; the SRE book codified SLOs/error budgets; Honeycomb popularized high-cardinality wide events. OpenTelemetry (2019, merging OpenTracing + OpenCensus) unified the SDKs and wire format so instrumentation is vendor-neutral.</li>
+</ul>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Approach</th><th>What it gives</th><th>When it wins</th><th>Why observability beats it</th></tr>
+<tr><td>Host monitoring (Nagios/Zabbix)</td><td>Up/down checks, host metrics</td><td>Small fleets, infra health</td><td>No request-level causality, no high cardinality</td></tr>
+<tr><td>APM-only (single vendor agent)</td><td>Auto traces + metrics</td><td>Fast start, one language stack</td><td>Vendor lock-in, sampling black box, weak custom cardinality</td></tr>
+<tr><td>Logs-only (grep/ELK)</td><td>Full detail</td><td>Forensic deep dives</td><td>Expensive at scale, no cheap trends, hard to aggregate</td></tr>
+<tr><td>Metrics-only (Graphite)</td><td>Cheap trends, alerting</td><td>Capacity, SLOs</td><td>Cardinality limits kill per-user/per-request slicing</td></tr>
+<tr><td>OpenTelemetry + backends</td><td>All three pillars, correlated</td><td>Microservices at scale</td><td>This is the union — vendor-neutral, pivotable</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "The pillars aren't competitors — the win is correlation. Metrics tell me <em>something</em> is wrong cheaply, traces tell me <em>where</em>, logs tell me <em>why</em>. OTel makes instrumentation portable so the backend is a swappable decision."</div>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Answer unknown-unknowns</strong> at query time — no redeploy to add a new breakdown dimension.</li>
+<li><strong>MTTR collapse</strong> — metric → exemplar trace → log pivot turns a 2-hour hunt into minutes.</li>
+<li><strong>Vendor neutrality</strong> via OpenTelemetry: instrument once, export to Prometheus/Tempo/Datadog/Honeycomb without code changes.</li>
+<li><strong>SLO-driven ops</strong> — error budgets convert reliability into a shared, quantified decision instead of gut feel.</li>
+<li><strong>High cardinality</strong> lets you isolate the one bad tenant, build, or region among millions.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>Cost.</strong> Telemetry can rival or exceed compute cost; logs and high-cardinality metrics are the usual budget-eaters.</li>
+<li><strong>Cardinality explosion.</strong> One unbounded label (user_id, URL with IDs) multiplies time series and can OOM Prometheus.</li>
+<li><strong>Sampling trade-off.</strong> Traces are usually sampled, so the one failing request you need may not be stored (mitigated by tail-based sampling).</li>
+<li><strong>Instrumentation drift.</strong> Inconsistent attribute names across teams make cross-service queries painful.</li>
+<li><strong>Alert fatigue.</strong> Too many cause-based alerts train engineers to ignore the pager.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<table>
+<tr><th>Axis</th><th>Option A</th><th>Option B</th></tr>
+<tr><td>Metric percentiles</td><td>Histogram (aggregatable, buckets fixed up front)</td><td>Summary (accurate quantiles, not aggregatable across instances)</td></tr>
+<tr><td>Trace sampling</td><td>Head-based (cheap, decided early, may miss errors)</td><td>Tail-based (keeps errors/slow, needs buffering + more Collector RAM)</td></tr>
+<tr><td>Log storage</td><td>Loki (index labels only, cheap, grep-style)</td><td>Elasticsearch (full inverted index, fast search, costly)</td></tr>
+<tr><td>Collection</td><td>Pull (Prometheus — SD, target health free)</td><td>Push (OTLP — works for batch/serverless/short-lived)</td></tr>
+<tr><td>Cardinality</td><td>High (rich debugging, costly storage)</td><td>Low (cheap, blunt)</td></tr>
+</table>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't put unbounded values (<code>user_id</code>, <code>request_id</code>, raw URLs, timestamps, full emails) in <em>metric labels</em> — that's a cardinality bomb; put them in trace/log attributes instead. Don't run full tail-based sampling on a low-traffic single service — head-based at 100% is simpler. Don't build a bespoke agent-based tracing framework when OpenTelemetry auto-instrumentation covers your stack. Don't alert on every cause (CPU, memory, GC); alert on user-facing symptoms tied to SLOs. Don't log at DEBUG in prod for high-QPS paths — it will dominate your bill and can add latency.</div>
+
+<h2>Production Architecture</h2>
+<p>A typical Kubernetes deployment: apps auto-instrumented with OTel SDKs push OTLP to a per-node Collector agent (DaemonSet), which forwards to a gateway Collector pool that does tail-based sampling and fan-out. Metrics are scraped by Prometheus (or pushed via OTLP to Mimir); traces go to Tempo; logs to Loki. Grafana is the single query pane, wiring exemplars and trace_id links across all three.</p>
+<pre class="mermaid">
+flowchart LR
+  App["App pods with OTel SDK"] -->|OTLP| Agent["Collector agent DaemonSet"]
+  Agent -->|OTLP| GW["Collector gateway pool"]
+  Prom["Prometheus"] -->|scrape metrics| App
+  GW -->|traces| Tempo["Tempo traces"]
+  GW -->|logs| Loki["Loki logs"]
+  Prom --> Mimir["Mimir long term TSDB"]
+  Grafana["Grafana"] --> Mimir
+  Grafana --> Tempo
+  Grafana --> Loki
+  Alert["Alertmanager"] --> Prom
+</pre>
+<p>The gateway Collector is the sampling and enrichment choke point: it buffers spans per trace_id, applies tail policies (keep-on-error, latency threshold, probabilistic base rate), attaches k8s resource attributes, and drops noisy telemetry before it hits paid storage. Prometheus stays pull for scrape-health signals; everything else is push.</p>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>Cardinality blow-up:</strong> a new label with per-request values takes Prometheus from 1M to 50M series, RSS spikes, OOMKilled, alerting goes blind during an incident.</li>
+<li><strong>Broken trace propagation:</strong> one service (often a legacy or third-party hop) drops <code>traceparent</code>, so traces fragment into disconnected halves and you can't follow the request.</li>
+<li><strong>Collector backpressure:</strong> trace volume exceeds gateway throughput; OTLP queue fills, spans are dropped silently, and you lose exactly the incident traffic.</li>
+<li><strong>Log cost runaway:</strong> a DEBUG line in a hot loop or a stack trace on every request 10x's log volume and blows the retention budget overnight.</li>
+<li><strong>Clock skew:</strong> unsynced node clocks make child spans appear to start before parents; trace waterfalls look nonsensical.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Prometheus: find the label eating your cardinality
+topk(10, count by (__name__)({__name__=~".+"}))
+# per-metric series count
+count({__name__="http_requests_total"})
+
+# Check scrape health &amp; target discovery
+curl -s localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job, health, lastError}'
+curl -s localhost:9090/metrics | grep prometheus_tsdb_head_series
+
+# Verify trace propagation on the wire
+curl -v https://svc/api 2&gt;&amp;1 | grep -i traceparent
+
+# OTel Collector health &amp; drops
+curl -s localhost:8888/metrics | grep -E "otelcol_(processor_dropped|exporter_send_failed|receiver_refused)"
+
+# Loki: find the noisiest stream
+logcli series '{namespace="prod"}' --analyze-labels
+
+# Continuous profiling — capture a 30s CPU profile
+go tool pprof -http=:8080 http://svc:6060/debug/pprof/profile?seconds=30
+</code></pre>
+<p>Signals to read: <code>prometheus_tsdb_head_series</code> (cardinality), <code>otelcol_processor_dropped_spans</code> (sampling/backpressure loss), <code>otelcol_exporter_send_failed_spans</code>, scrape <code>up</code> gauge, and per-service RED metrics.</p>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>Means</th><th>Healthy / alert threshold</th></tr>
+<tr><td><code>prometheus_tsdb_head_series</code></td><td>Active time series in memory</td><td>Alert if growth &gt; 20%/day or nearing host RAM limit</td></tr>
+<tr><td><code>up</code></td><td>Scrape target reachable</td><td>1 = healthy; alert if 0 for &gt; 2 scrape intervals</td></tr>
+<tr><td><code>scrape_duration_seconds</code></td><td>Time to pull /metrics</td><td>&lt; scrape_interval; alert if &gt; 80% of interval</td></tr>
+<tr><td><code>otelcol_processor_dropped_spans</code></td><td>Spans lost in Collector</td><td>0; any sustained &gt; 0 is a red flag</td></tr>
+<tr><td><code>otelcol_exporter_queue_size</code></td><td>Backpressure at exporter</td><td>Well below capacity; alert near queue max</td></tr>
+<tr><td>SLO burn rate</td><td>Error-budget consumption speed</td><td>Page at 14.4x (1h/5m windows); ticket at 1x</td></tr>
+<tr><td>p99 latency (RED)</td><td>Tail user experience</td><td>Against SLO; e.g. &lt; 300ms</td></tr>
+<tr><td>Ingestion cost / GB</td><td>Telemetry spend</td><td>Track weekly; alert on step change</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>Metrics scale via federation and sharding: Prometheus stays single-node per shard, then Thanos/Mimir/Cortex provide global query, long-term object storage, downsampling, and horizontal ingest. Traces scale by pushing sampling to a stateless gateway tier and storing in object storage (Tempo). Logs scale by indexing only labels (Loki) instead of full text.</p>
+<pre class="mermaid">
+flowchart TD
+  A["App fleet"] --> B1["Prometheus shard 1"]
+  A --> B2["Prometheus shard 2"]
+  B1 --> C["Thanos or Mimir query layer"]
+  B2 --> C
+  C --> D["Object storage S3 with downsampling"]
+  C --> E["Grafana global view"]
+</pre>
+<ul>
+<li><strong>Vertical first:</strong> Prometheus handles millions of series on one box before you shard.</li>
+<li><strong>Functional sharding:</strong> split scrape jobs by team/namespace via hashmod relabeling.</li>
+<li><strong>Downsampling:</strong> keep raw for 15d, 5m-resolution for 90d, 1h for a year — cuts storage 10-100x.</li>
+<li><strong>Collector autoscaling:</strong> HPA the gateway pool on queue size and CPU; tail sampling needs enough RAM to buffer full traces.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+<li><strong>PII leakage:</strong> emails, tokens, card numbers end up in logs/span attributes. Mitigate with Collector <code>redaction</code>/<code>attributes</code> processors and log scrubbers; enforce in review.</li>
+<li><strong>Transport:</strong> OTLP over TLS/mTLS; Prometheus scrape with bearer tokens or mTLS; never expose <code>/metrics</code> publicly (it leaks internal topology and versions).</li>
+<li><strong>Multi-tenancy:</strong> enforce tenant isolation (Mimir/Loki X-Scope-OrgID) so one team can't query another's data.</li>
+<li><strong>Access control:</strong> RBAC on Grafana; traces can contain sensitive request payloads.</li>
+<li><strong>DoS via cardinality:</strong> a malicious or buggy client can inflate labels — enforce label limits and rate-limit ingest.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>Instrumentation overhead:</strong> OTel SDK adds ~1-5% CPU with auto-instrumentation; a span is on the order of hundreds of ns to create in-process. Batch exporters, don't block the request path.</li>
+<li><strong>Cardinality is the dominant cost:</strong> Prometheus memory ≈ ~3KB per active series; 5M series ≈ ~15GB+ RSS. Cut it by dropping high-card labels via relabeling.</li>
+<li><strong>Scrape tuning:</strong> 15s interval is standard; drop to 30-60s for large fleets. <code>scrape_timeout</code> must be &lt; interval.</li>
+<li><strong>Histogram buckets:</strong> too many buckets = cardinality × buckets; native/exponential histograms (Prometheus 2.40+) give better resolution at lower cost.</li>
+<li><strong>Log throughput:</strong> async, batched, non-blocking log appenders; structured JSON serialization is cheaper to parse downstream than regex over free text.</li>
+<li><strong>Sampling for throughput:</strong> at 100k+ traces/s, tail sampling to ~1-10% keeps storage sane while preserving all errors.</li>
+</ul>
+<div class="callout tip"><strong>Say this:</strong> "The number I watch is active series and RSS on Prometheus, and dropped_spans on the Collector. Those two tell me if observability itself is about to fail during an incident."</div>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>High-cardinality metric labels.</strong> Fix: move IDs to trace/log attributes; keep metric labels bounded (status, method, route template not raw path).</li>
+<li><strong>Alerting on causes, not symptoms.</strong> Fix: alert on golden signals + SLO burn; make CPU/memory diagnostic dashboards, not pages.</li>
+<li><strong>Unstructured logs.</strong> Fix: JSON with consistent keys and a <code>trace_id</code> on every line.</li>
+<li><strong>Averages instead of percentiles.</strong> Fix: histograms + <code>histogram_quantile</code>; the mean hides the tail.</li>
+<li><strong>Head sampling that drops errors.</strong> Fix: tail-based keep-on-error policy.</li>
+<li><strong>No trace_id in logs.</strong> Fix: inject it via logging framework MDC/formatter so you can pivot trace ↔ log.</li>
+<li><strong>Summary metrics across replicas.</strong> Fix: never average quantiles; use histograms which aggregate correctly.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they likely use it</th></tr>
+<tr><td>Google</td><td>Origin of Dapper (tracing), Borgmon → Monarch (metrics), and the SRE SLO/error-budget model; internal high-cardinality telemetry across Borg.</td></tr>
+<tr><td>Amazon</td><td>CloudWatch metrics/logs + X-Ray tracing; internally per-service dashboards and tight per-team operational metrics; likely OTel adoption for AWS Distro (ADOT).</td></tr>
+<tr><td>Netflix</td><td>Atlas (dimensional TSDB), Mantis for real-time streaming ops, and heavy use of RED-style service metrics; likely per-request tracing across their microservice mesh.</td></tr>
+<tr><td>Uber</td><td>Built M3 (metrics platform) and Jaeger (tracing, later donated to CNCF); massive-scale trace propagation across thousands of services.</td></tr>
+<tr><td>Swiggy</td><td>Likely Prometheus/Grafana + distributed tracing to debug order → restaurant → delivery latency across the fulfillment pipeline; SLOs on order-placement success.</td></tr>
+<tr><td>PhonePe</td><td>Likely metrics + tracing on the payments path with strict SLOs on transaction success and latency; high-cardinality per-merchant/per-bank breakdowns for debugging.</td></tr>
+<tr><td>Razorpay</td><td>Likely OTel-based tracing across payment gateway hops (bank, network, PG) with exemplars to debug failed transactions; error-budget-driven alerting on settlement.</td></tr>
+<tr><td>Atlassian</td><td>Likely large-scale metrics + tracing across Jira/Confluence multi-tenant cloud; per-tenant SLOs and cardinality control to isolate a noisy tenant.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What's the difference between monitoring and observability?
+  <ol><li>Answer pointer: known-unknowns/pre-set dashboards vs unknown-unknowns/query-time slicing of high-cardinality data.</li></ol></li>
+<li>Name the three pillars and when each is the right tool.
+  <ol><li>Metrics for cheap trends/alerts, traces for cross-service causality, logs for detailed why.</li></ol></li>
+<li>Counter vs gauge vs histogram vs summary?
+  <ol><li>Monotonic vs up-down vs server-side percentiles via buckets vs client-side quantiles (not aggregatable).</li></ol></li>
+<li>How does <code>histogram_quantile</code> actually work?
+  <ol><li>Linear interpolation within the bucket that crosses the target rank of cumulative <code>le</code> counts.</li></ol></li>
+<li>Why is a histogram aggregatable but a summary is not?
+  <ol><li>Bucket counts add across instances; precomputed quantiles cannot be averaged meaningfully.</li></ol></li>
+<li>What is cardinality explosion and how do you contain it?
+  <ol><li>labels × values multiply series; drop unbounded labels via relabeling, use route templates, native histograms.</li></ol></li>
+<li>Pull vs push collection — trade-offs?
+  <ol><li>Pull gives target health + SD for free; push needed for batch/serverless/short-lived jobs.</li></ol></li>
+<li>How does trace context propagate across services?
+  <ol><li>W3C <code>traceparent</code>/<code>tracestate</code> headers injected/extracted by the SDK; child span links to parent span_id.</li></ol></li>
+<li>Head-based vs tail-based sampling?
+  <ol><li>Decide at root (cheap, may miss errors) vs buffer whole trace and keep-on-error/slow (costly RAM).</li></ol></li>
+<li>What are RED and USE?
+  <ol><li>RED = Rate/Errors/Duration for services; USE = Utilization/Saturation/Errors for resources.</li></ol></li>
+<li>What are the four golden signals?
+  <ol><li>Latency, traffic, errors, saturation — the symptom-level things to alert on.</li></ol></li>
+<li>Define SLI, SLO, SLA and error budget.
+  <ol><li>Measured indicator, internal target, contractual promise, and 1 minus SLO as spendable unreliability.</li></ol></li>
+<li>Explain multi-window multi-burn-rate alerting.
+  <ol><li>Fast page at 14.4x burn (1h+5m windows), slow ticket at 1x — balances speed vs false positives.</li></ol></li>
+<li>Why alert on symptoms not causes?
+  <ol><li>Causes are noisy and don't map to user pain; symptoms tie to SLOs and cut alert fatigue.</li></ol></li>
+<li>What is an exemplar?
+  <ol><li>A trace_id attached to a metric sample so a bucket links to a representative trace.</li></ol></li>
+<li>What does the OTel Collector do?
+  <ol><li>Receive (OTLP) → process (batch, sample, redact, enrich) → export; decouples app from backend.</li></ol></li>
+<li>How would you debug a fragmented trace?
+  <ol><li>Check <code>traceparent</code> on each hop, find the service dropping context, confirm SDK propagator config.</li></ol></li>
+<li>How do you scale Prometheus past one node?
+  <ol><li>Functional sharding + Thanos/Mimir for global query, long-term storage, downsampling.</li></ol></li>
+<li>How do the pillars cut MTTR together?
+  <ol><li>Metric alert → exemplar trace → log by trace_id: from "something's wrong" to root cause fast.</li></ol></li>
+<li>What is continuous profiling and when do you reach for it?
+  <ol><li>Always-on pprof/flame graphs to find CPU/alloc hotspots when traces show a slow span but not why.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>Microservices &amp; service mesh:</strong> "How does Istio/Envoy add tracing?" — sidecars propagate headers and emit spans, but you still must propagate context inside the app or the trace breaks at the process.</li>
+<li><strong>Reliability engineering:</strong> "How do error budgets change release policy?" — burn budget too fast → freeze features and invest in reliability.</li>
+<li><strong>Databases:</strong> "How do you observe a slow query?" — DB span with statement attributes + slow-query log correlated by trace_id.</li>
+<li><strong>Kubernetes:</strong> "How does service discovery feed Prometheus?" — kubernetes_sd + relabel_configs to select pods and rewrite labels.</li>
+<li><strong>Cost/FinOps:</strong> "Telemetry bill doubled — what do you cut?" — logs first (sampling/retention), then metric cardinality, then trace sample rate.</li>
+<li><strong>Security:</strong> "How do you keep PII out of telemetry?" — Collector redaction processors + review + never log request bodies.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Prometheus OOMKilled during an incident</h3>
+<table>
+<tr><th>Symptoms</th><td>Alerting goes dark mid-incident; Prometheus pod restarts, RSS climbing, gaps in graphs.</td></tr>
+<tr><td>Investigation</td><td><code>prometheus_tsdb_head_series</code> spiked; <code>topk(10, count by (__name__)({__name__=~".+"}))</code> shows one metric with millions of series.</td></tr>
+<tr><td>Root Cause</td><td>A deploy added <code>user_id</code> (or raw URL with IDs) as a metric label — unbounded cardinality.</td></tr>
+<tr><td>Solution</td><td>Drop the label with a <code>metric_relabel_configs</code> action <code>labeldrop</code>; hotfix the instrumentation to move the ID to span attributes.</td></tr>
+<tr><td>Prevention</td><td>CI cardinality linting, label allow-lists, per-target series limits, native histograms.</td></tr>
+<tr><td>Interview Answer</td><td>"Cardinality is Prometheus's Achilles heel — I keep metric labels bounded, IDs go to traces/logs, and I alert on head_series growth so the monitor never dies during the outage."</td></tr>
+</table>
+
+<h3>Traces fragment across a service boundary</h3>
+<table>
+<tr><th>Symptoms</th><td>Trace waterfall stops at service B; downstream shows up as separate root traces.</td></tr>
+<tr><td>Investigation</td><td><code>curl -v</code> the hop and grep <code>traceparent</code>; it's missing on B's outbound calls.</td></tr>
+<tr><td>Root Cause</td><td>Service B uses a raw HTTP client not covered by auto-instrumentation, or a mismatched propagator (B3 vs W3C).</td></tr>
+<tr><td>Solution</td><td>Wrap the client with OTel instrumentation or manually inject context; standardize on the W3C propagator across the fleet.</td></tr>
+<tr><td>Prevention</td><td>Contract test that asserts <code>traceparent</code> survives each hop; shared base image with SDK preconfigured.</td></tr>
+<tr><td>Interview Answer</td><td>"Broken traces almost always mean a hop that didn't propagate context — I find the boundary where the header disappears and fix the propagator or instrument that client."</td></tr>
+</table>
+
+<h3>Collector dropping the exact incident traffic</h3>
+<table>
+<tr><th>Symptoms</th><td>During a spike, error traces you need are missing even though errors are happening.</td></tr>
+<tr><td>Investigation</td><td><code>otelcol_processor_dropped_spans</code> &gt; 0 and <code>otelcol_exporter_queue_size</code> at max on the gateway.</td></tr>
+<tr><td>Root Cause</td><td>Head-based sampling discarded errors, and the gateway is backpressured beyond queue capacity.</td></tr>
+<tr><td>Solution</td><td>Switch to tail-based sampling with keep-on-error + latency policy; scale the gateway HPA and raise queue/batch limits.</td></tr>
+<tr><td>Prevention</td><td>Capacity-plan the Collector for peak, autoscale on queue size, always keep 100% of error traces.</td></tr>
+<tr><td>Interview Answer</td><td>"I never let sampling throw away errors — tail-based keep-on-error plus an autoscaled gateway means the traffic I most need during an incident is exactly what's retained."</td></tr>
+</table>
+
+<h3>Alert fatigue — the pager is ignored</h3>
+<table>
+<tr><th>Symptoms</th><td>On-call gets 50 pages/night, most auto-resolve; real incidents get missed.</td></tr>
+<tr><td>Investigation</td><td>Audit alerts: most fire on causes (CPU, memory, single-pod restarts) not user symptoms.</td></tr>
+<tr><td>Root Cause</td><td>Threshold alerts on infra metrics that don't correlate with user pain.</td></tr>
+<tr><td>Solution</td><td>Delete cause alerts, replace with SLO multi-burn-rate alerts on golden signals; move causes to dashboards + runbooks.</td></tr>
+<tr><td>Prevention</td><td>Every page must be actionable and tied to an SLO; review alert-to-incident precision monthly.</td></tr>
+<tr><td>Interview Answer</td><td>"I alert on symptoms tied to SLOs with burn-rate windows, not on every CPU blip — that's how you keep the pager meaningful."</td></tr>
+</table>
+
+<h3>Log bill runaway overnight</h3>
+<table>
+<tr><th>Symptoms</th><td>Log storage cost doubles; ingestion pipeline lags, log search slows.</td></tr>
+<tr><td>Investigation</td><td><code>logcli series --analyze-labels</code> / index stats show one service's volume exploded; a DEBUG log in a hot loop.</td></tr>
+<tr><td>Root Cause</td><td>A debug line left enabled on a high-QPS path, emitting full stack traces per request.</td></tr>
+<tr><td>Solution</td><td>Revert to INFO, add dynamic log-level control, sample noisy loggers, cap retention on low-value streams.</td></tr>
+<tr><td>Prevention</td><td>Log-level policy in code review, budget alerts on ingest GB/day, per-namespace ingest quotas.</td></tr>
+<tr><td>Interview Answer</td><td>"Logs are the biggest and most volatile cost — I sample, cap retention by value, and alert on ingest volume so a stray DEBUG line can't blow the budget silently."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Walk me through exactly what happens from a metric alert to root cause.</summary><p>Alertmanager fires on an SLO burn-rate rule computed from a histogram (e.g. <code>histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))</code> breaching target). I open the Grafana panel; the p99 spike has an <em>exemplar</em> — a dot carrying a trace_id — so I click straight into Tempo and see the waterfall. The slow span is a DB call in service C. I take that trace_id and query Loki <code>{service="C"} | trace_id="..."</code> to find the log line with the actual statement and error. If the span shows CPU-bound time with no clear cause, I pull the continuous profile for that pod's window and read the flame graph. Metric → trace → log → profile: minutes, not hours.</p></details>
+  <details><summary>Why can't you average two services' summary quantiles, and what do you do instead?</summary><p>A summary computes quantiles client-side over a sliding window; the p99 of instance A and p99 of instance B have no mathematical relationship to the p99 of the combined stream — averaging them is statistically meaningless. Histograms store per-bucket counts, which are additive: sum the buckets across instances, then apply <code>histogram_quantile</code> on the aggregate. That's why fleet-wide percentiles require histograms. The cost is you must pick buckets up front (or use native/exponential histograms for automatic resolution).</p></details>
+  <details><summary>Design a tail-based sampling policy for a payments service.</summary><p>Keep 100% of traces with any error span, 100% above a latency threshold (say p99 target), and a low probabilistic base rate (1-5%) for the healthy majority. Add a policy to always keep specific high-value routes (settlement, refund). Buffer at the gateway Collector keyed by trace_id with a decision window (e.g. 5-10s) long enough for all spans to arrive. Size Collector RAM for peak in-flight traces × avg spans × span size. The point: you can throw away boring successful traffic but never the failures or slow requests, and you keep enough baseline to compute unbiased latency stats.</p></details>
+  <details><summary>How do you set up multi-window multi-burn-rate alerts for a 99.9% SLO?</summary><p>99.9% over 30 days = 0.1% error budget ≈ 43 minutes. A burn rate of 1 exhausts the budget exactly in 30 days. Page on <em>fast burn</em>: 14.4x over a 1h window AND a 5m short window (the short window prevents flapping and makes it recover fast) — that burns 2% of budget in an hour. Add a <em>slow burn</em> ticket: ~6x over 6h, and ~1x over 3d. Two severities: fast burn pages immediately (something is badly broken), slow burn opens a ticket (steady degradation). Requiring both a long and short window cuts false positives and false negatives.</p></details>
+  <details><summary>Your Prometheus is at 8M series and climbing. Walk me through the fix.</summary><p>First, find the offender: <code>topk(10, count by (__name__)({__name__=~".+"}))</code> and <code>count by (job)(...)</code>. Usually one label is unbounded. Immediate mitigation: <code>metric_relabel_configs</code> with <code>labeldrop</code>/<code>labelkeep</code> to strip it at scrape time, and per-target <code>sample_limit</code>. Structural fix: change instrumentation to use route templates not raw paths, move IDs to trace attributes, adopt native histograms to cut bucket cardinality. Long term: functional shard across multiple Prometheus by namespace and put Thanos/Mimir in front for global query and downsampled long-term storage. Guardrail: alert on <code>prometheus_tsdb_head_series</code> growth and add CI cardinality checks.</p></details>
+  <details><summary>Explain W3C Trace Context on the wire, byte by byte.</summary><p><code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</code>. Fields: <code>version</code> (00), 16-byte <code>trace-id</code> (32 hex), 8-byte parent <code>span-id</code> (16 hex), 1-byte <code>trace-flags</code> (01 = sampled). <code>tracestate</code> carries vendor-specific key-value pairs to survive multi-vendor hops. The receiving SDK extracts, sets its new span's parent to the incoming span-id, keeps the trace-id, and re-injects with its own span-id on the next outbound call. If a hop doesn't forward these headers, the trace fragments — that's the number-one cause of broken waterfalls.</p></details>
+  <details><summary>When would you choose Loki over Elasticsearch, and what do you give up?</summary><p>Loki indexes only labels and stores compressed log chunks in object storage, so ingestion and storage are cheap and it pairs naturally with Prometheus labels. You give up full-text inverted-index search speed — LogQL brute-force scans chunks matching the label selector, which is slower for needle-in-haystack queries over huge volumes. Choose Loki when logs are high-volume, cost-sensitive, and you mostly filter by known labels (namespace, service, trace_id). Choose Elasticsearch/OpenSearch when you need fast arbitrary full-text search and complex aggregations and can pay for the index.</p></details>
+  <details><summary>How does continuous profiling complement tracing?</summary><p>A trace tells you span X took 400ms; it rarely tells you <em>why</em> the CPU was busy inside it. Continuous profiling (pprof, Parca, Pyroscope, Grafana Phlare) samples stacks always-on at low overhead (~1-2%) and produces flame graphs you can slice to the incident window and even the pod. You see the exact function eating CPU or allocating. The frontier is linking a span to its profile via span context, so from a slow span you jump to the flame graph of that request. It closes the last gap: trace says where, profile says which line of code.</p></details>
+  <details><summary>How do you keep observability alive when the thing you're observing is falling over?</summary><p>Isolation: telemetry infra runs in a separate failure domain (own nodes/cluster), so an app outage doesn't take Prometheus with it. Non-blocking exporters and bounded queues so the app degrades telemetry, not requests, under load. Local Collector agents buffer and retry so a gateway blip doesn't lose data. Alert on the observability stack itself (<code>up</code>, head_series, dropped_spans) so you know when you're flying blind. And keep a minimal always-on low-cardinality metric set that survives even when high-card debugging telemetry is shed.</p></details>
+  <details><summary>What's the difference between auto and manual instrumentation, and where's the boundary?</summary><p>Auto-instrumentation hooks known libraries (HTTP, gRPC, DB drivers, message queues) via bytecode agents (Java) or monkey-patching (Node/Python) to emit spans and metrics with zero code changes. It gets you the request skeleton for free. Manual instrumentation adds business-meaningful spans and attributes — <code>order_id</code>, <code>tenant</code>, <code>payment_method</code>, cache hit/miss — which is what makes traces answer real questions. The rule: auto for plumbing, manual for domain semantics. Without manual attributes your traces show <em>where</em> time went but not <em>which</em> business case, so debugging stays coarse.</p></details>
+  <details><summary>Why is the pull model useful beyond just scraping numbers?</summary><p>Pull gives you a free liveness signal — the <code>up</code> metric per target — so a target that vanishes is instantly detectable, unlike push where silence is ambiguous (dead vs idle). Service discovery (kubernetes_sd, consul) means new pods are scraped automatically and relabeling normalizes their labels. It also centralizes scrape config and rate control on the monitoring side, so a runaway app can't flood you. The gap is short-lived jobs and serverless that die before a scrape — for those you push to a Pushgateway or use OTLP.</p></details>
+  <details><summary>An exemplar links a metric to a trace — how is it stored and surfaced?</summary><p>When recording a histogram observation, the SDK can attach the current trace_id as an exemplar to the specific bucket. Prometheus stores exemplars in a separate, size-limited store (they're not full samples). Grafana renders them as clickable dots on the graph at the timestamp/value, each carrying the trace_id that Grafana turns into a deep link to Tempo/Jaeger. So a latency spike on a panel is literally one click from a representative slow trace — that's the single biggest MTTR lever because it removes the "now go find a matching trace" step.</p></details>
+  <details><summary>How do you observe an async / event-driven flow where there's no synchronous call chain?</summary><p>Context must travel through the message, not an HTTP header. Inject <code>traceparent</code> into message metadata/headers (Kafka record headers, SQS message attributes) on produce, and extract on consume to create a span linked to the producer. Because it's async, use span <em>links</em> rather than strict parent-child for fan-out/batch consumers, so one consumer span can reference many producing traces. Watch for long queue dwell — model it as a span or a gap between producer and consumer spans so latency in the broker is visible, not hidden.</p></details>
+  <details><summary>Give me the cost-reduction playbook when the observability bill is out of control.</summary><p>Attack in order of $/value. 1) Logs: sample non-error logs, drop DEBUG in prod, cut retention on low-value streams, move to label-indexed storage. 2) Metric cardinality: drop unbounded labels, aggregate away unused dimensions with recording rules, use native histograms. 3) Traces: tail-sample to keep errors + slow + a small baseline, drop the boring successful bulk. 4) Downsample old metrics (raw 15d, 5m 90d, 1h 1y). 5) Right-size retention per pillar to how far back you actually query. Always keep a cheap always-on core (SLO metrics) untouched so cost cuts never blind you to user pain.</p></details>
+  <details><summary>What breaks if node clocks are skewed, and how do you detect it?</summary><p>Span timestamps are set locally per service; if node clocks drift, a child span can appear to start before its parent or spans overlap impossibly, making waterfalls unreadable and duration math wrong. Metrics get misaligned buckets and rate() can produce spikes/negatives. Detect via NTP offset monitoring (<code>node_timex_offset_seconds</code>) and alert on drift &gt; a few ms; in traces, watch for negative or nonsensical span gaps. Fix: enforce NTP/chrony on all nodes; some backends clamp child start to parent start as a band-aid but the real fix is clock sync.</p></details>
+  <details><summary>How do RED and USE differ and when do you use each?</summary><p>RED is request-centric — Rate, Errors, Duration — applied per service/endpoint; it's what users feel and what your SLOs are built on, so it drives alerting. USE is resource-centric — Utilization, Saturation, Errors — applied per resource (CPU, disk, queue, connection pool); it's diagnostic, telling you <em>why</em> RED went bad. In an incident: RED alert says "checkout p99 is breaching"; USE dashboards then reveal the DB connection pool is saturated. Alert on RED (symptoms), diagnose with USE (causes).</p></details>
+</div>

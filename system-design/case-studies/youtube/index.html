@@ -1,0 +1,134 @@
+<h1>How YouTube Works <span class="tag express">Case Study</span></h1>
+<p>YouTube ingests one video file and must play it back smoothly for a billion people on connections ranging from fiber to a flaky 3G phone on a train. The interesting system-design problem hides in that gap: a single upload has to be <em>fanned out</em> into many versions, sliced into tiny chunks, pushed to edge servers worldwide, and then stitched back together by the player in real time as the network speeds up and slows down.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 720 300" role="img" aria-label="Upload to ingest to transcoding pipeline fanning out to four renditions, then object storage, CDN edge, and adaptive-bitrate player">
+    <defs>
+      <marker id="arr-youtube" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path class="edge-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+      </marker>
+    </defs>
+
+    <rect class="box" x="16" y="128" width="104" height="48" rx="9"></rect>
+    <text class="lbl" x="68" y="149" text-anchor="middle">Upload</text>
+    <text class="sub" x="68" y="165" text-anchor="middle">raw 4K file</text>
+
+    <rect class="box" x="148" y="128" width="104" height="48" rx="9"></rect>
+    <text class="lbl" x="200" y="149" text-anchor="middle">Ingest</text>
+    <text class="sub" x="200" y="165" text-anchor="middle">chunk source</text>
+
+    <rect class="box-accent" x="284" y="120" width="120" height="64" rx="9"></rect>
+    <text class="lbl" x="344" y="146" text-anchor="middle">Transcoding</text>
+    <text class="lbl" x="344" y="162" text-anchor="middle">pipeline</text>
+    <text class="accent-text" x="344" y="178" text-anchor="middle">parallel workers</text>
+
+    <rect class="box" x="436" y="36" width="96" height="34" rx="7"></rect>
+    <text class="lbl" x="484" y="57" text-anchor="middle">240p</text>
+    <rect class="box" x="436" y="98" width="96" height="34" rx="7"></rect>
+    <text class="lbl" x="484" y="119" text-anchor="middle">480p</text>
+    <rect class="box" x="436" y="160" width="96" height="34" rx="7"></rect>
+    <text class="lbl" x="484" y="181" text-anchor="middle">720p</text>
+    <rect class="box" x="436" y="222" width="96" height="34" rx="7"></rect>
+    <text class="lbl" x="484" y="243" text-anchor="middle">1080p</text>
+
+    <rect class="box" x="564" y="98" width="92" height="48" rx="9"></rect>
+    <text class="lbl" x="610" y="119" text-anchor="middle">Object</text>
+    <text class="lbl" x="610" y="135" text-anchor="middle">storage</text>
+
+    <rect class="box" x="564" y="170" width="92" height="48" rx="9"></rect>
+    <text class="lbl" x="610" y="191" text-anchor="middle">CDN edge</text>
+    <text class="sub" x="610" y="207" text-anchor="middle">cached</text>
+
+    <rect class="box" x="300" y="246" width="120" height="42" rx="9"></rect>
+    <text class="lbl" x="360" y="271" text-anchor="middle">ABR player</text>
+
+    <line class="edge" x1="120" y1="152" x2="144" y2="152" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="252" y1="152" x2="280" y2="152" marker-end="url(#arr-youtube)"></line>
+    <text class="cap" x="266" y="145" text-anchor="middle">ingest</text>
+
+    <line class="edge" x1="404" y1="142" x2="432" y2="53" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="404" y1="148" x2="432" y2="115" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="404" y1="158" x2="432" y2="177" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="404" y1="164" x2="432" y2="239" marker-end="url(#arr-youtube)"></line>
+    <text class="cap" x="420" y="30" text-anchor="middle">fan-out: rendition ladder</text>
+
+    <line class="edge" x1="532" y1="53" x2="560" y2="112" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="532" y1="115" x2="560" y2="118" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="532" y1="177" x2="560" y2="128" marker-end="url(#arr-youtube)"></line>
+    <line class="edge" x1="532" y1="239" x2="560" y2="134" marker-end="url(#arr-youtube)"></line>
+    <text class="cap" x="548" y="92" text-anchor="middle">store segments</text>
+
+    <line class="edge" x1="610" y1="146" x2="610" y2="166" marker-end="url(#arr-youtube)"></line>
+    <text class="cap" x="654" y="160" text-anchor="middle">origin pull</text>
+
+    <line class="edge" x1="564" y1="200" x2="424" y2="262" marker-end="url(#arr-youtube)"></line>
+    <text class="cap" x="500" y="246" text-anchor="middle">adaptive segments</text>
+  </svg>
+  <div class="diagram-cap">Figure: one upload fans out through the transcoding pipeline into a rendition ladder, lands in object storage, and is served from the CDN edge to an adaptive-bitrate player.</div>
+</div>
+
+<h2>Requirements (functional & non-functional)</h2>
+<p>Before designing anything, pin down what the system must <em>do</em> versus how <em>well</em> it must do it. Mixing these up is the classic fresher mistake.</p>
+<ul>
+  <li><strong>Functional:</strong> upload a video, transcode it to multiple qualities, store it durably, stream it to viewers, and let the player switch quality on the fly.</li>
+  <li><strong>Non-functional:</strong> playback must start fast (low startup latency), never stall (smooth), survive massive read traffic (a viral video), and be cheap to store at petabyte scale.</li>
+</ul>
+<p>The key observation: YouTube is <strong>write-once, read-billions</strong>. One person uploads; everyone else only reads. So we happily spend a lot of expensive work <em>once</em> at upload time to make every later read cheap and fast.</p>
+
+<h2>Step-by-step request flow</h2>
+<p>Following the boxes in the diagram above, here is the life of one video from creator to viewer:</p>
+<ol>
+  <li><strong>Upload:</strong> the creator's raw file (say a 4K, 8&nbsp;Mbps source) is pushed to an upload endpoint via a resumable protocol so a dropped connection doesn't restart a 2&nbsp;GB transfer.</li>
+  <li><strong>Ingest:</strong> the service validates the file, extracts metadata, and splits the source into independent time-chunks at keyframe boundaries so the next stage can run in parallel.</li>
+  <li><strong>Transcoding pipeline</strong> (the star): a pool of parallel workers re-encodes each chunk into every rung of the <em>rendition ladder</em>. This is the expensive, write-once work.</li>
+  <li><strong>Rendition fan-out:</strong> one source becomes 240p / 480p / 720p / 1080p (and higher), each segmented on identical time boundaries so the player can splice across them.</li>
+  <li><strong>Object storage:</strong> every segment plus its HLS/DASH manifests are written to a durable blob store; the metadata DB records only the keys/URLs.</li>
+  <li><strong>CDN edge:</strong> segments are immutable, so the first viewer in a region pulls from origin and every later viewer is served from a nearby edge cache.</li>
+  <li><strong>ABR player:</strong> the player fetches the master manifest, then downloads one ~4-second segment at a time, re-choosing quality before each based on measured bandwidth and buffer level.</li>
+</ol>
+
+<h2>The core hard problem: the transcode fan-out</h2>
+<p>A phone might upload a 4K video encoded in a format your laptop can't decode. We cannot just hand that raw file to every viewer. Instead, the upload triggers a <strong>transcoding pipeline</strong> that produces a <em>rendition ladder</em>: the same video re-encoded at several resolutions and bitrates (e.g. 240p, 480p, 720p, 1080p).</p>
+<p>Why fan out into many copies instead of one? Because the viewer's network decides what they can play. A 1080p stream needs ~5 Mbps; a train passenger on 3G has maybe 0.5 Mbps. If we only stored 1080p, that passenger would buffer endlessly. By pre-making every rung of the ladder, the player can pick whichever fits <em>right now</em>.</p>
+<p>Each rendition is then chopped into fixed-length <strong>segments</strong> (typically 2-10 seconds each). This chunking is what makes adaptive streaming possible: the player downloads one little segment at a time and re-decides quality before each one.</p>
+<p>The cost is real but bounded, and that is <em>why</em> the fan-out is worth it. A typical 5-rung ladder roughly <strong>doubles</strong> total stored bytes versus the source alone (lower rungs are tiny: 240p is ~0.4&nbsp;Mbps, 1080p ~5&nbsp;Mbps), yet it lets a 0.5&nbsp;Mbps 3G viewer play <em>at all</em> instead of buffering forever. You pay storage once and forever; you save bandwidth and stalls on every one of billions of reads. With ~500 hours uploaded per minute, even a small per-video saving on the read path dwarfs the one-time encode cost.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Transcoding is embarrassingly parallel. Split the source into chunks and transcode each chunk on a different worker simultaneously, then concatenate. A 1-hour video can be processed in minutes instead of an hour because 30 workers each handle 2 minutes. Concretely: 60&nbsp;min / 30 workers &asymp; 2&nbsp;min wall-clock per rendition, and all renditions run on separate workers too, so the whole ladder finishes in roughly the time of the slowest single rung.</div>
+
+<h2>Adaptive bitrate streaming (HLS / DASH)</h2>
+<p>The magic that prevents buffering is <strong>Adaptive Bitrate (ABR)</strong> streaming. The two dominant protocols are <strong>HLS</strong> (Apple) and <strong>DASH</strong> (open standard). Both work the same way conceptually: the server publishes a text <em>manifest</em> (a playlist) describing every rendition and its segments.</p>
+<ul>
+  <li><strong>Master manifest:</strong> lists each available quality and its bandwidth, pointing to a per-quality playlist.</li>
+  <li><strong>Media manifest:</strong> lists the ordered segment files for one quality.</li>
+  <li><strong>Player logic:</strong> after each segment, the player measures how fast it downloaded and its buffer level, then chooses the next segment's quality. Network sped up? Step up to 1080p. Buffer draining? Drop to 480p instantly.</li>
+</ul>
+<p>This is why quality on YouTube changes mid-video without restarting: every rendition is segmented on the <em>same time boundaries</em>, so segment #5 of 480p and segment #5 of 1080p cover the exact same seconds and are interchangeable.</p>
+
+<h2>Storage choices</h2>
+<p>Where do petabytes of segments live? Not in a relational database. We separate two very different kinds of data.</p>
+<table>
+  <tr><th>Blob store (S3 / GCS)</th><td>Holds the actual video segments and manifests. Cheap per GB, infinitely scalable, durable across data centers. Tiered: hot recent videos on fast storage, cold archives on cheap slow storage.</td></tr>
+  <tr><th>Metadata DB (SQL/NoSQL)</th><td>Holds title, uploader, view count, comments, and the URL pointing into the blob store. Small rows, queried constantly. Relational for relationships; NoSQL for high-write counters like views.</td></tr>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> Never store video bytes <em>inside</em> the metadata database. Blobs bloat the DB, wreck backups, and make queries crawl. The DB should only store a <em>pointer</em> (a URL/key) to the object in blob storage.</div>
+
+<h2>Scaling delivery with a CDN</h2>
+<p>Even with perfect renditions, serving every viewer from one data center would melt the network and add huge latency for far-away users. The fix is a <strong>CDN</strong> (Content Delivery Network): copies of segments cached on thousands of edge servers physically close to viewers.</p>
+<p>Because segments are immutable files with stable URLs, they are <em>perfectly</em> cacheable. The first viewer in Tokyo pulls a segment from origin; it's now cached at the Tokyo edge, so the next million Tokyo viewers get it from a few miles away. This is how a viral video survives: traffic is absorbed by the edge, not the origin.</p>
+<div class="callout tip"><strong>Senior tip:</strong> The write path (upload + transcode) and the read path (CDN playback) are completely decoupled. Optimize them independently — the write path cares about throughput and cost; the read path cares about latency and cache hit rate.</div>
+
+<h2>Tradeoffs to discuss</h2>
+<ul>
+  <li><strong>Segment length:</strong> shorter segments = faster quality adaptation and quicker startup, but more files and more HTTP overhead. ~4-6s is a common sweet spot.</li>
+  <li><strong>Number of renditions:</strong> more rungs = smoother adaptation but more storage and transcode cost. You pay storage forever to save bandwidth and stalls.</li>
+  <li><strong>Pre-transcode all vs. on-demand:</strong> popular videos justify making every rendition upfront; for the long tail of rarely-watched videos, transcode lazily on first request.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why fan one upload out into multiple resolutions instead of letting the player downscale a single high-quality file?</summary><p>Downscaling needs the full high-bitrate bytes to arrive first, which defeats the purpose for slow networks — they'd stall before downscaling helps. Pre-encoding a ladder lets a slow client download a genuinely smaller file. We trade extra storage (cheap, paid once) for guaranteed smooth playback on any connection.</p></details>
+  <details><summary>How does the player switch quality mid-stream without restarting?</summary><p>Every rendition is segmented on identical time boundaries, so segment N of any quality covers the same seconds. After each segment the player measures download speed and buffer level, then simply requests the next segment from a different quality's playlist. The segments splice seamlessly because they're keyframe-aligned.</p></details>
+  <details><summary>Why store video files in a blob store rather than a database?</summary><p>Databases are optimized for small, structured, frequently-mutated rows. Video segments are huge, immutable blobs read sequentially. Putting them in the DB bloats backups, slows queries, and wastes expensive DB storage. Blob stores are cheap, durable, and integrate with CDNs. The DB just stores a pointer.</p></details>
+  <details><summary>How does a CDN let a single video survive going viral?</summary><p>Segments are immutable files with stable URLs, so they cache perfectly at edge servers. The first viewer in a region populates the edge cache; every subsequent viewer is served locally without touching origin. Origin load stays roughly constant (one fetch per region per segment) no matter how many viewers, and latency drops because bytes travel a short distance.</p></details>
+  <details><summary>Why is transcoding done in parallel chunks, and what's the catch?</summary><p>Transcoding is CPU-heavy and independent per time-chunk, so splitting the source across many workers cuts wall-clock time dramatically. The catch is that chunks must be cut at keyframe boundaries and re-stitched so renditions stay time-aligned; otherwise quality switches would glitch. You also need an orchestrator to track all the chunk jobs and assemble the final manifest.</p></details>
+  <details><summary>How much extra storage does the rendition ladder actually cost, and is it justified?</summary><p>A 5-rung ladder roughly doubles stored bytes versus the source, because the lower rungs are small (240p ~0.4&nbsp;Mbps vs 1080p ~5&nbsp;Mbps). It's justified by the read pattern: write-once, read-billions. Spending one-time encode and storage cost lets slow-network viewers play at all and lets fast viewers get full quality, saving bandwidth and eliminating stalls on every subsequent read.</p></details>
+</div>

@@ -1,0 +1,260 @@
+<h1>Cloud Providers — AWS vs Azure vs GCP <span class="tag express">Comparison</span></h1>
+<p>The three hyperscalers offer roughly the same primitives under different names. Interviewers probe whether you understand the <em>concepts</em> (and can map them across clouds) rather than memorising one vendor's catalog. This page is the equivalence map plus what genuinely differentiates each provider.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "All three give you the same building blocks — VMs, object storage, managed databases, serverless, Kubernetes, a VPC, IAM and observability — just with different names. AWS wins on breadth and maturity, Azure on enterprise/Microsoft and hybrid integration, GCP on data analytics (BigQuery), Kubernetes (GKE) and its global network. I pick based on the team's existing stack, the workload (analytics → GCP, Microsoft shop → Azure, widest service needs → AWS), data-gravity and egress cost, and how much managed-service lock-in is acceptable."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The mental model is "learn the concept once, map the label three ways". Every provider has: <strong>compute</strong> (VMs, autoscaling, serverless functions, serverless containers, managed Kubernetes), <strong>storage</strong> (object/block/file/archive), <strong>databases</strong> (relational, NoSQL key-value/document, wide-column, in-memory cache, data warehouse), <strong>networking</strong> (a virtual network, L4/L7 load balancers, DNS, CDN, private connectivity), <strong>messaging</strong> (queue, pub/sub, event streaming, event bus), <strong>security/identity</strong> (IAM, secrets, KMS) and <strong>observability</strong> (metrics, logs, traces).</p>
+<ul>
+<li><strong>AWS</strong> — the widest and most mature catalog, most regions, biggest ecosystem and market share. Default when you want the most services and the deepest community/tooling.</li>
+<li><strong>Azure</strong> — deepest integration with the Microsoft stack (Entra ID/Active Directory, Microsoft 365, Windows/SQL Server licensing via Hybrid Benefit) and the strongest hybrid-cloud story (Azure Arc, Azure Stack, ExpressRoute). Default for enterprises already on Microsoft.</li>
+<li><strong>GCP</strong> — best-in-class for data/analytics (BigQuery, Dataflow), Kubernetes (Google invented K8s; GKE Autopilot is the most managed), a uniquely <em>global</em> VPC and load balancer, live-migrating VMs, and Spanner (globally-consistent SQL). Default for analytics-heavy and cloud-native/K8s teams.</li>
+</ul>
+<p>The honest interview point: the differences are at the <em>edges</em> (analytics, hybrid, global networking, specific managed services and their semantics), not the core primitives — and <strong>egress/data-transfer cost</strong> and <strong>IAM model differences</strong> are what actually bite in production.</p>
+
+<h2>Compute &amp; Containers</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>Virtual machines</th><td>EC2</td><td>Virtual Machines</td><td>Compute Engine</td></tr>
+<tr><th>Autoscaling group</th><td>EC2 Auto Scaling Groups</td><td>VM Scale Sets</td><td>Managed Instance Groups</td></tr>
+<tr><th>Serverless functions (FaaS)</th><td>Lambda</td><td>Azure Functions</td><td>Cloud Run functions (Cloud Functions)</td></tr>
+<tr><th>Serverless containers</th><td>Fargate (ECS/EKS)</td><td>Container Apps / ACI</td><td>Cloud Run</td></tr>
+<tr><th>Managed Kubernetes</th><td>EKS</td><td>AKS</td><td>GKE (Autopilot)</td></tr>
+<tr><th>Container registry</th><td>ECR</td><td>ACR</td><td>Artifact Registry</td></tr>
+<tr><th>PaaS / app hosting</th><td>Elastic Beanstalk / App Runner</td><td>App Service</td><td>App Engine</td></tr>
+<tr><th>Batch compute</th><td>AWS Batch</td><td>Azure Batch</td><td>Cloud Batch</td></tr>
+<tr><th>Edge / spot compute</th><td>Lambda@Edge, EC2 Spot, Graviton (ARM)</td><td>Front Door functions, Spot VMs</td><td>Cloud CDN edge, Spot VMs, Tau/ARM</td></tr>
+</table>
+
+<h2>Storage &amp; Databases</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>Object storage</th><td>S3</td><td>Blob Storage</td><td>Cloud Storage</td></tr>
+<tr><th>Block storage</th><td>EBS</td><td>Managed Disks</td><td>Persistent Disk / Hyperdisk</td></tr>
+<tr><th>File storage (NFS/SMB)</th><td>EFS / FSx</td><td>Azure Files / NetApp Files</td><td>Filestore</td></tr>
+<tr><th>Archive / cold tier</th><td>S3 Glacier</td><td>Blob Archive tier</td><td>Cloud Storage Archive class</td></tr>
+<tr><th>Managed relational</th><td>RDS (PostgreSQL/MySQL/…)</td><td>Azure SQL, Database for PostgreSQL/MySQL</td><td>Cloud SQL</td></tr>
+<tr><th>Cloud-native relational</th><td>Aurora</td><td>Azure SQL Hyperscale</td><td>AlloyDB</td></tr>
+<tr><th>Globally-distributed SQL</th><td>Aurora Global / DynamoDB Global</td><td>Cosmos DB (SQL API)</td><td><strong>Cloud Spanner</strong> (TrueTime, strong-consistent)</td></tr>
+<tr><th>Key-value / document NoSQL</th><td>DynamoDB</td><td>Cosmos DB</td><td>Firestore / Datastore</td></tr>
+<tr><th>Wide-column</th><td>Keyspaces (Cassandra)</td><td>Cosmos DB (Cassandra API)</td><td>Bigtable</td></tr>
+<tr><th>In-memory cache</th><td>ElastiCache (Redis/Memcached)</td><td>Azure Cache for Redis</td><td>Memorystore</td></tr>
+<tr><th>Data warehouse</th><td>Redshift</td><td>Synapse Analytics / Fabric</td><td><strong>BigQuery</strong></td></tr>
+<tr><th>Graph / ledger</th><td>Neptune / QLDB</td><td>Cosmos DB (Gremlin)</td><td>(Spanner Graph / partner)</td></tr>
+</table>
+<div class="callout warn"><strong>Watch out:</strong> "equivalent" ≠ "identical". DynamoDB, Cosmos DB and Firestore have different consistency models, partition-key rules and pricing units (RCU/WCU vs RU/s vs operations). Always name the semantic difference, not just the mapping.</div>
+
+<h2>Networking &amp; Content Delivery</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>Virtual network</th><td>VPC (regional)</td><td>VNet (regional)</td><td>VPC (<strong>global</strong>)</td></tr>
+<tr><th>L4 load balancer</th><td>NLB</td><td>Azure Load Balancer</td><td>Network Load Balancing</td></tr>
+<tr><th>L7 load balancer</th><td>ALB</td><td>Application Gateway</td><td>Global External HTTP(S) LB</td></tr>
+<tr><th>Global traffic / GSLB</th><td>Route 53 / Global Accelerator</td><td>Traffic Manager / Front Door</td><td>Global LB (single anycast IP)</td></tr>
+<tr><th>DNS</th><td>Route 53</td><td>Azure DNS</td><td>Cloud DNS</td></tr>
+<tr><th>CDN</th><td>CloudFront</td><td>Azure CDN / Front Door</td><td>Cloud CDN / Media CDN</td></tr>
+<tr><th>API gateway</th><td>API Gateway</td><td>API Management</td><td>API Gateway / Apigee</td></tr>
+<tr><th>Private service connectivity</th><td>PrivateLink / VPC Endpoints</td><td>Private Link</td><td>Private Service Connect</td></tr>
+<tr><th>Hybrid link</th><td>Site-to-Site VPN / Direct Connect</td><td>VPN Gateway / ExpressRoute</td><td>Cloud VPN / Cloud Interconnect</td></tr>
+<tr><th>WAF / DDoS</th><td>WAF + Shield</td><td>Azure WAF + DDoS Protection</td><td>Cloud Armor</td></tr>
+<tr><th>Service mesh</th><td>App Mesh</td><td>Istio on AKS</td><td>Cloud Service Mesh (Anthos)</td></tr>
+</table>
+
+<h2>Messaging &amp; Eventing</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>Queue (point-to-point)</th><td>SQS</td><td>Service Bus Queues / Storage Queues</td><td>Cloud Tasks / Pub/Sub</td></tr>
+<tr><th>Pub/Sub (fan-out)</th><td>SNS</td><td>Service Bus Topics / Event Grid</td><td>Pub/Sub</td></tr>
+<tr><th>Event streaming (log)</th><td>Kinesis Data Streams / MSK</td><td>Event Hubs (Kafka-compatible)</td><td>Pub/Sub / Managed Kafka</td></tr>
+<tr><th>Event bus (routing)</th><td>EventBridge</td><td>Event Grid</td><td>Eventarc</td></tr>
+<tr><th>Managed Kafka</th><td>MSK</td><td>Event Hubs (Kafka API) / HDInsight</td><td>Managed Service for Apache Kafka</td></tr>
+<tr><th>Workflow orchestration</th><td>Step Functions</td><td>Logic Apps / Durable Functions</td><td>Workflows</td></tr>
+</table>
+
+<h2>Security, Identity &amp; Operations</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>Identity &amp; access (IAM)</th><td>IAM (users, roles, policies)</td><td>Microsoft Entra ID + Azure RBAC</td><td>Cloud IAM (org/folder/project hierarchy)</td></tr>
+<tr><th>Secrets</th><td>Secrets Manager / SSM Parameter Store</td><td>Key Vault</td><td>Secret Manager</td></tr>
+<tr><th>Key management (KMS/HSM)</th><td>KMS / CloudHSM</td><td>Key Vault / Managed HSM</td><td>Cloud KMS / Cloud HSM</td></tr>
+<tr><th>Metrics &amp; monitoring</th><td>CloudWatch</td><td>Azure Monitor + App Insights</td><td>Cloud Monitoring</td></tr>
+<tr><th>Logging</th><td>CloudWatch Logs</td><td>Log Analytics</td><td>Cloud Logging</td></tr>
+<tr><th>Tracing</th><td>X-Ray</td><td>Application Insights</td><td>Cloud Trace</td></tr>
+<tr><th>Audit</th><td>CloudTrail</td><td>Activity Log</td><td>Cloud Audit Logs</td></tr>
+<tr><th>IaC (native)</th><td>CloudFormation / CDK</td><td>ARM templates / Bicep</td><td>Config Controller (Terraform on all three)</td></tr>
+<tr><th>CI/CD</th><td>CodePipeline / CodeBuild / CodeDeploy</td><td>Azure Pipelines (Azure DevOps)</td><td>Cloud Build / Cloud Deploy</td></tr>
+<tr><th>Cost &amp; policy</th><td>Cost Explorer / AWS Config</td><td>Cost Management / Azure Policy</td><td>Cloud Billing / Org Policy</td></tr>
+</table>
+
+<h2>Data, Analytics &amp; ML</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>ETL / data integration</th><td>Glue</td><td>Data Factory</td><td>Dataflow / Data Fusion</td></tr>
+<tr><th>Big data (Spark/Hadoop)</th><td>EMR</td><td>HDInsight / Synapse Spark</td><td>Dataproc</td></tr>
+<tr><th>Streaming analytics</th><td>Managed Flink / Kinesis Analytics</td><td>Stream Analytics</td><td>Dataflow (Apache Beam)</td></tr>
+<tr><th>Data warehouse</th><td>Redshift</td><td>Synapse / Microsoft Fabric</td><td>BigQuery</td></tr>
+<tr><th>BI</th><td>QuickSight</td><td>Power BI</td><td>Looker</td></tr>
+<tr><th>ML platform</th><td>SageMaker</td><td>Azure Machine Learning</td><td>Vertex AI</td></tr>
+<tr><th>Managed LLM / GenAI</th><td>Bedrock</td><td>Azure OpenAI</td><td>Vertex AI (Gemini)</td></tr>
+<tr><th>Managed search</th><td>OpenSearch Service</td><td>Azure AI Search</td><td>Vertex AI Search</td></tr>
+</table>
+
+<h2>Unique / Differentiating Strengths</h2>
+<h3>AWS — breadth &amp; maturity</h3>
+<ul>
+<li>Largest service catalog and region footprint; earliest to market so the deepest feature depth per service and the biggest third-party ecosystem/marketplace.</li>
+<li><strong>Graviton</strong> (in-house ARM) for ~40% better price/performance; <strong>Nitro</strong> hypervisor offload; <strong>S3</strong> is the de-facto object-storage standard others emulate.</li>
+<li>Richest serverless ecosystem (Lambda + EventBridge + Step Functions) and the widest set of niche/primitive services.</li>
+</ul>
+<h3>Azure — enterprise &amp; hybrid</h3>
+<ul>
+<li><strong>Entra ID</strong> (formerly Azure AD) is the identity backbone for most large enterprises → seamless SSO with Microsoft 365 and on-prem AD.</li>
+<li><strong>Hybrid Benefit</strong> reuses existing Windows Server / SQL Server licenses; strongest hybrid/on-prem story via <strong>Azure Arc</strong> (manage any infra) and <strong>Azure Stack</strong> (run Azure services on-prem), plus <strong>ExpressRoute</strong>.</li>
+<li>First-class for .NET, Windows workloads, and heavily-regulated/government tenants.</li>
+</ul>
+<h3>GCP — data, Kubernetes &amp; global network</h3>
+<ul>
+<li><strong>BigQuery</strong>: serverless warehouse with separated storage/compute — best-in-class for ad-hoc, petabyte-scale analytics with no cluster to manage.</li>
+<li><strong>Kubernetes heritage</strong>: Google created K8s (from Borg); GKE + Autopilot is the most mature managed offering.</li>
+<li><strong>Global VPC and global HTTP(S) load balancer</strong> behind a single anycast IP (AWS/Azure networks are regional); <strong>live migration</strong> of VMs during host maintenance (no reboot); premium-tier global backbone.</li>
+<li><strong>Cloud Spanner</strong>: globally distributed, strongly consistent relational DB using TrueTime — genuinely unique. Plus automatic <strong>sustained-use discounts</strong> and per-second billing.</li>
+</ul>
+
+<h2>Global Infrastructure Model</h2>
+<p>All three isolate failure domains, but the topology differs — a common follow-up.</p>
+<table>
+<tr><th>AWS</th><td>Region → 3+ <strong>Availability Zones</strong> (physically isolated DCs, low-latency links). Design across AZs for HA; regional services replicate within a region.</td></tr>
+<tr><th>Azure</th><td>Region → <strong>Availability Zones</strong> <em>plus</em> <strong>region pairs</strong> (a partner region for DR / sequential updates). Largest number of regions.</td></tr>
+<tr><th>GCP</th><td>Region → <strong>Zones</strong>. Distinctive: the VPC and HTTP(S) LB are <strong>global</strong>, so one network/IP can span regions.</td></tr>
+</table>
+<pre class="mermaid">
+flowchart TD
+  R["Cloud Region"] --> Z1["Zone A"]
+  R --> Z2["Zone B"]
+  R --> Z3["Zone C"]
+  Z1 --> S1["Subnet and resources"]
+  Z2 --> S2["Subnet and resources"]
+  Z3 --> S3["Subnet and resources"]
+  R -.DR replication.-> R2["Paired or secondary Region"]
+</pre>
+
+<h2>Pricing Models</h2>
+<table>
+<tr><th>Model</th><th>AWS</th><th>Azure</th><th>GCP</th></tr>
+<tr><th>Granularity</th><td>Per-second (Linux VMs)</td><td>Per-second / minute</td><td>Per-second</td></tr>
+<tr><th>Commit discounts</th><td>Reserved Instances / Savings Plans</td><td>Reserved Instances</td><td>Committed-use discounts</td></tr>
+<tr><th>Automatic discounts</th><td>—</td><td>—</td><td><strong>Sustained-use</strong> (auto, no commit)</td></tr>
+<tr><th>License reuse</th><td>License-included / BYOL</td><td><strong>Hybrid Benefit</strong> (Windows/SQL)</td><td>BYOL</td></tr>
+<tr><th>Cheap interruptible</th><td>Spot Instances</td><td>Spot VMs</td><td>Spot / Preemptible VMs</td></tr>
+</table>
+<div class="callout warn"><strong>Watch out:</strong> compute is easy to compare; the real bill surprises are <strong>egress / cross-region / cross-AZ data transfer</strong>, NAT gateway data processing, and per-request/RU pricing on managed NoSQL. All three charge heavily for data leaving the cloud.</div>
+
+<h2>When to Choose Which</h2>
+<table>
+<tr><th>Situation</th><th>Lean towards</th></tr>
+<tr><td>Widest service breadth, biggest talent pool / community</td><td>AWS</td></tr>
+<tr><td>Already a Microsoft/Windows/AD shop, need hybrid/on-prem</td><td>Azure</td></tr>
+<tr><td>Analytics-heavy, data warehouse, ML, Kubernetes-native</td><td>GCP</td></tr>
+<tr><td>Globally-consistent relational data across continents</td><td>GCP (Spanner)</td></tr>
+<tr><td>Regulated enterprise / government with Microsoft agreements</td><td>Azure</td></tr>
+<tr><td>Avoiding lock-in / portability</td><td>Any — use Kubernetes + Terraform + open data formats</td></tr>
+</table>
+
+<h2>Production Architecture</h2>
+<p>The same 3-tier web application maps cleanly across providers: edge/CDN → global or regional L7 load balancer → autoscaling stateless compute (containers on managed K8s) → managed relational primary + read replicas → managed cache → object storage → async work on a queue.</p>
+<pre class="mermaid">
+flowchart LR
+  U["Users"] --> CDN["CDN CloudFront or Front Door or Cloud CDN"]
+  CDN --> LB["L7 Load Balancer ALB or App Gateway or Global LB"]
+  LB --> K["Managed Kubernetes EKS or AKS or GKE"]
+  K --> DB["Managed SQL RDS or Azure SQL or Cloud SQL"]
+  K --> CACHE["Cache ElastiCache or Azure Redis or Memorystore"]
+  K --> OBJ["Object Storage S3 or Blob or GCS"]
+  K --> Q["Queue SQS or Service Bus or Pub Sub"]
+</pre>
+<p>Only the service names change — the architecture, the failure domains (spread across zones), and the scaling story are identical. That portability is exactly why teams standardise on Kubernetes + Terraform to stay cloud-agnostic.</p>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Assuming feature parity</strong> — equivalents differ in consistency, limits and pricing units. <em>Fix:</em> name the semantic difference.</li>
+<li><strong>Ignoring egress cost</strong> — multi-region/multi-cloud designs quietly rack up transfer charges. <em>Fix:</em> keep compute near data; budget egress.</li>
+<li><strong>Porting the IAM mental model</strong> — AWS roles+resource policies, Azure RBAC+Entra, GCP hierarchy (org→folder→project) are genuinely different. <em>Fix:</em> relearn per cloud.</li>
+<li><strong>Zonal vs regional confusion</strong> (esp. GCP) — a zonal disk/IP doesn't survive a zone outage. <em>Fix:</em> pick regional resources for HA.</li>
+<li><strong>Deep managed-service lock-in</strong> (DynamoDB/Cosmos/BigQuery) with no exit plan. <em>Fix:</em> accept it deliberately or abstract behind portable layers.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>Cloud (public/likely) &amp; why</th></tr>
+<tr><td>Netflix</td><td>All-in on <strong>AWS</strong> — famous case study; open-sourced much of its AWS tooling (Spinnaker, Chaos Monkey).</td></tr>
+<tr><td>Spotify</td><td>Migrated to <strong>GCP</strong>; heavy BigQuery + Dataflow user for its data platform.</td></tr>
+<tr><td>Snap / Twitter (X)</td><td>Multi-cloud <strong>GCP + AWS</strong> historically, to negotiate cost and capacity.</td></tr>
+<tr><td>LinkedIn</td><td>Microsoft-owned → migrating to <strong>Azure</strong>.</td></tr>
+<tr><td>Uber</td><td>Long ran its own data centers; recently signed multi-year <strong>Google Cloud + Oracle</strong> deals for hybrid.</td></tr>
+<tr><td>Swiggy / Razorpay / Atlassian</td><td>Primarily <strong>AWS</strong> (breadth + India regions; Razorpay is PCI-DSS driven).</td></tr>
+<tr><td>PhonePe</td><td>Moved <em>off</em> public cloud to its <strong>own data centers</strong> for scale/cost control of UPI volumes.</td></tr>
+<tr><td>Google</td><td>Runs on its own <strong>GCP</strong>/Borg infrastructure; the internal Borg system is what GKE/K8s descended from.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What's the AWS/Azure/GCP equivalent of S3 / Lambda / EKS?
+  <ol><li><em>Pointer:</em> S3 → Blob → Cloud Storage; Lambda → Azure Functions → Cloud Functions/Run; EKS → AKS → GKE.</li></ol></li>
+<li>How do Availability Zones differ across the three?
+  <ol><li><em>Pointer:</em> AWS AZs, Azure AZs + region pairs for DR, GCP zones with global VPC/LB.</li></ol></li>
+<li>Why is GCP's VPC "global" and what does that buy you?
+  <ol><li><em>Pointer:</em> one VPC/subnetted network spans regions; single global anycast LB IP; simpler multi-region.</li></ol></li>
+<li>DynamoDB vs Cosmos DB vs Firestore — how do they differ beyond the name?
+  <ol><li><em>Pointer:</em> consistency options, partition-key model, and pricing units (RCU/WCU vs RU/s vs ops) differ.</li></ol></li>
+<li>What makes BigQuery different from Redshift/Synapse?
+  <ol><li><em>Pointer:</em> serverless, storage/compute separation, no cluster to size, pay-per-query scan.</li></ol></li>
+<li>What is Cloud Spanner and why is it unique?
+  <ol><li><em>Pointer:</em> globally distributed, strongly consistent SQL using TrueTime (GPS+atomic clocks) to bound clock skew.</li></ol></li>
+<li>Compare the IAM models.
+  <ol><li><em>Pointer:</em> AWS identity/resource policies + roles; Azure RBAC + Entra directory; GCP org→folder→project hierarchy with inherited bindings.</li></ol></li>
+<li>What's Azure Hybrid Benefit and when does it matter?
+  <ol><li><em>Pointer:</em> reuse owned Windows/SQL licenses to cut VM cost; matters for Microsoft-heavy enterprises.</li></ol></li>
+<li>How would you keep an app portable across clouds?
+  <ol><li><em>Pointer:</em> Kubernetes + Terraform + open formats; avoid proprietary managed services or abstract them.</li></ol></li>
+<li>Where do egress costs come from and how do you control them?
+  <ol><li><em>Pointer:</em> data leaving cloud/region/AZ, NAT processing; keep compute near data, cache, CDN, compress.</li></ol></li>
+<li>Serverless functions vs serverless containers — when each?
+  <ol><li><em>Pointer:</em> functions for event-driven short tasks; Cloud Run/Fargate/Container Apps for containerised HTTP services with more control.</li></ol></li>
+<li>Which cloud for a Kubernetes-native startup and why?
+  <ol><li><em>Pointer:</em> GKE Autopilot maturity, but justify by team skills and workload, not hype.</li></ol></li>
+<li>How does each do private connectivity to a managed service?
+  <ol><li><em>Pointer:</em> PrivateLink vs Private Link vs Private Service Connect — private IP, no public egress.</li></ol></li>
+<li>Multi-cloud — real benefit or resume-driven?
+  <ol><li><em>Pointer:</em> avoids lock-in and outages but multiplies ops/egress/complexity; usually pick one + DR plan.</li></ol></li>
+<li>What's the equivalent of Kafka on each?
+  <ol><li><em>Pointer:</em> MSK / Event Hubs (Kafka API) / Managed Service for Kafka; or Kinesis/Pub-Sub as native alternatives.</li></ol></li>
+<li>How do you design for a region outage on each?
+  <ol><li><em>Pointer:</em> multi-AZ within region for zone failure; cross-region replication + failover DNS/global LB for region failure.</li></ol></li>
+<li>Reserved vs Savings Plans vs committed-use vs sustained-use?
+  <ol><li><em>Pointer:</em> AWS RI/Savings Plans, Azure RI + Hybrid Benefit, GCP committed + automatic sustained-use.</li></ol></li>
+<li>Which provider for GenAI and why?
+  <ol><li><em>Pointer:</em> Bedrock (AWS, model choice), Azure OpenAI (GPT access), Vertex/Gemini + TPUs (GCP).</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>After equivalents → concepts:</strong> "What's object vs block vs file storage?", "L4 vs L7 LB?", "VPC/subnet/security-group basics?" — angle: they check you know the primitive, not just the brand name.</li>
+<li><strong>After databases → data modelling:</strong> "SQL vs NoSQL choice?", "How does DynamoDB partition?", "What is a data warehouse vs OLTP?" — angle: pick storage by access pattern.</li>
+<li><strong>After networking → global design:</strong> "How does anycast route to nearest region?", "CDN cache invalidation?", "multi-region active-active vs active-passive?" — angle: geography + failover.</li>
+<li><strong>After IAM → security:</strong> "least privilege?", "roles vs users?", "how do you rotate credentials/secrets?", "workload identity?" — angle: no long-lived static keys.</li>
+<li><strong>After serverless → trade-offs:</strong> "cold starts?", "when NOT serverless?", "vendor lock-in of FaaS?" — angle: latency and portability costs.</li>
+<li><strong>After cost → FinOps:</strong> "how do you cut a cloud bill?", "where does egress hide?", "spot vs on-demand?" — angle: right-size, commit, cache, near-data compute.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Give me the fastest way to map a service you don't know across clouds.</summary><p>Anchor on the concept category — compute, storage, database, networking, messaging, identity, observability — then recall the concept's job. "It's the managed Kubernetes service" instantly gives EKS/AKS/GKE; "it's the serverless data warehouse" gives Redshift-serverless/Synapse/BigQuery. Interviewers care that you reason from the primitive, not that you memorised a table. Then I add the one meaningful difference (e.g., GKE's Autopilot maturity, BigQuery's serverless storage/compute split).</p></details>
+  <details><summary>Why is data egress the cost that surprises teams, and how do you design around it?</summary><p>Inbound data is usually free, but data leaving the cloud — or crossing regions/AZs — is billed per GB, and it's invisible until the bill arrives. A chatty cross-region architecture or a multi-cloud pipeline can dwarf compute cost. Design rules: keep compute in the same region/zone as its data (data gravity), cache aggressively and serve via CDN so bytes leave once, compress payloads, use private connectivity to avoid public-internet egress rates, and colocate services that talk a lot. Model egress explicitly in the cost estimate, not just VM hours.</p></details>
+  <details><summary>Explain the real difference between DynamoDB, Cosmos DB and Firestore.</summary><p>All are managed NoSQL, but: DynamoDB is key-value/document with a strict partition-key + optional sort-key model, eventual or strong reads, and capacity in RCU/WCU (or on-demand). Cosmos DB is multi-model (document/graph/column/key-value) with <em>five</em> tunable consistency levels (strong → bounded-staleness → session → consistent-prefix → eventual), global distribution built-in, priced in Request Units/s. Firestore is a document store with real-time listeners and strong consistency within a region, priced per read/write/delete operation. So the "equivalent" mapping hides different consistency guarantees, partitioning rules, and billing units — which directly change how you data-model and what you pay.</p></details>
+  <details><summary>What makes Cloud Spanner able to offer global strong consistency when the CAP theorem says you can't?</summary><p>Spanner doesn't violate CAP — during a network partition it chooses consistency over availability for the minority side. Its trick for global strong consistency at low latency is <strong>TrueTime</strong>: Google equips datacenters with GPS receivers and atomic clocks so every node knows the current time within a small bounded uncertainty (epsilon). Spanner assigns commit timestamps and then "waits out" that uncertainty (commit-wait) before releasing a write, guaranteeing that any transaction that starts later sees it. That bounded clock uncertainty is what lets Paxos-replicated, globally-distributed data behave linearizably — something you can't easily replicate without that clock infrastructure.</p></details>
+  <details><summary>Why do teams standardise on Kubernetes + Terraform instead of native cloud services?</summary><p>To bound lock-in and keep skills/portability. Kubernetes gives the same deployment, scaling, service-discovery and rollout model on EKS, AKS or GKE, so workloads move with minimal rewrite. Terraform gives one declarative IaC language across all three providers (vs CloudFormation/ARM-Bicep being single-cloud). The trade-off is you give up some of the deepest managed-service leverage and take on more operational responsibility (you manage the cluster, addons, upgrades). Most teams still use native managed data services (RDS/BigQuery) because rebuilding those isn't worth it — they accept lock-in where the value is highest and stay portable at the compute/orchestration layer.</p></details>
+  <details><summary>Which cloud would you pick for an analytics-heavy product, and how would you justify it?</summary><p>GCP is the strong default because BigQuery is a serverless warehouse — no cluster to size, storage and compute scale independently, and ad-hoc petabyte queries "just work" with per-query pricing, plus Dataflow (Beam) for streaming/batch ETL and Looker for BI. But I'd justify with the team and data, not hype: if the org is already on AWS with Redshift expertise and the analytics volume is moderate, staying on AWS avoids a migration and egress to move data. The decision is data-gravity + existing skills + query patterns, and BigQuery only wins decisively when ad-hoc, spiky, large-scan analytics dominate.</p></details>
+  <details><summary>How do the three IAM models actually differ, in practice?</summary><p>AWS: identities (users/roles/groups) get JSON policies, and resources can <em>also</em> carry resource-based policies (e.g., an S3 bucket policy); access is the union evaluated with explicit-deny precedence, and cross-account access uses role assumption via STS. Azure: authentication is via Entra ID (the directory), and authorization is Azure RBAC — role assignments scoped at management-group/subscription/resource-group/resource levels, inherited downward. GCP: a resource hierarchy of organization → folders → projects → resources, with IAM bindings (member → role) set at any level and inherited by descendants. So "grant read access" is a policy attach in AWS, a role assignment at a scope in Azure, and a binding on a node in the hierarchy in GCP — and mixing them up is a common source of over-privilege.</p></details>
+  <details><summary>When would you deliberately go multi-cloud, and what does it cost you?</summary><p>Good reasons: regulatory data-residency that one provider can't meet, avoiding a single vendor's outage/lock-in for a critical path, or leveraging a best-of-breed service (e.g., BigQuery on GCP while the app runs on AWS). The costs are real: you multiply operational surface (two IAM models, two networking stacks, two skill sets), you pay inter-cloud egress, you lose the deep integration each provider offers, and you're limited to the lowest-common-denominator (often Kubernetes) to stay portable. For most teams the pragmatic answer is single-cloud with a documented DR plan and portable IaC — full active-active multi-cloud is justified only when the business risk of one provider genuinely outweighs that overhead.</p></details>
+</div>

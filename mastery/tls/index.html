@@ -1,0 +1,357 @@
+<h1>TLS / SSL <span class="tag express">Mastery</span></h1>
+<p>TLS (Transport Layer Security, the successor to SSL) is the protocol that turns a raw TCP or UDP byte stream into an authenticated, confidential, integrity-protected channel. Senior interviews rarely stop at "it encrypts traffic" — they drill into the handshake state machine, ECDHE forward secrecy, the X.509 chain of trust, 0-RTT replay, OCSP soft-fail, and the classic cert-expiry outage. This page pushes past the basics into the wire-level internals.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "TLS gives you three things over TCP: confidentiality, integrity, and server authentication. The handshake uses asymmetric crypto (an ECDHE key exchange plus a certificate signature) only to authenticate the server and agree on a shared secret. From that secret we derive symmetric AEAD keys — AES-GCM or ChaCha20-Poly1305 — and every byte after the handshake is bulk-encrypted with those cheap symmetric keys. Because the key-exchange keys are ephemeral, we get forward secrecy: stealing the server's private key later can't decrypt yesterday's traffic. TLS 1.3 does this in one round trip; 1.2 needed two."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The fuller answer names the moving parts:</p>
+<ul>
+<li><strong>Two crypto systems, two jobs.</strong> Asymmetric (ECDHE for key agreement, RSA/ECDSA signatures for authentication) is used <em>only</em> during the handshake because it is ~1000x slower. Symmetric AEAD ciphers do the bulk data encryption because they are fast and hardware-accelerated (AES-NI).</li>
+<li><strong>Authentication via X.509.</strong> The server presents a certificate chain: leaf → intermediate → root. The client verifies each signature up to a root already in its trust store, checks validity dates, and checks the hostname against the certificate's SubjectAltName (SAN). The certificate is not the secret — it's a signed statement binding a public key to a domain.</li>
+<li><strong>Key agreement is ephemeral.</strong> ECDHE means both sides generate a throwaway key pair per connection, exchange public parts (X25519 or P-256 <code>key_share</code>), and combine them. The shared secret is fed through HKDF to derive handshake secrets, then application traffic secrets. Ephemeral keys give <strong>forward secrecy</strong>.</li>
+<li><strong>TLS 1.3 is a rewrite.</strong> It removed RSA key transport, static DH, RC4, CBC MACs, compression, and renegotiation. Only AEAD suites remain. The handshake is 1-RTT: the client speculatively sends its <code>key_share</code> in the ClientHello, so the server can reply with its <code>key_share</code>, encrypted certificate, CertificateVerify, and Finished in one flight. It also adds 0-RTT resumption.</li>
+<li><strong>Negotiation lives in extensions.</strong> SNI tells the server which virtual host (so it can pick the right cert), ALPN negotiates the app protocol (h2 vs http/1.1 vs h3), <code>supported_versions</code> selects TLS 1.3, and <code>key_share</code>/<code>supported_groups</code> pick the curve.</li>
+</ul>
+
+<h2>Internal Working</h2>
+<h3>TLS 1.3 handshake — step by step (1-RTT)</h3>
+<ol>
+<li><strong>ClientHello.</strong> Client sends: a random nonce, a list of cipher suites (e.g. <code>TLS_AES_128_GCM_SHA256</code>), and extensions — <code>supported_versions</code> (advertises 1.3), <code>supported_groups</code> (X25519, secp256r1), <code>key_share</code> (an <em>actual</em> ephemeral X25519 public key, guessing the group), <code>server_name</code> (SNI, plaintext), <code>signature_algorithms</code>, and <code>application_layer_protocol_negotiation</code> (ALPN).</li>
+<li><strong>ServerHello.</strong> Server picks a cipher suite and group, and returns its own <code>key_share</code>. At this instant both sides can compute the ECDHE shared secret.</li>
+<li><strong>Key schedule.</strong> The raw ECDHE secret is run through HKDF-Extract/Expand with labels ("c hs traffic", "s hs traffic") to derive <strong>handshake traffic secrets</strong>. From this point, everything is encrypted.</li>
+<li><strong>EncryptedExtensions.</strong> Remaining non-secret negotiation (ALPN result, etc.), now under handshake keys.</li>
+<li><strong>Certificate.</strong> Server sends its X.509 chain (leaf + intermediates), encrypted.</li>
+<li><strong>CertificateVerify.</strong> Server signs a transcript hash of everything so far with the private key matching the leaf cert's public key. This proves it <em>owns</em> the key, binding the cert to this handshake.</li>
+<li><strong>Finished (server).</strong> An HMAC over the full transcript using a derived <code>finished_key</code> — integrity check that nothing was tampered with (anti-downgrade).</li>
+<li><strong>Client verifies</strong> the chain, hostname (SAN), dates, and the CertificateVerify signature; then derives <strong>application traffic secrets</strong>.</li>
+<li><strong>Finished (client)</strong> flight, plus optional early application data. Channel is now open.</li>
+</ol>
+<h3>TLS 1.2 handshake — why it needed 2-RTT</h3>
+<ol>
+<li>ClientHello (no <code>key_share</code> — 1.2 negotiates the group first).</li>
+<li>ServerHello + Certificate + ServerKeyExchange (contains the ECDHE params + signature) + ServerHelloDone. <em>First round trip done.</em></li>
+<li>Client sends ClientKeyExchange (its ECDHE public), ChangeCipherSpec, Finished.</li>
+<li>Server ChangeCipherSpec + Finished. <em>Second round trip.</em> Only now can data flow.</li>
+</ol>
+<div class="callout tip"><strong>Say this:</strong> "The reason 1.3 saves a round trip is that the client <em>guesses</em> the key-exchange group and pre-sends its <code>key_share</code> in the ClientHello. If it guessed wrong, the server sends a HelloRetryRequest and you fall back to 2-RTT."</div>
+
+<h3>Record layer</h3>
+<p>After the handshake, application bytes are chunked into TLS records (max 16 KB plaintext), each sealed with an AEAD cipher. AEAD (Authenticated Encryption with Associated Data) means the same operation encrypts <em>and</em> authenticates — no separate MAC, no padding oracle. A per-record nonce is derived from a static IV XOR'd with the record sequence number, so nonces never repeat under one key.</p>
+
+<h2>Why was this built?</h2>
+<ul>
+<li><strong>The pre-TLS world was plaintext.</strong> HTTP, FTP, Telnet, SMTP all sent credentials and data in the clear. Anyone on the path — a coffee-shop Wi-Fi sniffer, a malicious ISP, a compromised router — could read and modify traffic (a man-in-the-middle).</li>
+<li><strong>SSL 2.0 (1995, Netscape)</strong> was the first attempt, quickly broken. SSL 3.0 (1996) was better but died to POODLE in 2014. TLS 1.0 (1999) was SSL 3.1 rebranded under the IETF.</li>
+<li><strong>TLS 1.2 (2008)</strong> added SHA-256, AEAD suites, and became the workhorse of the 2010s.</li>
+<li><strong>TLS 1.3 (2018, RFC 8446)</strong> was a security-and-latency-driven redesign after a decade of attacks (BEAST, CRIME, Lucky13, Heartbleed context, downgrade attacks) taught the community that "negotiable legacy options" are a liability. It ripped out everything non-forward-secret and non-AEAD.</li>
+</ul>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Alternative</th><th>What it is</th><th>When it wins / why TLS beats it</th></tr>
+<tr><td>Plaintext + VPN/IPsec</td><td>Encrypt at the network layer for all traffic</td><td>Wins for site-to-site tunnels and legacy apps you can't touch. TLS wins for per-application, end-to-end, hostname-authenticated security that survives NAT and works through any proxy.</td></tr>
+<tr><td>SSH tunneling</td><td>Encrypted channel via SSH</td><td>Great for admin/port-forwarding. No PKI/CA ecosystem, no browser trust, no ALPN/HTTP semantics.</td></tr>
+<tr><td>App-layer encryption (e.g. JOSE/JWE, Noise)</td><td>Encrypt payloads yourself</td><td>Wins when you need end-to-end secrecy through untrusted intermediaries (e.g. Signal uses Noise-like). Reinventing TLS's authentication + negotiation is error-prone; usually layered <em>on top of</em> TLS.</td></tr>
+<tr><td>QUIC</td><td>UDP transport with TLS 1.3 baked in</td><td>QUIC doesn't replace TLS — it <em>embeds</em> the TLS 1.3 handshake for its crypto. It wins for HTTP/3 (0-RTT, no head-of-line blocking).</td></tr>
+<tr><td>mTLS vs bearer tokens (JWT/OAuth)</td><td>Client auth by cert vs by token</td><td>Tokens win for user-facing auth (revocable, fine-grained scopes). mTLS wins for service-to-service in a mesh (strong cryptographic identity, no shared secret to leak).</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Forward secrecy</strong> by default in 1.3 (ephemeral ECDHE) — compromise of the long-term key doesn't retroactively decrypt captured traffic.</li>
+<li><strong>Hardware-accelerated bulk crypto.</strong> AES-GCM runs at multiple GB/s per core with AES-NI; TLS overhead is single-digit % CPU at scale.</li>
+<li><strong>Ubiquitous PKI.</strong> The CA/browser trust store means clients authenticate servers with zero prior contact.</li>
+<li><strong>AEAD everywhere in 1.3</strong> eliminates whole attack classes (padding oracles, MAC-then-encrypt bugs).</li>
+<li><strong>1-RTT and 0-RTT</strong> make encryption nearly latency-free for repeat visitors.</li>
+<li><strong>Layer-agnostic:</strong> works under HTTP, gRPC, SMTP, AMQP, Postgres, Kafka, etc.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>Handshake latency</strong> on first connect: 1-2 extra round trips before any data. Painful on high-RTT links (satellite, cross-region).</li>
+<li><strong>Certificate operations are a liability</strong> — the number one cause of TLS outages is expired certs, not crypto breaks.</li>
+<li><strong>Revocation is broken in practice</strong> — CRLs are huge, OCSP is slow and privacy-leaking, and browsers soft-fail (treat "can't reach OCSP" as "OK").</li>
+<li><strong>Observability cost:</strong> encrypted traffic is opaque to network monitoring/IDS; you must terminate or use SSLKEYLOGFILE to inspect.</li>
+<li><strong>0-RTT is replayable</strong> and must be handled carefully.</li>
+<li><strong>Complexity:</strong> version/cipher/curve negotiation is a big attack surface historically.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+<li><strong>Security vs latency:</strong> 0-RTT resumption saves a round trip but opens a replay window. You trade a bit of safety for speed and must restrict it to idempotent requests.</li>
+<li><strong>Termination location:</strong> terminate at the edge (LB/CDN) for cheap central cert management and observability, or run end-to-end mTLS for zero-trust — but then you manage certs on every pod.</li>
+<li><strong>Session resumption vs forward secrecy:</strong> long-lived session tickets encrypted under a static ticket key can undermine forward secrecy if that key isn't rotated frequently.</li>
+<li><strong>Cipher choice:</strong> AES-GCM is fastest with AES-NI hardware; ChaCha20-Poly1305 wins on mobile/ARM without AES acceleration. Servers should prefer per-client.</li>
+<li><strong>OCSP stapling</strong> improves privacy and latency but adds a moving part that can itself fail (stale/expired staple).</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't reach for TLS termination-then-plaintext across an untrusted hop and call it "secure end-to-end" — it isn't. And don't add TLS where it buys nothing:
+<ul>
+<li>Loopback-only IPC on the same host (unix sockets) where the kernel already isolates — TLS just adds CPU and cert headaches.</li>
+<li>Inside a trusted, physically isolated network segment where the compliance model already covers it (though zero-trust says encrypt anyway).</li>
+<li>Ultra-constrained IoT devices that can't do ECDHE at your required rate — consider pre-shared-key TLS-PSK or DTLS profiles instead of full X.509.</li>
+<li>When you need message-level end-to-end secrecy through intermediaries — TLS only protects hop-by-hop; use app-layer encryption too.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical layered deployment terminates TLS at the CDN/edge for public traffic, re-encrypts to origin, and runs mTLS between internal services via a service mesh sidecar. Certs come from public CAs (ACME/Let's Encrypt) at the edge and from an internal CA (e.g. mesh CA / Vault PKI) inside.</p>
+<pre class="mermaid">
+flowchart LR
+  U["Client browser"] -->|"TLS 1.3 public cert"| CDN["CDN edge"]
+  CDN -->|"TLS re-encrypt"| LB["Regional load balancer"]
+  LB -->|"TLS termination"| GW["API gateway"]
+  GW -->|"mTLS sidecar"| S1["Service A"]
+  GW -->|"mTLS sidecar"| S2["Service B"]
+  S1 -->|"mTLS internal CA"| S2
+  ACME["ACME Lets Encrypt"] -.->|"auto renew"| CDN
+  VAULT["Internal CA Vault PKI"] -.->|"short lived certs"| S1
+  VAULT -.->|"short lived certs"| S2
+</pre>
+<ul>
+<li><strong>Edge:</strong> public certs, HSTS enabled, OCSP stapling on, ALPN negotiates h2/h3.</li>
+<li><strong>Origin hop:</strong> re-encrypted; the LB validates the origin cert or a pinned CA.</li>
+<li><strong>Mesh:</strong> mTLS with short-lived (hours) certs auto-rotated by the mesh control plane (Istio/Linkerd) — no human touches these.</li>
+</ul>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>Cert expiry outage</strong> — the classic. A cert on a rarely-touched internal service or an intermediate expires; everything depending on it hard-fails at midnight UTC.</li>
+<li><strong>Chain incomplete</strong> — server sends only the leaf, not the intermediate. Works in browsers that cache the intermediate, fails in curl/Java/mobile. Intermittent and maddening.</li>
+<li><strong>Clock skew</strong> — a host with a wrong clock rejects valid certs as "not yet valid" or "expired."</li>
+<li><strong>SNI mismatch</strong> — client omits SNI (old Java, some IoT) and gets the wrong virtual host's default cert.</li>
+<li><strong>Protocol/cipher mismatch</strong> after disabling TLS 1.0/1.1 — legacy clients can't connect.</li>
+<li><strong>OCSP stapling stale</strong> — the staple expires and strict clients (Must-Staple) reject; soft-fail clients proceed.</li>
+<li><strong>Session ticket key not rotated</strong> — undermines forward secrecy across the whole fleet.</li>
+<li><strong>Handshake CPU spike</strong> under a connection storm (no keep-alive, no resumption) — asymmetric ops saturate CPU.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Full handshake, chain, negotiated version and cipher
+openssl s_client -connect example.com:443 -servername example.com -tls1_3
+
+# Show the leaf cert dates, SANs, issuer
+openssl s_client -connect example.com:443 -servername example.com &amp;lt;/dev/null 2&amp;gt;/dev/null \
+  | openssl x509 -noout -dates -subject -issuer -ext subjectAltName
+
+# Verify the chain server actually sends (missing intermediate?)
+openssl s_client -connect example.com:443 -showcerts
+
+# Check OCSP stapling
+openssl s_client -connect example.com:443 -status -servername example.com | grep -A5 "OCSP"
+
+# Test a specific protocol / cipher is offered or refused
+openssl s_client -connect example.com:443 -tls1_2 -cipher ECDHE-RSA-AES128-GCM-SHA256
+
+# Decrypt in Wireshark: export session keys
+export SSLKEYLOGFILE=/tmp/keys.log   # then point Wireshark TLS pref at it</code></pre>
+<ul>
+<li><strong>Signals to read:</strong> <code>Verify return code</code> (0 = ok, 10 = expired, 20 = unable to get local issuer = missing intermediate, 21 = self-signed in chain).</li>
+<li><code>curl -vI https://host</code> to see the negotiated protocol and cert error without a browser cache masking a missing intermediate.</li>
+<li><strong>SSL Labs / testssl.sh</strong> for a full posture scan (protocols, ciphers, HSTS, forward secrecy, chain).</li>
+<li><code>nmap --script ssl-enum-ciphers -p443 host</code> to enumerate accepted ciphers.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>What it means</th><th>Healthy / alert threshold</th></tr>
+<tr><td>cert_days_until_expiry</td><td>Days left on each serving cert</td><td>Alert at &amp;lt; 21 days; page at &amp;lt; 7</td></tr>
+<tr><td>tls_handshake_latency_p99</td><td>Time to complete handshake</td><td>&amp;lt; 50 ms same-region; investigate spikes</td></tr>
+<tr><td>tls_handshake_errors_rate</td><td>Failed handshakes / sec</td><td>Near 0; alert on any sustained rise</td></tr>
+<tr><td>tls_resumption_ratio</td><td>% handshakes resumed (ticket/PSK)</td><td>&amp;gt; 60% for repeat-heavy traffic</td></tr>
+<tr><td>tls_version_distribution</td><td>Share of 1.3 vs 1.2 vs legacy</td><td>Legacy (1.0/1.1) should be ~0</td></tr>
+<tr><td>ocsp_staple_age</td><td>Age of the stapled OCSP response</td><td>Refresh well before its nextUpdate</td></tr>
+<tr><td>handshake_cpu_ratio</td><td>CPU spent on asymmetric ops</td><td>Investigate if resumption is low + CPU high</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "The single most valuable TLS alert is days-until-expiry, scraped for <em>every</em> endpoint including internal and intermediate certs — because the outages come from the cert you forgot about, not the crypto."</div>
+
+<h2>Scaling</h2>
+<p>TLS scales along two axes: handshake throughput (asymmetric, expensive) and bulk throughput (symmetric, cheap). You attack the expensive part with resumption and offload.</p>
+<pre class="mermaid">
+flowchart TD
+  C1["New client"] -->|"full handshake ECDHE"| LB["TLS terminator pool"]
+  C2["Returning client"] -->|"PSK resumption ticket"| LB
+  LB -->|"session ticket key"| KMS["Shared ticket key store"]
+  LB -->|"offload"| NIC["AES NI or QAT card"]
+  LB --> APP["App servers plaintext or reencrypt"]
+</pre>
+<ul>
+<li><strong>Session resumption</strong> (tickets/PSK) skips the certificate + signature, cutting a full handshake to a fast symmetric one — the biggest throughput lever.</li>
+<li><strong>Shared ticket keys</strong> across the terminator pool so any node can resume any session; rotate them (e.g. hourly) to preserve forward secrecy.</li>
+<li><strong>Keep-alive / connection reuse</strong> and HTTP/2 multiplexing amortize one handshake over many requests.</li>
+<li><strong>Hardware offload:</strong> AES-NI is universal; dedicated cards (Intel QAT) offload ECDHE for extreme handshake rates.</li>
+<li><strong>Terminate at the edge</strong> to concentrate cert management and CPU on a specialized fleet.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+<li><strong>Downgrade attacks:</strong> a MITM strips the ClientHello to offer only weak versions. Mitigations: <code>TLS_FALLBACK_SCSV</code> (signals "this is a fallback, reject if you support better"), and the Finished MAC covering the whole transcript so any tampering breaks the handshake. TLS 1.3 also embeds a downgrade sentinel in the ServerHello random.</li>
+<li><strong>Renegotiation attacks:</strong> the 2009 renegotiation flaw allowed prefix injection. TLS 1.3 <em>removed renegotiation entirely</em>; 1.2 needs the <code>renegotiation_info</code> (RFC 5746) extension.</li>
+<li><strong>HSTS:</strong> <code>Strict-Transport-Security: max-age=31536000; includeSubDomains; preload</code> forces HTTPS and stops SSL-strip. Preloading bakes it into browsers.</li>
+<li><strong>SNI leaks the hostname in plaintext</strong> — a network observer sees which site you visit. <strong>ECH (Encrypted Client Hello)</strong> encrypts the SNI under a public key published in DNS (HTTPS/SVCB records).</li>
+<li><strong>Revocation:</strong> CRL (big lists), OCSP (per-cert query, privacy leak + latency), OCSP stapling (server fetches and staples, fixing both), Must-Staple (cert flag forcing strict validation). The <strong>soft-fail problem:</strong> most clients treat an unreachable OCSP responder as "valid," so revocation is weak in practice — hence short-lived certs as the real answer.</li>
+<li><strong>mTLS / zero trust:</strong> both sides present certs; identity is cryptographic, not a bearer token that can leak. Foundation of service meshes (SPIFFE/SPIFFE IDs in SAN URIs).</li>
+<li><strong>Weak crypto:</strong> disable TLS 1.0/1.1, RC4, 3DES, CBC suites, static RSA key exchange. Require forward-secret ECDHE suites.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>Handshake latency:</strong> 1.2 = 2-RTT (~2x your RTT before data); 1.3 = 1-RTT; resumption/0-RTT = 0 added RTT. On a 100 ms RTT link, that's 200 ms saved going 1.2 → 1.3+resumption.</li>
+<li><strong>Asymmetric cost:</strong> an ECDHE + ECDSA handshake is thousands of times pricier than a symmetric record op. A single core does tens of thousands of ECDSA-P256 signs/sec; resumption is ~10x cheaper.</li>
+<li><strong>Bulk throughput:</strong> AES-128-GCM with AES-NI hits multiple GB/s/core; ChaCha20-Poly1305 is comparable in software and faster on non-AES-NI ARM.</li>
+<li><strong>Record size:</strong> 16 KB max plaintext per record; small first records (dynamic record sizing) reduce time-to-first-byte by not buffering a full 16 KB.</li>
+<li><strong>Tuning knobs:</strong> enable session tickets (<code>ssl_session_tickets on</code>), size the session cache (<code>ssl_session_cache</code>), set <code>ssl_buffer_size 4k</code> for latency-sensitive, prefer ECDHE + AEAD, enable OCSP stapling, turn on 0-RTT only for idempotent GETs.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Serving an incomplete chain</strong> (leaf only). <em>Fix:</em> concatenate leaf + intermediates in <code>ssl_certificate</code>; verify with <code>openssl s_client -showcerts</code>.</li>
+<li><strong>No expiry monitoring.</strong> <em>Fix:</em> alert at &amp;lt;21 days on every cert; automate renewal with ACME.</li>
+<li><strong>Manual renewal on many hosts expiring the same day.</strong> <em>Fix:</em> automate + stagger expiry so a bug doesn't take everything down at once.</li>
+<li><strong>Enabling 0-RTT for all methods.</strong> <em>Fix:</em> restrict early data to idempotent, non-state-changing requests; add anti-replay windows.</li>
+<li><strong>Using CN for hostname.</strong> <em>Fix:</em> CN is deprecated for hostname matching; modern clients require SAN — put every name in <code>subjectAltName</code>.</li>
+<li><strong>Never rotating session ticket keys.</strong> <em>Fix:</em> rotate hourly/daily to preserve forward secrecy.</li>
+<li><strong>Trusting soft-fail OCSP for security.</strong> <em>Fix:</em> use short-lived certs + stapling; use Must-Staple only if you can guarantee the staple.</li>
+<li><strong>Pinning certs in mobile apps rigidly.</strong> <em>Fix:</em> pin to the intermediate/public key with backup pins, or you brick the app on rotation.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they plausibly use TLS/SSL</th></tr>
+<tr><td>Google</td><td>Authored TLS 1.3, QUIC, and BoringSSL; TLS 1.3 + HTTP/3 across all properties, ECH rollout, and internal ALTS/mTLS for service-to-service (likely, per public BeyondCorp/zero-trust papers).</td></tr>
+<tr><td>Amazon</td><td>ACM issues and auto-rotates certs for ALB/CloudFront; s2n-tls is their minimal TLS library built after Heartbleed. Internal services likely use mTLS via their own CA.</td></tr>
+<tr><td>Netflix</td><td>TLS termination at Open Connect CDN edge and at the ELB/Zuul gateway; ChaCha20 for mobile clients without AES-NI (likely). Heavy session resumption for repeat streaming clients.</td></tr>
+<tr><td>Uber</td><td>Service mesh with mTLS between microservices for zero-trust identity; edge TLS termination for the mobile app APIs; short-lived internal certs (likely, per their mesh writeups).</td></tr>
+<tr><td>Swiggy</td><td>TLS at CDN + API gateway for the consumer app; likely mTLS between order/payment/delivery services; cert automation to avoid expiry outages during peak dinner load.</td></tr>
+<tr><td>PhonePe</td><td>Regulated payments: TLS 1.2/1.3 with strong ciphers, mTLS to bank/UPI switch partners, HSTS, cert pinning in the mobile app to resist MITM (likely, given RBI security norms).</td></tr>
+<tr><td>Razorpay</td><td>PCI-DSS scope forces strong TLS (1.2+), mTLS for partner/bank integrations, webhook signature + TLS, and strict cipher policy on payment endpoints (likely).</td></tr>
+<tr><td>Atlassian</td><td>Cloud products terminate TLS at edge (AWS/CloudFront), enforce TLS 1.2+ and HSTS, and use mTLS/short-lived certs internally for tenant isolation across microservices (likely).</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What does TLS actually provide over TCP?
+  <ol><li>Confidentiality, integrity, and server authentication (optionally client auth).</li></ol></li>
+<li>Why use both asymmetric and symmetric crypto?
+  <ol><li>Asymmetric only for auth + key agreement (slow); symmetric AEAD for bulk data (fast, hardware-accelerated).</li></ol></li>
+<li>Walk me through the TLS 1.3 handshake.
+  <ol><li>ClientHello with key_share → ServerHello + encrypted cert + CertificateVerify + Finished → client Finished; 1-RTT.</li></ol></li>
+<li>Why is 1.3 one round trip when 1.2 was two?
+  <ol><li>Client pre-sends its ephemeral key_share, guessing the group, so the server can reply in one flight.</li></ol></li>
+<li>What is forward secrecy and where does it come from?
+  <ol><li>Ephemeral ECDHE keys per connection; stealing the long-term key later can't decrypt captured sessions.</li></ol></li>
+<li>How are the actual encryption keys derived?
+  <ol><li>ECDHE shared secret fed through HKDF-Extract/Expand with labels into handshake then application traffic secrets.</li></ol></li>
+<li>What is AEAD and why does 1.3 require it?
+  <ol><li>Combined encrypt+authenticate (AES-GCM, ChaCha20-Poly1305); removes padding-oracle and MAC-order bugs.</li></ol></li>
+<li>Explain the certificate chain of trust.
+  <ol><li>Leaf signed by intermediate signed by root in the client trust store; verify signatures + dates + SAN up the chain.</li></ol></li>
+<li>SAN vs CN — which matters?
+  <ol><li>SAN; CN is deprecated for hostname matching and ignored by modern clients.</li></ol></li>
+<li>What does SNI do and what's its privacy problem?
+  <ol><li>Selects the virtual host so the server picks the right cert; it's plaintext, leaking the hostname — ECH fixes it.</li></ol></li>
+<li>What is ALPN used for?
+  <ol><li>Negotiates the application protocol (h2 / http/1.1 / h3) inside the handshake.</li></ol></li>
+<li>How does session resumption work and what's the risk?
+  <ol><li>Session IDs / tickets / PSK skip cert+signature; static ticket keys undermine forward secrecy unless rotated.</li></ol></li>
+<li>What is 0-RTT and why is it dangerous?
+  <ol><li>Early data on resumption saves a round trip but is replayable; restrict to idempotent requests + anti-replay windows.</li></ol></li>
+<li>How is a cert revoked and why is revocation weak?
+  <ol><li>CRL/OCSP/stapling; clients soft-fail on unreachable responders, so short-lived certs are the practical fix.</li></ol></li>
+<li>What is mTLS and where is it used?
+  <ol><li>Both sides present certs; cryptographic identity for zero-trust service meshes.</li></ol></li>
+<li>How do downgrade attacks work and how are they stopped?
+  <ol><li>MITM strips to weak versions; TLS_FALLBACK_SCSV, transcript Finished MAC, and 1.3 downgrade sentinel prevent it.</li></ol></li>
+<li>Where should you terminate TLS?
+  <ol><li>Edge for central management/observability; end-to-end mTLS for zero-trust, at the cost of per-pod cert ops.</li></ol></li>
+<li>What's the number-one cause of TLS outages?
+  <ol><li>Expired certificates — automate renewal (ACME) and monitor days-to-expiry on every endpoint.</li></ol></li>
+<li>How would you scale TLS to millions of handshakes/sec?
+  <ol><li>Resumption + shared rotating ticket keys, keep-alive, edge termination, AES-NI/QAT offload.</li></ol></li>
+<li>Why did TLS 1.3 remove RSA key transport?
+  <ol><li>Static RSA key exchange has no forward secrecy — one stolen key decrypts all past traffic.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>PKI &amp; certificates:</strong> CAs, ACME/Let's Encrypt, cert transparency logs, key rotation, HSMs. Angle: how trust is bootstrapped and how you automate it.</li>
+<li><strong>HTTP/2 &amp; HTTP/3:</strong> ALPN negotiation, QUIC embedding TLS 1.3, head-of-line blocking. Angle: TLS is the security layer QUIC/HTTP build on.</li>
+<li><strong>Load balancing &amp; CDNs:</strong> termination location, re-encryption, SNI-based routing. Angle: where crypto work lives in the topology.</li>
+<li><strong>Zero-trust &amp; service mesh:</strong> mTLS, SPIFFE IDs, Istio/Linkerd, short-lived certs. Angle: identity without shared secrets.</li>
+<li><strong>Cryptography basics:</strong> ECDHE vs RSA, AEAD, HKDF, curves (X25519 vs P-256), symmetric vs asymmetric cost. Angle: why each primitive is chosen.</li>
+<li><strong>Auth tokens:</strong> JWT/OAuth vs mTLS, token binding. Angle: user auth vs service auth.</li>
+<li><strong>Observability &amp; security:</strong> IDS on encrypted traffic, SSLKEYLOGFILE, decryption at proxies. Angle: the monitoring blind spot TLS creates.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Scenario 1 — The midnight cert-expiry outage</h3>
+<table>
+<tr><th>Symptoms</th><td>At 00:00 UTC, all clients start failing with <code>certificate has expired</code>; browsers show NET::ERR_CERT_DATE_INVALID; API 5xx spike.</td></tr>
+<tr><td>Investigation</td><td><code>openssl s_client ... | openssl x509 -noout -dates</code> shows notAfter in the past; check monitoring — no expiry alert existed for this endpoint.</td></tr>
+<tr><td>Root Cause</td><td>A manually-issued cert on a service not covered by ACME automation expired; nobody owned its renewal.</td></tr>
+<tr><td>Solution</td><td>Issue a new cert immediately (ACME/DNS challenge), deploy, reload without dropping connections (<code>nginx -s reload</code>).</td></tr>
+<tr><td>Prevention</td><td>Inventory every cert; automate all renewals; alert at &amp;lt;21 days; stagger expiries so no single day is a cliff.</td></tr>
+<tr><td>Interview Answer</td><td>"Cert expiry is the most common TLS outage. The fix is process, not crypto: automate renewal and monitor days-to-expiry for every endpoint, including internal and intermediate certs."</td></tr>
+</table>
+
+<h3>Scenario 2 — Works in Chrome, fails in curl/Java (missing intermediate)</h3>
+<table>
+<tr><th>Symptoms</th><td>Browsers connect fine; server-to-server calls and mobile fail with <code>unable to get local issuer certificate</code> intermittently.</td></tr>
+<tr><td>Investigation</td><td><code>openssl s_client -showcerts</code> shows only the leaf; browsers succeeded because they cached the intermediate from a prior site.</td></tr>
+<tr><td>Root Cause</td><td>Server config omitted the intermediate cert in the chain (fullchain vs leaf-only file).</td></tr>
+<tr><td>Solution</td><td>Point <code>ssl_certificate</code> at the fullchain (leaf + intermediates), reload.</td></tr>
+<tr><td>Prevention</td><td>Always deploy fullchain; add a synthetic check with a clean-trust-store client (curl in CI) that fails on incomplete chains.</td></tr>
+<tr><td>Interview Answer</td><td>"Classic incomplete-chain bug. Browsers hide it via AIA fetching / caching; strict clients don't. Serve leaf plus all intermediates and test with a cold client."</td></tr>
+</table>
+
+<h3>Scenario 3 — Handshake CPU storm during a traffic spike</h3>
+<table>
+<tr><th>Symptoms</th><td>During a flash sale, TLS terminators hit 100% CPU, handshake latency p99 jumps to seconds, connections time out.</td></tr>
+<tr><td>Investigation</td><td>Metrics show resumption ratio near 0 and huge new-connection rate; profiling shows time in ECDHE/ECDSA.</td></tr>
+<tr><td>Root Cause</td><td>Clients opened fresh connections per request (no keep-alive) and session tickets were disabled, forcing full handshakes.</td></tr>
+<tr><td>Solution</td><td>Enable session tickets + shared ticket-key store, turn on keep-alive/HTTP-2, add terminator capacity, enable hardware offload.</td></tr>
+<tr><td>Prevention</td><td>Load-test handshake rate, not just throughput; alert on low resumption ratio + high asymmetric CPU.</td></tr>
+<tr><td>Interview Answer</td><td>"Full handshakes are the expensive part. I'd raise the resumption ratio with tickets/PSK and connection reuse, and offload asymmetric ops — that's the biggest lever before adding nodes."</td></tr>
+</table>
+
+<h3>Scenario 4 — 0-RTT replay double-charge</h3>
+<table>
+<tr><th>Symptoms</th><td>A payment POST occasionally executes twice; logs show identical requests microseconds apart from the same client.</td></tr>
+<tr><td>Investigation</td><td>Requests arrived as TLS 1.3 early data; a network retry / MITM replayed the 0-RTT flight.</td></tr>
+<tr><td>Root Cause</td><td>0-RTT early data was accepted for non-idempotent POSTs, which are replayable by design.</td></tr>
+<tr><td>Solution</td><td>Reject early data for state-changing methods (respond 425 Too Early or defer to 1-RTT); add idempotency keys server-side.</td></tr>
+<tr><td>Prevention</td><td>Only allow 0-RTT for idempotent GETs; enable anti-replay windows; require idempotency keys on payment APIs.</td></tr>
+<tr><td>Interview Answer</td><td>"0-RTT trades a round trip for replay risk. Early data must be restricted to idempotent requests, backed by anti-replay windows and server-side idempotency keys."</td></tr>
+</table>
+
+<h3>Scenario 5 — Legacy client breakage after disabling TLS 1.0/1.1</h3>
+<table>
+<tr><th>Symptoms</th><td>After a security hardening, a subset of old partners/devices can no longer connect: <code>handshake failure</code>, no cipher overlap.</td></tr>
+<tr><td>Investigation</td><td><code>nmap ssl-enum-ciphers</code> and access logs show the failing clients only offer TLS 1.0 / weak ciphers.</td></tr>
+<tr><td>Root Cause</td><td>Removing legacy protocols broke clients that never got upgraded.</td></tr>
+<tr><td>Solution</td><td>Coordinate a migration window, provide a temporary legacy endpoint if compliance allows, notify partners with deadlines.</td></tr>
+<tr><td>Prevention</td><td>Track tls_version_distribution before deprecating; announce timelines; sunset legacy on a schedule with dashboards.</td></tr>
+<tr><td>Interview Answer</td><td>"Deprecating protocols is a compatibility project, not a config flip. I'd measure the version distribution first, communicate a deadline, and cut over once legacy traffic is negligible."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Walk me through exactly what bytes cross the wire in a TLS 1.3 handshake and when encryption begins.</summary><p>The ClientHello goes in plaintext: client random, cipher suite list, and extensions including <code>supported_versions</code> (1.3), <code>supported_groups</code>, an actual X25519 <code>key_share</code>, SNI, ALPN, and <code>signature_algorithms</code>. The server replies with ServerHello (its <code>key_share</code>, chosen suite) in plaintext — but the instant both sides have each other's <code>key_share</code>, they compute the ECDHE shared secret and run HKDF to derive handshake traffic secrets. From EncryptedExtensions onward everything is encrypted: EncryptedExtensions, Certificate, CertificateVerify (signature over the transcript proving key ownership), and the server Finished (HMAC over the transcript). The client verifies the chain and signature, derives application secrets, sends its Finished, and data flows. So only ClientHello and ServerHello are ever cleartext.</p></details>
+  <details><summary>Why does CertificateVerify exist if the client already has the certificate?</summary><p>Because possessing a certificate proves nothing — certs are public. CertificateVerify is a signature, made with the private key corresponding to the leaf cert's public key, over a hash of the entire handshake transcript. It proves the server actually <em>controls</em> the private key <em>and</em> binds that proof to this specific handshake (preventing replay of a captured signature). Without it, anyone could present someone else's cert.</p></details>
+  <details><summary>Explain the HKDF key schedule — why not just use the ECDHE secret directly as the AES key?</summary><p>The raw ECDHE output isn't uniformly random and you need many independent keys (client/server handshake, client/server application, finished keys, resumption secret). HKDF-Extract first "whitens" the shared secret into a pseudorandom key; HKDF-Expand then derives each labeled key ("c hs traffic", "s ap traffic", etc.) from it. Distinct labels guarantee the keys are cryptographically independent, and mixing in the transcript hash binds the keys to what was actually negotiated, defeating tampering.</p></details>
+  <details><summary>How does forward secrecy actually work, and how did TLS 1.2 with static RSA lack it?</summary><p>Forward secrecy comes from ephemeral key exchange: each connection generates a fresh ECDHE key pair, uses it once, and discards it. The long-term certificate key only <em>signs</em> — it never encrypts the session key. So capturing traffic and later stealing the cert's private key yields nothing. Old TLS 1.2 RSA key transport had the client encrypt the premaster secret <em>to the server's long-term RSA public key</em>; anyone who later obtained that private key could decrypt every recorded session. That's why 1.3 removed static RSA/DH entirely.</p></details>
+  <details><summary>What's the difference between session IDs, session tickets, and PSK resumption?</summary><p>Session IDs (1.2) require the server to store session state keyed by an ID — stateful, hard to share across a pool. Session tickets (1.2/1.3) push the state to the client: the server encrypts the session under a server-held ticket key and hands it back; on resume the client presents the ticket, keeping the server stateless. In 1.3 this is unified as PSK (pre-shared key) resumption — the ticket becomes a PSK identity used in the ClientHello's <code>pre_shared_key</code> extension, enabling 1-RTT or 0-RTT resumption. The catch: the ticket key must be rotated, or forward secrecy is lost for resumed sessions.</p></details>
+  <details><summary>Why is 0-RTT replayable when nothing else in TLS is?</summary><p>0-RTT early data is encrypted under a key derived solely from the PSK (the resumption secret) — there's no fresh server contribution yet, because the whole point is the client sends data <em>before</em> hearing from the server. Without a server nonce mixed in, an attacker can capture the early-data flight and replay it to the same or another server in the pool, and it'll decrypt and process identically. Mitigations: single-use tickets, anti-replay windows (bounded by clock skew) tracked across the fleet, and — most importantly — only allowing 0-RTT for idempotent requests plus server-side idempotency keys.</p></details>
+  <details><summary>Walk through chain validation and the common failure codes.</summary><p>The client builds a path from the leaf up to a trust anchor: verify each certificate's signature was made by the next issuer's key, check each is within its notBefore/notAfter window, check basic constraints (CA:TRUE for issuers, path length), check key usage / EKU (serverAuth), and match the requested hostname against the leaf's SubjectAltName. It must terminate at a root already in the trust store. Common openssl verify codes: 0 = OK, 10 = certificate expired, 20 = unable to get local issuer (missing intermediate), 21 = unable to verify the first certificate / self-signed, 18 = self-signed in chain. Code 20 is the classic incomplete-chain bug.</p></details>
+  <details><summary>SNI is plaintext — what actually leaks and how does ECH fix it?</summary><p>SNI carries the target hostname in the ClientHello so a server hosting many domains picks the right cert. Because it's cleartext, a passive observer learns exactly which site you're visiting even though the payload is encrypted (and DNS may be encrypted via DoH). ECH (Encrypted Client Hello) fixes this: the server publishes an ECH public key in a DNS HTTPS/SVCB record; the client encrypts the sensitive part of the ClientHello (including the real SNI) to that key, sending only an outer, generic "public" SNI in the clear. The fronting server decrypts the inner ClientHello and routes accordingly. It relies on many domains sharing one ECH config to provide an anonymity set.</p></details>
+  <details><summary>Why is certificate revocation considered broken, and what's the modern answer?</summary><p>CRLs are large and slow to distribute. OCSP queries a responder per-certificate, adding latency and leaking to the CA which sites you visit. OCSP stapling fixes latency/privacy by having the server fetch and attach ("staple") a recent signed OCSP response — but it can go stale or the server can just omit it. The killer is <em>soft-fail</em>: if the OCSP responder is unreachable, virtually all browsers proceed as if the cert is valid, so an attacker who can block OCSP defeats revocation. Must-Staple hardens this per-cert but risks outages if stapling breaks. The practical answer the industry converged on is <strong>short-lived certificates</strong> (days to hours, auto-rotated) so the revocation window is tiny and you rarely need to revoke at all.</p></details>
+  <details><summary>How does mTLS give you zero-trust identity, and how is it operationally different from server-only TLS?</summary><p>In mTLS both peers present certificates and each verifies the other's chain, so a service's identity is a cryptographically-verifiable cert (often a SPIFFE URI in the SAN) rather than a bearer token that can be stolen and replayed. This is the backbone of zero-trust meshes: every hop authenticates both ends regardless of network location. Operationally it multiplies the cert-management problem — now every workload needs a cert and a rotation story. Meshes (Istio, Linkerd) solve this with a control-plane CA issuing very short-lived certs to sidecars automatically, so humans never touch them. The trade-off is added latency/CPU per connection and heavy dependence on the mesh control plane.</p></details>
+  <details><summary>Explain downgrade attacks and every layer of defense against them.</summary><p>A MITM tampers with the ClientHello to remove strong options, forcing a weak protocol/cipher. Defenses stack: (1) the Finished message is an HMAC over the entire handshake transcript, so any modification breaks it; (2) <code>TLS_FALLBACK_SCSV</code> is a signaling cipher that a client includes when it deliberately retries with a lower version — a server that supports higher rejects it, catching forced fallbacks; (3) TLS 1.3 embeds a sentinel in the last 8 bytes of the ServerHello random ("DOWNGRD\x01") that a genuine 1.3-capable server sets when negotiating 1.2, so a 1.3 client detects the downgrade; (4) HSTS prevents protocol-level SSL-strip by forcing HTTPS at the browser.</p></details>
+  <details><summary>Where would you terminate TLS in a large architecture and why?</summary><p>Usually a hybrid. Terminate public TLS at the CDN/edge and the regional load balancer: it centralizes public cert management and OCSP stapling, concentrates handshake CPU on a specialized fleet, and lets you inspect/route traffic. Then re-encrypt the origin hop (edge→origin TLS) so the internal network isn't cleartext. Inside the cluster, run end-to-end mTLS via mesh sidecars for zero-trust service identity. The trade-off axis is management simplicity + observability (edge termination) versus true end-to-end confidentiality and cryptographic identity (mTLS everywhere), at the cost of per-workload cert operations.</p></details>
+  <details><summary>AES-GCM vs ChaCha20-Poly1305 — how do you choose?</summary><p>Both are AEAD and equally secure when used correctly. AES-128/256-GCM is fastest on hardware with AES-NI (essentially all modern x86 and recent ARM), reaching multiple GB/s per core. ChaCha20-Poly1305 is a software stream cipher that's faster and more constant-time on devices <em>without</em> AES acceleration — older phones, low-end ARM, some embedded. Best practice: the server offers both and lets the client's preference (advertised order) or a per-client policy pick, so mobile clients get ChaCha and datacenter clients get AES-GCM. The one hard rule for GCM is never repeat a nonce under the same key — TLS handles this via the sequence-number-derived nonce.</p></details>
+  <details><summary>How do you scale to millions of handshakes per second without melting CPUs?</summary><p>The expensive part is the per-handshake asymmetric operation (ECDHE + signature), not the symmetric bulk crypto. Levers, in order of impact: (1) maximize session resumption — tickets/PSK turn a full handshake into a cheap symmetric one, aim for &amp;gt;60% resumption; (2) share and rotate ticket keys across the whole terminator pool so any node can resume any session (rotate hourly to keep forward secrecy); (3) connection reuse — keep-alive and HTTP/2 multiplexing amortize one handshake over thousands of requests; (4) hardware offload — AES-NI is free, and Intel QAT cards can offload ECDHE for extreme rates; (5) only then scale out terminator nodes. Load-testing must exercise handshake <em>rate</em>, not just steady-state throughput, because the storm is on new connections.</p></details>
+  <details><summary>A cert rotation bricked our mobile app. What went wrong and how should pinning be done?</summary><p>The app almost certainly pinned the leaf certificate's exact public key or fingerprint; when the cert rotated, the new key didn't match any pin and every install failed TLS. Correct pinning pins higher and with backups: pin the <em>intermediate</em> CA or an SPKI (public key) hash, and always ship at least one <strong>backup pin</strong> for a key you'll rotate to next, so rotation is seamless. Include an expiry/kill-switch and a remote-config path to update pins. Many teams have moved away from hard pinning toward Certificate Transparency monitoring plus short-lived certs because rigid pinning is a self-inflicted outage risk.</p></details>
+  <details><summary>How would you debug a report of "TLS handshake failed" from one client population only?</summary><p>First reproduce with <code>openssl s_client -connect host:443 -servername host</code> and read the negotiated version, cipher, and <code>Verify return code</code>. Compare a working vs failing client's offered protocols/ciphers with <code>nmap --script ssl-enum-ciphers</code> — a failing population usually has no cipher/version overlap after a hardening change. Check <code>-showcerts</code> for a missing intermediate (fails strict clients only). Check clock skew on the client (not-yet-valid errors). Confirm SNI is sent (old Java/clients that omit it get the default vhost cert). For deep inspection, set SSLKEYLOGFILE and decrypt in Wireshark to see exactly which flight fails and the alert code (e.g. <code>handshake_failure(40)</code>, <code>protocol_version(70)</code>, <code>certificate_expired(45)</code>). The alert code usually names the root cause directly.</p></details>
+</div>

@@ -1,0 +1,350 @@
+<h1>Concurrency &amp; Async <span class="tag express">Mastery</span></h1>
+<p>Concurrency is about <em>structure</em> — dealing with many things at once — while parallelism is about <em>execution</em> — doing many things at once. This page pushes past "use async/await" into the event loop phases, libuv's thread pool, race conditions and the Coffman deadlock conditions, optimistic vs pessimistic locking, MVCC isolation anomalies, distributed locks with fencing tokens, and the war-stories (double-charged payments, lost counter increments, cache stampedes) that separate an SDE2 from a Staff answer.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Concurrency is structuring a program so independent tasks make progress without blocking each other; parallelism is literally running them on multiple cores at the same instant. You can be concurrent on one core. Node.js runs your JavaScript single-threaded on an event loop, offloading blocking I/O to libuv's thread pool and the OS, so one thread juggles tens of thousands of sockets. The moment shared mutable state is touched by two flows at once, you get a race condition — you fix it with a critical section guarded by a lock, an atomic compare-and-swap, or by pushing the invariant into the database with a conditional UPDATE or SELECT FOR UPDATE. The hard part is never the happy path — it's deadlock, lost updates, and idempotency under retries."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>At senior level I frame it in four layers:</p>
+<ul>
+<li><strong>Execution model.</strong> Three ways to overlap work: multiple <em>processes</em> (isolated address spaces, IPC, expensive context switch ~1-10&#181;s), multiple <em>threads</em> (shared address space, cheap switch, but shared mutable memory = the danger zone), and <em>async I/O</em> on a single thread (the event loop) where the CPU never blocks on a socket — it registers interest with <code>epoll</code>/<code>kqueue</code>/IOCP and gets woken on readiness.</li>
+<li><strong>Node.js specifics.</strong> One JS thread, one event loop (libuv). Each loop iteration walks fixed <em>phases</em>: timers → pending callbacks → poll → check (setImmediate) → close. Between every phase (and after each macrotask) the microtask queues drain: <code>process.nextTick</code> first, then the Promise/microtask queue. CPU-bound work blocks the loop and stalls every connection — you move it to <code>worker_threads</code>, <code>cluster</code>, or an external service. Blocking file/DNS/crypto calls run on libuv's thread pool (default 4, tunable via <code>UV_THREADPOOL_SIZE</code>).</li>
+<li><strong>Correctness under sharing.</strong> A race condition is when the result depends on interleaving; the classic is read-modify-write (<code>x = x + 1</code>) which is three non-atomic steps. You protect the critical section with a mutex, or make the whole operation atomic (CAS, atomic counter), or serialize it in the database. TOCTOU (time-of-check to time-of-use) bugs are the same disease across a gap.</li>
+<li><strong>Coordination hazards.</strong> Deadlock (four Coffman conditions must all hold), livelock, starvation, priority inversion. In distributed systems the same problems reappear as distributed locks (Redis Redlock, ZooKeeper/etcd ephemeral nodes) plus the extra evils of partial failure and clock skew — which is why fencing tokens matter.</li>
+</ul>
+<p>Then I'd name the two big concurrency-control philosophies: <strong>pessimistic</strong> (lock first, then work — <code>SELECT ... FOR UPDATE</code>) wins under high contention; <strong>optimistic</strong> (work, then check nobody changed it — version column CAS) wins under low contention and avoids holding locks across round-trips.</p>
+
+<h2>Internal Working</h2>
+<h3>The Node.js event loop, step by step</h3>
+<ol>
+<li><strong>Bootstrap.</strong> V8 compiles and runs your top-level script synchronously. Any <code>fs.readFile</code>, timer, or socket you register is handed to libuv, which stores callbacks in per-phase queues.</li>
+<li><strong>Timers phase.</strong> libuv checks a min-heap of timers; callbacks whose threshold elapsed run. <code>setTimeout(fn, 0)</code> is really "&ge;1ms, next timers phase".</li>
+<li><strong>Pending callbacks.</strong> Deferred system-level callbacks (e.g. some TCP errors like <code>ECONNREFUSED</code>).</li>
+<li><strong>Poll phase.</strong> The heart. libuv calls <code>epoll_wait</code> (Linux) / <code>kqueue</code> (BSD/macOS) / IOCP (Windows) and blocks here for I/O until either an event fires or the next timer is due. Ready I/O callbacks execute here.</li>
+<li><strong>Check phase.</strong> <code>setImmediate</code> callbacks run — designed to fire right after poll.</li>
+<li><strong>Close callbacks.</strong> <code>socket.on('close')</code> etc.</li>
+<li><strong>Microtask drain.</strong> After each macrotask callback and between phases, Node empties the <code>process.nextTick</code> queue (highest priority) then the Promise microtask queue. A tight recursive <code>nextTick</code> can starve the loop forever.</li>
+</ol>
+<h3>libuv thread pool</h3>
+<ol>
+<li>Truly-async kernel primitives (network sockets) use <code>epoll</code> directly — no thread needed.</li>
+<li>APIs with no portable async syscall — <code>fs.*</code>, <code>dns.lookup</code> (getaddrinfo), <code>crypto.pbkdf2</code>/<code>randomBytes</code>, <code>zlib</code> — are dispatched to a fixed pool of worker threads (default <strong>4</strong>). Set <code>UV_THREADPOOL_SIZE</code> (max 1024) before the process spins up the pool.</li>
+<li>If all 4 threads are busy on slow crypto, your <code>fs.readFile</code> queues behind them even though the disk is idle — a classic "why is my I/O slow" mystery.</li>
+</ol>
+<h3>Race condition &amp; critical section mechanics</h3>
+<ol>
+<li>Two flows execute <code>balance = balance - amount</code>. Machine code: <code>LOAD</code>, <code>SUB</code>, <code>STORE</code>. Interleave two LOADs before either STORE → one update is lost.</li>
+<li>A <strong>mutex</strong> makes the LOAD-SUB-STORE a critical section: only the lock holder enters; others block. Under the hood a mutex is itself built on an atomic instruction (<code>lock cmpxchg</code> / test-and-set) plus a futex to park waiters in the kernel.</li>
+<li><strong>Atomic / CAS</strong> avoids the lock: <code>CAS(addr, expected, new)</code> succeeds only if memory still equals <code>expected</code>; loop and retry on failure. This is lock-free and the basis of optimistic concurrency.</li>
+</ol>
+
+<h2>Why was this built?</h2>
+<p>Before async I/O, servers used <strong>thread-per-connection</strong> (Apache prefork/worker). Each connection = a thread with an ~1-8&nbsp;MB stack; at 10k connections you're spending gigabytes of RAM and drowning in context switches — the <strong>C10k problem</strong>. The kernel scheduler thrashes and most threads are just parked waiting on a socket read.</p>
+<p>Event-driven servers (nginx, then Node.js on libuv) flipped the model: one thread, non-blocking sockets, and a readiness notification syscall (<code>select</code> → <code>poll</code> → <code>epoll</code>). Now one thread services tens of thousands of idle-ish connections because it only wakes for sockets that actually have data. Node made this ergonomic for application developers by exposing it as callbacks/promises rather than raw reactor loops.</p>
+<p>On the data side, before proper concurrency control people used table locks or "last write wins" and quietly corrupted balances. MVCC (invented conceptually in the late 1970s, productionized by Postgres/Oracle/InnoDB) let readers not block writers, which unlocked high-throughput OLTP.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Model</th><th>How it overlaps work</th><th>Wins when</th><th>Loses when</th></tr>
+<tr><td>Thread-per-request (Java/Tomcat)</td><td>OS threads, blocking calls</td><td>CPU-bound mix, mature debugging, true parallelism</td><td>Huge idle connection counts; memory blows up</td></tr>
+<tr><td>Event loop (Node, nginx)</td><td>Single thread + epoll</td><td>I/O-bound fan-out, many idle sockets, WebSockets</td><td>CPU-bound work blocks everything</td></tr>
+<tr><td>Goroutines (Go)</td><td>M:N green threads on a runtime scheduler</td><td>You want blocking-style code AND high concurrency</td><td>You need a mature single-lang ecosystem match</td></tr>
+<tr><td>Virtual threads (Java 21 Loom)</td><td>Millions of cheap threads over few carriers</td><td>Existing blocking Java code, want scale for free</td><td>Very hot pinned synchronized sections</td></tr>
+<tr><td>Actor model (Erlang/Akka)</td><td>Isolated mailboxes, no shared memory</td><td>Fault isolation, telecom-grade uptime</td><td>Shared-state hot paths, low-latency compute</td></tr>
+</table>
+<p>Pessimistic vs optimistic DB locking:</p>
+<table>
+<tr><th>Approach</th><th>Mechanism</th><th>Use when</th></tr>
+<tr><td>Pessimistic</td><td><code>SELECT ... FOR UPDATE</code>, row locks held to commit</td><td>High contention, short txns; must not fail retry (inventory decrement)</td></tr>
+<tr><td>Optimistic</td><td><code>UPDATE ... WHERE version = ?</code>; retry on 0 rows</td><td>Low contention, long think-time (edit-a-form), avoid holding locks</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Event loop:</strong> massive connection concurrency on tiny memory; no per-request thread stack; no lock contention in your JS because there's one thread — you never race on plain JS variables within a single process.</li>
+<li><strong>Async/await:</strong> non-blocking code that reads sequentially; error propagation via <code>try/catch</code>; composable with <code>Promise.all</code>/<code>allSettled</code>.</li>
+<li><strong>Optimistic concurrency:</strong> no lock held across the user's think-time; scales reads; lock-free means no deadlock.</li>
+<li><strong>Worker threads:</strong> real parallelism for CPU work with <code>SharedArrayBuffer</code> zero-copy sharing when you need it.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li>One CPU-bound function (JSON.parse of a 50&nbsp;MB body, sync bcrypt, a regex catastrophe) freezes the entire event loop — every request, including health checks, stalls.</li>
+<li>Single JS thread means one process uses one core; you need <code>cluster</code>/PM2 to use all cores.</li>
+<li>Async stack traces are shallow/confusing without <code>--async-stack-traces</code>; "callback hell" and unhandled rejections crash processes.</li>
+<li>Optimistic concurrency wastes work under high contention (constant retries → livelock-ish thrash).</li>
+<li>Distributed locks are genuinely hard to make correct — most Redis-lock tutorials are subtly wrong.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+<li><strong>Throughput vs latency:</strong> a bigger thread pool / more concurrency raises throughput but queues raise tail latency (Little's Law: L = &#955; &#215; W).</li>
+<li><strong>Consistency vs concurrency:</strong> SERIALIZABLE isolation kills anomalies but serializes conflicting txns (aborts/retries); READ COMMITTED is fast but allows lost updates.</li>
+<li><strong>Lock granularity:</strong> coarse locks are simple but serialize everything; fine-grained locks scale but invite deadlock and ordering bugs.</li>
+<li><strong>Pessimistic vs optimistic:</strong> hold-a-lock (blocking, deadlock risk) vs retry-on-conflict (wasted work, starvation risk).</li>
+<li><strong>Bounded concurrency:</strong> unbounded <code>Promise.all</code> over 10k items DDoSes your DB; a semaphore/p-limit trades peak speed for stability.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't reach for these when they don't fit —
+<ul>
+<li><strong>Node event loop for CPU-heavy compute</strong> (video transcode, ML inference, big crypto batch) — you'll block the loop; use a worker pool or a different runtime.</li>
+<li><strong>Redlock as a correctness guarantee</strong> for money movement without a fencing token — it's a best-effort mutual-exclusion optimization, not a safety property. If correctness depends on it, you also need the DB to reject stale writes.</li>
+<li><strong>Optimistic locking on a hot single row</strong> (a global counter everyone increments) — retry storms; use an atomic DB increment or shard the counter.</li>
+<li><strong>Threads with shared mutable state</strong> when message-passing/immutability would do — every shared variable is a future race report.</li>
+<li><strong>SERIALIZABLE</strong> on a high-throughput hot path where write skew can't actually happen — you're paying abort costs for nothing.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical Node.js API tier: N pods, each running <code>cluster</code> (or one process per core via PM2) behind an L7 load balancer using <code>SO_REUSEPORT</code> so the kernel load-balances accepts across workers. CPU-bound endpoints offload to a worker-thread pool. Cross-instance mutual exclusion (e.g. "only one worker runs this cron") goes through Redis or etcd. Money/inventory correctness lives in Postgres with row locks or version columns — never solely in the app.</p>
+<pre class="mermaid">
+flowchart TD
+  LB["Load Balancer L7"] --> P1["Pod A cluster master"]
+  LB --> P2["Pod B cluster master"]
+  P1 --> W1["Worker proc core 1"]
+  P1 --> W2["Worker proc core 2"]
+  W1 --> WT["worker_threads pool CPU work"]
+  W1 --> PG["Postgres row locks MVCC"]
+  W2 --> PG
+  W1 --> RD["Redis distributed lock"]
+  W2 --> RD
+  PG --> FT["Fencing token authority"]
+</pre>
+<p>Key point: the load balancer and cluster give you <em>parallelism</em> across cores/pods; the event loop inside each worker gives you <em>concurrency</em> across connections; Postgres and Redis provide the <em>coordination</em> that the stateless app tier deliberately does not.</p>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>Event loop lag spikes:</strong> a sync JSON parse or a bad regex pushes <code>event loop delay</code> from &lt;5ms to 800ms; p99 latency and health checks tank, k8s restarts healthy pods.</li>
+<li><strong>Thread pool starvation:</strong> heavy <code>crypto.pbkdf2</code> saturates the 4 libuv threads; unrelated <code>fs</code> reads queue; latency mysteriously correlates with login volume.</li>
+<li><strong>Lost updates:</strong> two requests read a counter, both write +1, one increment vanishes — reconciliation reports show money/stock drift.</li>
+<li><strong>Deadlocks:</strong> two transactions lock rows A then B vs B then A; Postgres kills one with <code>deadlock detected</code> (SQLSTATE 40P01) after <code>deadlock_timeout</code> (default 1s).</li>
+<li><strong>Cache stampede:</strong> a hot key expires; 5000 concurrent requests all miss and hammer the DB simultaneously.</li>
+<li><strong>Double-submit payments:</strong> user double-clicks / client retries a 504 that actually succeeded → two charges, no idempotency key.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Is the event loop blocked? measure lag
+node --require ./monitor-eventloop.js app.js   # perf_hooks.monitorEventLoopDelay
+
+# CPU profile a hot Node process
+node --prof app.js            # then: node --prof-process isolate-*.log
+node --cpu-prof app.js        # emits .cpuprofile for Chrome DevTools
+
+# Live flamegraph on a running PID
+npx 0x -- node app.js
+clinic flame -- node app.js   # clinic.js: flame / doctor / bubbleprof
+
+# Thread pool size check
+UV_THREADPOOL_SIZE=16 node app.js
+node -e 'console.log(process.env.UV_THREADPOOL_SIZE)'
+
+# Postgres: who is blocking whom
+SELECT pid, wait_event_type, wait_event, state, query
+FROM pg_stat_activity WHERE wait_event_type = 'Lock';
+SELECT * FROM pg_locks WHERE NOT granted;
+
+# See deadlocks in the log
+grep 'deadlock detected' /var/log/postgresql/*.log
+
+# Redis lock inspection
+redis-cli TTL lock:order:123
+redis-cli GET  lock:order:123</code></pre>
+<p>Signals to watch: <code>nodejs_eventloop_lag_seconds</code>, GC pause counts (<code>--trace-gc</code>), <code>pg_stat_activity.wait_event = 'Lock'</code>, Redis <code>blocked_clients</code>, and a rising retry-count metric on optimistic updates.</p>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>What it means</th><th>Healthy / alert</th></tr>
+<tr><td>Event loop delay p99</td><td>Time callbacks wait past their schedule</td><td>&lt;10ms healthy; alert &gt;50ms; page &gt;200ms</td></tr>
+<tr><td>libuv pool queue depth</td><td>fs/crypto tasks waiting for a thread</td><td>~0; sustained &gt;0 means bump UV_THREADPOOL_SIZE</td></tr>
+<tr><td>Active handles / requests</td><td>Open sockets, pending libuv reqs</td><td>Flat; monotonic growth = leak</td></tr>
+<tr><td>GC pause time</td><td>V8 stop-the-world pauses</td><td>&lt;50ms; frequent long pauses = heap pressure</td></tr>
+<tr><td>DB lock wait time</td><td>Time txns block on row locks</td><td>&lt;20ms p95; alert on rising trend</td></tr>
+<tr><td>Deadlocks/min</td><td>Postgres 40P01 aborts</td><td>~0; any sustained rate = lock-ordering bug</td></tr>
+<tr><td>Optimistic retry rate</td><td>UPDATE...WHERE version matched 0 rows</td><td>&lt;1% of writes; &gt;10% = wrong strategy/hot row</td></tr>
+<tr><td>Redis blocked_clients</td><td>Clients waiting on blocking ops/locks</td><td>Near 0; spikes = lock contention</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>Vertical inside a process is capped at one core for JS. To use a 16-core box you run 16 worker processes (cluster/PM2) or 16 pods. State that must be shared (locks, counters, sessions) moves out to Redis/DB. CPU work goes to a bounded worker-thread pool sized to core count, not request count.</p>
+<pre class="mermaid">
+flowchart LR
+  A["Incoming requests"] --> Q["Bounded queue semaphore"]
+  Q --> WP["Worker pool size N cores"]
+  WP --> R1["Task 1"]
+  WP --> R2["Task 2"]
+  WP --> R3["Task 3"]
+  R1 --> D["Results"]
+  R2 --> D
+  R3 --> D
+</pre>
+<p><strong>Little's Law</strong> sizes the pool: concurrency L = arrival rate &#955; &#215; service time W. If 500 req/s each take 40ms, you need ~20 in-flight slots. Size the DB connection pool similarly — more connections than the DB can serve just moves the queue into Postgres and adds latency. Shard hot counters (N sub-counters, sum on read) to remove the single-row contention point.</p>
+
+<h2>Security</h2>
+<ul>
+<li><strong>Race-condition auth bypass / TOCTOU:</strong> check-then-act on permissions or balance across an await gap lets attackers exploit the window. Re-validate inside the transaction, not before it.</li>
+<li><strong>Redis lock without fencing token:</strong> a paused (GC/STW) lock holder resumes after its lease expired and another holder took over — two writers. Attach a monotonically increasing fencing token and have the resource reject stale tokens.</li>
+<li><strong>ReDoS:</strong> catastrophic-backtracking regex on user input blocks the single event loop = trivial DoS. Use linear-time regex engines or timeouts.</li>
+<li><strong>SharedArrayBuffer + Spectre:</strong> high-res timing side channels; requires COOP/COEP headers to enable, isolate untrusted code.</li>
+<li><strong>Idempotency key spoofing:</strong> scope keys per-user and validate ownership so one user can't replay another's key.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li>Context switch: thread ~1-5&#181;s, process heavier; an epoll wakeup for one ready socket avoids waking thousands of parked threads.</li>
+<li>Uncontended mutex lock/unlock ~20-50ns (atomic + no syscall); contended lock = futex syscall + context switch ~1-5&#181;s.</li>
+<li>Atomic CAS ~10-30ns but a cache-line ping-pong under contention (<strong>false sharing</strong> — two hot variables on the same 64-byte line) can cost 100x; pad to separate cache lines.</li>
+<li>Node event loop can push 50k-100k+ req/s of light I/O on one core; a single 10ms sync CPU chunk caps you at ~100 req/s on that endpoint.</li>
+<li>Tuning knobs: <code>UV_THREADPOOL_SIZE</code>, <code>--max-old-space-size</code>, keep-alive agents (<code>maxSockets</code>), DB pool size (~= cores &#215; 2 to 4 as a start), batch/pipeline round-trips, and offload CPU to workers.</li>
+</ul>
+<div class="callout tip"><strong>Say this:</strong> "I size pools with Little's Law and I measure event-loop lag as my primary saturation signal, not CPU% — a Node box can be 30% CPU and completely stalled if one handler blocks."</div>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Blocking the loop</strong> with <code>fs.readFileSync</code>, sync bcrypt, or huge JSON in a request handler. Fix: async APIs, worker threads, stream/chunk.</li>
+<li><strong><code>await</code> inside a loop</strong> serializing independent calls. Fix: <code>Promise.all</code> — but bound it with p-limit for large N.</li>
+<li><strong>Unbounded <code>Promise.all</code></strong> over thousands of items → connection-pool exhaustion. Fix: semaphore / p-limit / batching.</li>
+<li><strong>Read-modify-write in app code</strong> for counters/balances. Fix: atomic DB op or optimistic version check.</li>
+<li><strong>Inconsistent lock ordering</strong> across transactions → deadlocks. Fix: always acquire in a canonical order (e.g. by primary key ascending).</li>
+<li><strong>Forgetting idempotency</strong> on POST/payment endpoints. Fix: idempotency key with a unique constraint.</li>
+<li><strong>Swallowed promise rejections</strong> / missing <code>await</code>. Fix: lint <code>no-floating-promises</code>, handle <code>unhandledRejection</code>.</li>
+<li><strong>Holding a DB lock across an external HTTP call.</strong> Fix: do the network call outside the transaction.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they plausibly use it</th></tr>
+<tr><td>Google</td><td>Spanner uses TrueTime + Paxos for externally-consistent distributed transactions; two-phase locking for read-write txns and lock-free snapshot reads at a timestamp — concurrency control at planetary scale.</td></tr>
+<tr><td>Amazon</td><td>DynamoDB conditional writes (<code>ConditionExpression</code>) are optimistic concurrency; idempotency and exactly-once semantics on order pipelines; likely fencing-token-style guards on inventory decrement.</td></tr>
+<tr><td>Netflix</td><td>Heavy Node.js/JVM edge tier; bounded concurrency and bulkheads via Hystrix/resilience4j; async reactive streams (RxJava) with backpressure to protect downstreams.</td></tr>
+<tr><td>Uber</td><td>Surge/dispatch requires serializing driver-rider matching per region; likely optimistic version checks on trip state and distributed locks (Ringpop/consistent hashing) to avoid double-assigning a driver.</td></tr>
+<tr><td>Swiggy</td><td>Order-assignment and restaurant-inventory decrement are hot contended rows; likely pessimistic row locks or atomic decrements plus idempotency keys on payment callbacks to prevent double orders.</td></tr>
+<tr><td>PhonePe</td><td>UPI money movement demands strict idempotency and lost-update prevention; ledger entries via serializable/row-locked transactions; fencing on any distributed lock for settlement jobs.</td></tr>
+<tr><td>Razorpay</td><td>Payment idempotency keys are core API contract; webhook processing must be idempotent (at-least-once delivery); optimistic locking on payment state machine transitions.</td></tr>
+<tr><td>Atlassian</td><td>Jira concurrent issue edits use optimistic locking (version field → 409 conflict); Confluence collaborative editing needs operational transforms/CRDT-style merge; async job queues for indexing.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What's the difference between concurrency and parallelism?
+<ol><li>Structure vs execution; concurrency possible on one core, parallelism needs multiple.</li></ol></li>
+<li>Node is single-threaded — how does it do thousands of concurrent connections?
+<ol><li>Event loop + epoll; blocking work offloaded to libuv pool / OS.</li></ol></li>
+<li>Walk me through the event loop phases.
+<ol><li>timers → pending → poll → check → close, microtasks drained between each.</li></ol></li>
+<li>Where do <code>nextTick</code> and Promise callbacks run?
+<ol><li>Microtask queues between phases; nextTick before promises; both can starve the loop.</li></ol></li>
+<li>What runs on the libuv thread pool and how big is it?
+<ol><li>fs, dns.lookup, crypto, zlib; default 4, tune UV_THREADPOOL_SIZE.</li></ol></li>
+<li>You have CPU-heavy work in a handler — what do you do?
+<ol><li>worker_threads / cluster / external service; never block the loop.</li></ol></li>
+<li>Difference between worker_threads and cluster?
+<ol><li>Threads share memory (SharedArrayBuffer, MessagePort); cluster = separate processes, SO_REUSEPORT.</li></ol></li>
+<li>What is a race condition? Give the canonical example.
+<ol><li>Result depends on interleaving; read-modify-write on a counter loses updates.</li></ol></li>
+<li>How do you protect a critical section?
+<ol><li>Mutex/lock, or make op atomic (CAS), or serialize in DB.</li></ol></li>
+<li>What are the four Coffman conditions for deadlock?
+<ol><li>Mutual exclusion, hold-and-wait, no preemption, circular wait — break any one.</li></ol></li>
+<li>How do you prevent deadlock in practice?
+<ol><li>Global lock ordering, try-lock with timeout, lock-free designs.</li></ol></li>
+<li>Optimistic vs pessimistic locking — when each?
+<ol><li>Optimistic (version CAS) low contention; pessimistic (FOR UPDATE) high contention.</li></ol></li>
+<li>Explain the DB isolation levels and their anomalies.
+<ol><li>RU/RC/RR/Serializable vs dirty/non-repeatable/phantom/lost-update/write-skew.</li></ol></li>
+<li>What is MVCC and how does SSI work?
+<ol><li>Versioned rows, readers don't block writers; SSI detects dangerous read-write dependency cycles and aborts.</li></ol></li>
+<li>Is Redlock safe for correctness?
+<ol><li>No — Kleppmann: needs fencing tokens; it's a mutual-exclusion optimization, not a safety guarantee.</li></ol></li>
+<li>What's a fencing token and who enforces it?
+<ol><li>Monotonic number; the protected resource rejects lower tokens.</li></ol></li>
+<li>How do ZooKeeper/etcd locks work?
+<ol><li>Sequential ephemeral nodes; watch predecessor; ephemerality releases on session loss; leases.</li></ol></li>
+<li>How do you make a payment endpoint idempotent?
+<ol><li>Client-supplied idempotency key + unique constraint; return the prior result on replay.</li></ol></li>
+<li>How do you prevent a cache stampede?
+<ol><li>Single-flight lock, request coalescing, stale-while-revalidate, jittered TTL.</li></ol></li>
+<li>How do you size a thread/connection pool?
+<ol><li>Little's Law L = &#955;W; measure service time, don't overshoot the DB.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>Databases:</strong> "So how does Postgres MVCC store versions?" — expect xmin/xmax tuple visibility, VACUUM, and why long transactions bloat.</li>
+<li><strong>Distributed systems:</strong> "How does this relate to consensus?" — Raft/Paxos elect a leader so you don't need a distributed lock at all; leader lease vs lock.</li>
+<li><strong>Caching:</strong> "Stampede vs thundering herd vs dogpile?" — same family; single-flight and probabilistic early expiration.</li>
+<li><strong>Message queues:</strong> "At-least-once delivery means what for me?" — consumers must be idempotent; dedup keys; outbox pattern.</li>
+<li><strong>Memory model:</strong> "What is false sharing / memory ordering?" — cache-line contention; acquire/release semantics; why Atomics exist.</li>
+<li><strong>OS internals:</strong> "epoll vs select?" — O(1) vs O(n) fd scanning; edge vs level triggered.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Incident 1 — Double-charged payments after a timeout</h3>
+<table>
+<tr><th>Symptoms</th><td>Customers report two charges; support tickets spike after a downstream gateway slowdown.</td></tr>
+<tr><th>Investigation</th><td>Logs show client retried a request that returned 504; both requests reached the gateway and succeeded; no idempotency key on the endpoint.</td></tr>
+<tr><th>Root Cause</th><td>The 504 was a proxy timeout, not a real failure — the original charge committed. Retry created a second charge.</td></tr>
+<tr><th>Solution</th><td>Require an idempotency key; store <code>(key → response)</code> with a unique DB constraint; on replay return the stored result instead of re-charging.</td></tr>
+<tr><th>Prevention</th><td>Make all money-moving POSTs idempotent by contract; treat timeouts as "unknown", not "failed"; short-circuit duplicate keys before hitting the gateway.</td></tr>
+<tr><th>Interview Answer</th><td>"Timeouts are ambiguous. Correctness comes from an idempotency key backed by a unique constraint, so a retry is a no-op that returns the first outcome."</td></tr>
+</table>
+
+<h3>Incident 2 — Lost counter increments on a viral post</h3>
+<table>
+<tr><th>Symptoms</th><td>Like count visibly lower than actual likes; reconciliation shows drift proportional to traffic.</td></tr>
+<tr><th>Investigation</th><td>Code does <code>SELECT count</code> → <code>count+1</code> → <code>UPDATE</code> in app; concurrent requests read the same value.</td></tr>
+<tr><th>Root Cause</th><td>Classic lost update: read-modify-write outside a transaction/atomic op under high concurrency.</td></tr>
+<tr><th>Solution</th><td>Replace with atomic <code>UPDATE posts SET likes = likes + 1</code> (or Redis <code>INCR</code>); for extreme hotness, shard into N sub-counters and sum on read.</td></tr>
+<tr><th>Prevention</th><td>Ban app-side read-modify-write on shared numeric state in review; default to atomic DB operations.</td></tr>
+<tr><th>Interview Answer</th><td>"Push the increment into the database as one atomic statement so there's no read-modify-write window; shard the counter if a single row gets too hot."</td></tr>
+</table>
+
+<h3>Incident 3 — Seat/inventory double-booking</h3>
+<table>
+<tr><th>Symptoms</th><td>Two users get confirmation for the same seat; oversold by a handful of units at peak.</td></tr>
+<tr><th>Investigation</th><td>Availability checked, then inserted booking — a TOCTOU gap; both requests passed the check before either wrote.</td></tr>
+<tr><th>Root Cause</th><td>Check-then-act across concurrent transactions without a lock or constraint.</td></tr>
+<tr><th>Solution</th><td>Pessimistic: <code>SELECT ... FOR UPDATE</code> the seat row inside the txn; or optimistic decrement <code>UPDATE seats SET taken=true WHERE id=? AND taken=false</code> and treat 0 rows as "already gone"; or a unique constraint on (event, seat).</td></tr>
+<tr><th>Prevention</th><td>Make the invariant a DB constraint, not an app check; do the availability check and the write in the same atomic step.</td></tr>
+<tr><th>Interview Answer</th><td>"I collapse check-and-reserve into one conditional UPDATE guarded by a unique constraint, so the database — not a racy app check — enforces single ownership."</td></tr>
+</table>
+
+<h3>Incident 4 — API stall correlated with login traffic</h3>
+<table>
+<tr><th>Symptoms</th><td>Unrelated endpoints slow down whenever login volume rises; CPU only ~40%.</td></tr>
+<tr><th>Investigation</th><td>Event-loop lag fine, but libuv pool queue depth spikes; logins use sync-ish <code>crypto.pbkdf2</code> which runs on the 4-thread pool; fs reads queue behind them.</td></tr>
+<tr><th>Root Cause</th><td>libuv thread pool starvation — password hashing monopolized all 4 threads.</td></tr>
+<tr><th>Solution</th><td>Raise <code>UV_THREADPOOL_SIZE</code> to match core count, move hashing to a dedicated worker pool, and use the async crypto API so it doesn't block the JS thread.</td></tr>
+<tr><th>Prevention</th><td>Monitor pool queue depth; isolate CPU-crypto onto its own workers; capacity-test auth separately.</td></tr>
+<tr><th>Interview Answer</th><td>"Low CPU with high latency screams saturation somewhere else — here the 4-thread libuv pool. I isolate crypto and size the pool to the box."</td></tr>
+</table>
+
+<h3>Incident 5 — Cache stampede takes down the DB</h3>
+<table>
+<tr><th>Symptoms</th><td>DB CPU pegs and latency explodes exactly when a popular cache key expires.</td></tr>
+<tr><th>Investigation</th><td>Thousands of concurrent requests miss the same key simultaneously and all recompute against the DB.</td></tr>
+<tr><th>Root Cause</th><td>Synchronized expiry + no request coalescing = thundering herd on the origin.</td></tr>
+<tr><th>Solution</th><td>Single-flight: first miss takes a short lock and populates; others wait or serve stale. Add stale-while-revalidate and jittered TTLs.</td></tr>
+<tr><th>Prevention</th><td>Probabilistic early expiration (XFetch), TTL jitter, and per-key locks on recompute.</td></tr>
+<tr><th>Interview Answer</th><td>"I coalesce misses with a single-flight lock so only one request recomputes while the rest serve slightly-stale data, and I jitter TTLs to avoid synchronized expiry."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Explain exactly what happens when you call <code>setTimeout(fn,0)</code>, <code>setImmediate(fn)</code>, and <code>process.nextTick(fn)</code> together.</summary><p><code>nextTick</code> runs first — it's drained before the loop even continues to the next phase, ahead of the Promise microtask queue. <code>setImmediate</code> fires in the check phase. <code>setTimeout(,0)</code> is clamped to &ge;1ms and fires in the next timers phase. Ordering of setTimeout vs setImmediate at top level is non-deterministic (depends on how fast the loop entered), but <em>inside an I/O callback</em> setImmediate always wins because you're already past timers and about to hit check. Recursive nextTick starves I/O entirely because the nextTick queue must fully empty before the loop proceeds.</p></details>
+  <details><summary>Why can raising <code>UV_THREADPOOL_SIZE</code> make things worse?</summary><p>The pool threads are real OS threads competing for cores with your JS thread and GC. If you set it to 128 on a 4-core box, you get context-switch thrash and cache pollution; crypto tasks that are CPU-bound don't get faster past core count. The right size is roughly the number of cores you can spare for blocking work, and you should isolate genuinely CPU-heavy work into dedicated worker_threads instead of inflating the shared libuv pool that also serves fs/dns.</p></details>
+  <details><summary>Redlock: what precisely does Kleppmann object to, and what's the fix?</summary><p>Two failure classes: (1) timing — a client acquires the lock, then a GC pause or network stall exceeds the lease; the lock expires, another client acquires it, and the first client wakes up believing it still holds the lock — now two writers. (2) Redlock's reliance on bounded clock drift and majority-of-N independent masters doesn't survive process pauses. The fix isn't a better lock; it's a <strong>fencing token</strong>: the lock service hands out a monotonically increasing number, the client passes it to the protected resource (DB/storage), and the resource rejects any write carrying a token lower than the highest it has seen. That converts a liveness optimization into an actual safety guarantee.</p></details>
+  <details><summary>What is write skew and why doesn't SNAPSHOT isolation prevent it?</summary><p>Write skew: two transactions read an overlapping set, each checks an invariant that currently holds, then each writes to <em>different</em> rows in a way that jointly violates the invariant (classic: two doctors both on-call, each checks "at least one other is on-call", both go off-call → zero on-call). Snapshot isolation gives each txn a consistent read snapshot and prevents write-write conflicts on the <em>same</em> row, but here they write different rows, so no conflict is detected. Only SERIALIZABLE (in Postgres, Serializable Snapshot Isolation) catches it by tracking read-write dependencies and aborting one txn when it detects a dangerous cycle. Alternatively materialize the conflict with a lock (SELECT FOR UPDATE on a summary row).</p></details>
+  <details><summary>How does Postgres MVCC actually implement snapshots, and what's the cost?</summary><p>Every row version (tuple) carries <code>xmin</code> (creating txn) and <code>xmax</code> (deleting/updating txn). A transaction's snapshot is the set of committed txn IDs visible to it; a tuple is visible if its xmin is committed-and-visible and its xmax is not. UPDATE writes a new tuple and marks the old one's xmax — it doesn't overwrite. Cost: dead tuples accumulate → table/index bloat; <code>VACUUM</code> (and autovacuum) reclaims them and advances the frozen-XID horizon to avoid transaction-ID wraparound. Long-running transactions hold back the xmin horizon so vacuum can't clean up — a single idle-in-transaction connection can bloat the whole DB.</p></details>
+  <details><summary>Design a correct, high-throughput global counter.</summary><p>Never read-modify-write in app code. For moderate rates use one atomic statement (<code>UPDATE ... SET n = n + 1</code>) or Redis <code>INCR</code> (single-threaded, so atomic). For a viral hot key, shard: keep K rows/keys (counter_0..counter_K-1), each request increments a random shard, and reads SUM across shards. This trades read cost for eliminating the single-row lock contention. If you need exactness with durability, batch increments in memory and flush atomically, accepting a small loss window, or use an append-only event log and materialize the count.</p></details>
+  <details><summary>Two services deadlock acquiring rows in different orders. Walk through the fix.</summary><p>Deadlock needs all four Coffman conditions; the cheapest to break is circular wait via a <strong>global lock ordering</strong> — always lock rows in ascending primary-key order regardless of business order, so no cycle can form. Backups: acquire with <code>SELECT ... FOR UPDATE NOWAIT</code> or a <code>lock_timeout</code> so one txn fails fast and retries instead of hanging; keep transactions short; never call external services while holding locks. Postgres already runs a deadlock detector (after <code>deadlock_timeout</code>, default 1s) that aborts one victim with 40P01 — but you want to avoid triggering it, not rely on it.</p></details>
+  <details><summary>How do ZooKeeper sequential ephemeral znodes implement a fair lock?</summary><p>Each client creates an <em>ephemeral sequential</em> child under <code>/lock</code>, getting a monotonically increasing suffix. The client lists children; if it has the lowest sequence it holds the lock. Otherwise it sets a <em>watch</em> on the next-lower znode only (avoids herd effect) and waits. When the predecessor's client dies, its ephemeral node vanishes automatically (session timeout), the watch fires, and the waiter rechecks. This gives FIFO fairness and automatic release on crash. The session/lease is the safety anchor; combine with a fencing token (the sequence number works) for downstream safety.</p></details>
+  <details><summary>What's false sharing and how do you detect and fix it?</summary><p>CPUs move memory in 64-byte cache lines. If two threads write two <em>different</em> variables that happen to sit on the same line, each write invalidates the other core's cached line (MESI protocol), causing a cache-line ping-pong even though there's no logical sharing — throughput can drop 5-100x. Detect with <code>perf c2c</code> (cache-to-cache) or high LLC-miss counts on hot atomics. Fix by padding/aligning hot per-thread variables to their own cache line (e.g. 64-byte alignment, or spacing array elements).</p></details>
+  <details><summary>When would you choose optimistic locking and how do you handle the retry?</summary><p>Choose optimistic when conflicts are rare and you don't want to hold a lock across user think-time (editing a Jira issue, updating a profile). Add a <code>version</code> column; read it with the row; write with <code>UPDATE ... SET ..., version = version + 1 WHERE id = ? AND version = ?</code>. Zero rows affected means someone else won — you reload, reapply, and retry (bounded, with backoff) or surface a 409 to the user. Cap retries to avoid livelock; if retry rate climbs past ~10% the row is too hot and you should switch to pessimistic or atomic ops.</p></details>
+  <details><summary>How do you bound concurrency in Node without a library, and why does it matter?</summary><p>Unbounded <code>Promise.all(items.map(fetchFromDb))</code> over 10k items opens 10k concurrent operations, exhausting the DB connection pool and often crashing downstreams. A semaphore bounds in-flight work: keep a counter of available permits, acquire before starting, release in a <code>finally</code>, and queue waiters. Or use p-limit (<code>const run = pLimit(20)</code>). Size the bound with Little's Law and the downstream's capacity, not your item count — the goal is steady throughput, not peak burst.</p></details>
+  <details><summary>Explain backpressure in Node streams.</summary><p>When a writable's internal buffer exceeds <code>highWaterMark</code>, <code>write()</code> returns <code>false</code>, signaling the producer to pause until the <code>'drain'</code> event. <code>pipe()</code> / <code>pipeline()</code> wire this automatically: a slow consumer (disk, network) throttles a fast producer so memory doesn't balloon. Ignoring the <code>false</code> return and writing anyway buffers unbounded in RAM — the Node equivalent of a memory leak under load. Backpressure is flow control: it propagates the slowest stage's rate back up the pipeline.</p></details>
+  <details><summary>Difference between livelock, starvation, and priority inversion.</summary><p><strong>Livelock:</strong> threads keep changing state in response to each other and make no progress (two people stepping aside in a hallway) — common with naive retry-on-conflict without backoff. <strong>Starvation:</strong> a thread never gets the resource because others keep jumping ahead (unfair scheduling, writer starved by constant readers). <strong>Priority inversion:</strong> a high-priority task waits on a lock held by a low-priority task that's itself preempted by a medium-priority task — the classic Mars Pathfinder bug; fixed by priority inheritance (raise the holder's priority to the waiter's).</p></details>
+  <details><summary>Why is a single event-loop model good for WebSockets but bad for image processing?</summary><p>WebSockets are mostly-idle long-lived connections doing tiny I/O — perfect for one thread + epoll servicing 100k sockets on a few MB. Image/video processing is pure CPU: a single frame's work occupies the one JS thread for tens of ms, during which <em>every</em> connection stalls (you can't even answer a ping). The fix is to keep the loop for I/O and hand CPU work to worker_threads or a separate service, so the event loop stays responsive and the heavy lifting parallelizes across cores.</p></details>
+  <details><summary>How do you make webhook processing idempotent under at-least-once delivery?</summary><p>Providers (Stripe, Razorpay) retry webhooks until you 2xx, so you'll get duplicates. Persist each event's provider ID with a unique constraint; on receipt, attempt insert — if it conflicts, you've seen it, ack and skip. Do the business side-effect and the dedup insert in the <em>same</em> transaction so a crash between them can't double-process. Also verify the signature and process idempotently at the effect level (e.g. "mark order paid" is naturally idempotent) as defense in depth.</p></details>
+  <details><summary>What does Little's Law tell you about a saturating queue, and how do you use it operationally?</summary><p>L = &#955; &#215; W: average items in the system equals arrival rate times average time in system. Operationally, if arrival rate &#955; exceeds service capacity, W grows without bound — the queue and latency explode. You use it to size pools (needed concurrency = &#955; &#215; service time), to predict when adding load will tip you over, and to reason about tail latency: shedding load (rejecting excess) keeps W bounded, whereas an unbounded queue converts an overload into a latency catastrophe. Bounded queues + load shedding beat infinite queues.</p></details>
+</div>
