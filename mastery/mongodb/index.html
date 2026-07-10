@@ -1,0 +1,395 @@
+<h1>MongoDB <span class="tag express">Mastery</span></h1>
+<p>MongoDB is a distributed document database: BSON documents in collections, WiredTiger as the storage engine, replica sets for HA/durability, and range/hash sharding for horizontal scale. This page is the senior-interview deep dive — internals, config knobs, real numbers, and the follow-up drill tree.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "MongoDB stores schema-flexible <em>BSON documents</em> in collections. Durability and HA come from a <em>replica set</em> — one primary takes writes, secondaries replicate the <em>oplog</em> (a capped collection), and a Raft-like election picks a new primary in ~10-12s if the primary dies. The <em>WiredTiger</em> engine gives document-level concurrency, MVCC snapshots, and checkpoints every 60s backed by a journal WAL. You scale writes horizontally by <em>sharding</em> on a well-chosen shard key. The whole game is picking the shard key and the indexes right up front — get those wrong and you get hot shards, jumbo chunks, and collection scans."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>Structure the fuller answer around four layers:</p>
+<ol>
+  <li><strong>Data model:</strong> BSON documents (typed binary JSON — has <code>ObjectId</code>, <code>Date</code>, <code>Decimal128</code>, binary), max 16 MB per doc. You model by <em>embedding</em> (denormalize what's read together) vs <em>referencing</em> (normalize unbounded or independently-updated data). The document is the unit of atomicity.</li>
+  <li><strong>Storage engine — WiredTiger:</strong> B-tree per collection/index, document-level MVCC concurrency (writers don't block readers), an in-memory cache (default 50% of RAM − 1 GB), <em>checkpoints every 60s</em> that flush a consistent snapshot to disk, and a <em>journal (WAL)</em> that group-commits every ~50-100 ms so a crash loses at most that window. Snappy compression on data, prefix compression on indexes.</li>
+  <li><strong>Replication:</strong> A replica set (typically P + 2 S, or P + S + arbiter). Secondaries tail the primary's <em>oplog</em> (an idempotent, capped op log). Elections use a protocol version 1 (Raft-like) with terms and heartbeats every 2s; <code>electionTimeoutMillis</code> default 10s. You tune correctness with <em>write concern</em> (<code>w:1</code>, <code>w:majority</code>, <code>j:true</code>) and <em>read concern</em> (<code>local</code>, <code>majority</code>, <code>linearizable</code>) plus <em>read preference</em>.</li>
+  <li><strong>Sharding:</strong> <code>mongos</code> routers, config servers (a replica set holding the metadata/chunk map), and shards (each a replica set). Data is split into <em>chunks</em> by shard key; the <em>balancer</em> migrates chunks to keep shards even. Hashed vs ranged. Monotonic keys (<code>_id</code>, timestamp) create a hot shard.</li>
+</ol>
+<p>Then name the levers: ESR index rule, covered queries, aggregation pipeline, and multi-document ACID transactions (4.0 on replica sets, 4.2 across shards, 60s default limit).</p>
+
+<h2>Internal Working</h2>
+<h3>Path of a write</h3>
+<ol>
+  <li>Client sends <code>insert/update</code> to the primary (driver picks primary via topology monitoring).</li>
+  <li>Query planner resolves the doc; WiredTiger takes a <strong>document-level intent lock</strong> and writes into its in-memory cache page (MVCC — creates a new version visible at the current snapshot).</li>
+  <li>The operation is appended to the <strong>journal (WAL)</strong> in <code>collection-*.wt</code>-adjacent journal files; journal group-commit fsyncs every ~50 ms (or immediately if <code>j:true</code> is requested).</li>
+  <li>A corresponding idempotent entry is written to the <strong>oplog</strong> (<code>local.oplog.rs</code>), a capped collection. Idempotent means an update like <code>$inc</code> is rewritten to a <code>$set</code> of the resulting value so replaying is safe.</li>
+  <li>Secondaries <strong>tail the oplog</strong> via a long-poll <code>getMore</code> on a cursor, apply ops in parallel batches (by document id to preserve order), and advance their <code>lastApplied</code> optime.</li>
+  <li>The write's <code>w:majority</code> acknowledgement returns only after a majority of voting members have persisted the op (tracked via replication heartbeats + optime).</li>
+  <li>Every 60s WiredTiger writes a <strong>checkpoint</strong>: a consistent on-disk snapshot. After a checkpoint, journal older than the checkpoint can be reclaimed. On crash recovery, WiredTiger loads the last checkpoint and replays the journal forward.</li>
+</ol>
+<h3>Key data structures</h3>
+<ul>
+  <li><strong>B-tree</strong> — one per collection (clustered by internal RecordId) and one per index. Leaf pages hold documents/keys; WiredTiger uses copy-on-write pages.</li>
+  <li><strong>Oplog</strong> — capped collection, fixed size (default 5% of free disk, min 990 MB, cap ~50 GB), FIFO ring. Its length in <em>time</em> is your replication safety window.</li>
+  <li><strong>MVCC snapshots</strong> — read transactions see a point-in-time view; <code>readConcern: "majority"</code> reads the majority-committed snapshot.</li>
+</ul>
+
+<h2>Why was this built?</h2>
+<p>MongoDB (2009, 10gen) targeted the pain of forcing rapidly-evolving, hierarchical app objects into rigid relational tables. Before it, teams either:</p>
+<ul>
+  <li>ran an RDBMS and paid the <strong>object-relational impedance mismatch</strong> — ORMs, N-way joins to reassemble one screen's object, and migrations that locked tables;</li>
+  <li>bolted on memcached and manual sharding logic in the app to scale reads/writes;</li>
+  <li>used key-value stores that gave scale but no rich queries or secondary indexes.</li>
+</ul>
+<p>MongoDB's bet: make the <em>document</em> (a whole aggregate) the unit of storage, indexing, and atomicity, give it secondary indexes and an expressive query language, and bake in replication + sharding so scale is an ops decision, not an app rewrite.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>System</th><th>Model</th><th>When it wins over MongoDB</th></tr>
+  <tr><td>PostgreSQL</td><td>Relational + JSONB</td><td>Multi-table transactions, complex joins/analytics, strict schema + constraints, mature SQL tooling. JSONB covers many document cases without giving up ACID.</td></tr>
+  <tr><td>Cassandra / ScyllaDB</td><td>Wide-column, leaderless</td><td>Massive write throughput, multi-region active-active, tunable AP. No single primary bottleneck; better for time-series firehoses.</td></tr>
+  <tr><td>DynamoDB</td><td>Managed KV/document</td><td>Zero ops, predictable single-digit-ms at any scale, tight AWS integration. Loses on ad-hoc queries and rich aggregation.</td></tr>
+  <tr><td>Redis</td><td>In-memory KV</td><td>Sub-ms latency, caching, counters, queues. Not a system of record for large datasets.</td></tr>
+  <tr><td>Elasticsearch</td><td>Inverted index</td><td>Full-text relevance, faceted search, log analytics. Not a durable primary store.</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "If my access pattern is one aggregate read/written together and I need flexible schema + horizontal scale, Mongo. If I need heavy relational joins and strong multi-row invariants, Postgres. If I need write-anywhere multi-region, Cassandra."</div>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Schema flexibility</strong> — ship features without blocking migrations; polymorphic documents.</li>
+  <li><strong>Locality</strong> — read one aggregate in one seek; no joins for the common path.</li>
+  <li><strong>Horizontal scale built-in</strong> — sharding + auto-balancing without app-side routing.</li>
+  <li><strong>HA out of the box</strong> — replica set failover in ~10-12s, no external coordinator.</li>
+  <li><strong>Rich queries + aggregation pipeline</strong> — closest to SQL among document stores; $lookup, $facet, window functions.</li>
+  <li><strong>Document-level concurrency</strong> — WiredTiger MVCC means readers never block writers.</li>
+  <li><strong>Tunable consistency/durability</strong> — per-operation write/read concern.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>16 MB doc limit</strong> and the unbounded-array trap push you to bucketing/referencing.</li>
+  <li><strong>Joins ($lookup) are expensive</strong> and can't use the foreign collection's index as efficiently as an RDBMS join.</li>
+  <li><strong>Shard key is nearly immutable</strong> (resharding exists since 5.0 but is heavy) — a bad choice haunts you.</li>
+  <li><strong>Transactions are costly</strong> — hold locks, 60s limit, and defeat much of the locality advantage.</li>
+  <li><strong>No enforced schema by default</strong> — data drift unless you use JSON Schema validation.</li>
+  <li><strong>Working set must fit RAM</strong> for good latency; cache eviction thrash kills p99.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><strong>Consistency vs availability:</strong> <code>w:majority</code> + <code>readConcern:majority</code> gives no-rollback durability but ~2x write latency and a read lag; <code>w:1</code> is fast but a failover can roll back unacked writes.</li>
+  <li><strong>Durability vs latency:</strong> <code>j:true</code> forces a journal fsync per write (adds ~single-digit ms on SSD) vs riding the 50 ms group commit.</li>
+  <li><strong>Embedding vs referencing:</strong> embedding = fast reads, atomic single-doc updates, but growth/duplication risk; referencing = normalized but needs $lookup or app-side joins.</li>
+  <li><strong>Read scaling vs staleness:</strong> <code>secondaryPreferred</code> spreads reads but serves stale data (replication lag).</li>
+  <li><strong>Hashed vs ranged shard key:</strong> hashed = even distribution, no hot shard, but kills range queries and scatter-gathers them; ranged = efficient range scans but risks hot chunks on monotonic keys.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Reach for something else when — (1) your workload is inherently <em>relational</em> with many-to-many joins and cross-entity invariants (banking ledgers with complex constraints → Postgres); (2) you need <em>true multi-region active-active writes</em> with conflict resolution (→ Cassandra/Dynamo global tables); (3) it's a <em>cache or ephemeral counter</em> (→ Redis); (4) it's <em>full-text search / relevance ranking</em> as the primary need (→ Elasticsearch); (5) heavy <em>OLAP / columnar analytics</em> over billions of rows (→ ClickHouse/BigQuery); (6) you'll routinely store blobs &gt; 16 MB (→ object storage + GridFS only if you must).</div>
+
+<h2>Production Architecture</h2>
+<p>A production sharded cluster: application drivers talk to <code>mongos</code> routers (stateless, often co-located or behind an LB). Routers consult <em>config servers</em> (a 3-node replica set holding the chunk-to-shard map) and route each query to the right shard(s). Each shard is itself a 3-node replica set spread across availability zones. The balancer runs on the config server primary and migrates chunks in the background.</p>
+<pre class="mermaid">
+flowchart TD
+  App["App drivers"] --> M1["mongos router"]
+  App --> M2["mongos router"]
+  M1 --> CFG["Config servers RS"]
+  M2 --> CFG
+  M1 --> S1["Shard A primary"]
+  M1 --> S2["Shard B primary"]
+  M2 --> S1
+  M2 --> S2
+  S1 --> S1b["Shard A secondaries"]
+  S2 --> S2b["Shard B secondaries"]
+  CFG --> BAL["Balancer"]
+  BAL --> S1
+  BAL --> S2
+</pre>
+<p>Rules of thumb: 3 config servers, shards as 3-member replica sets across 3 AZs, at least 2 <code>mongos</code> for redundancy, and put a majority of each replica set in a primary region so a single-AZ loss keeps a majority alive.</p>
+<h3>Replica set write + replication path</h3>
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant P as Primary
+  participant S1 as Secondary 1
+  participant S2 as Secondary 2
+  C->>P: insert w majority
+  P->>P: write cache plus journal plus oplog
+  S1->>P: getMore tail oplog
+  S2->>P: getMore tail oplog
+  P-->>S1: oplog batch
+  P-->>S2: oplog batch
+  S1->>P: ack optime
+  P-->>C: acknowledged majority reached
+</pre>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>Hot shard / monotonic key</strong> — sharding on <code>_id</code> or a timestamp sends all new writes to the max chunk on one shard; the balancer chases it forever.</li>
+  <li><strong>Jumbo chunks</strong> — a chunk that can't split (all docs share one shard-key value) exceeds the max chunk size and becomes unmovable.</li>
+  <li><strong>Replication lag</strong> — a slow secondary (I/O, index build, long-running op) falls behind; <code>w:majority</code> writes stall and stale reads worsen.</li>
+  <li><strong>Cache eviction thrash</strong> — working set &gt; WiredTiger cache → constant page eviction, disk reads, p99 spikes. Watch <code>wiredTiger.cache</code> dirty/eviction stats.</li>
+  <li><strong>Collection scans (COLLSCAN)</strong> — a query without a supporting index scans everything; ESR-violating compound index doesn't get used.</li>
+  <li><strong>Unbounded array growth</strong> — an <code>$push</code>-forever array grows the doc, causing frequent moves and eventually hitting 16 MB.</li>
+  <li><strong>Oplog window too small</strong> — a secondary offline longer than the oplog window needs a full resync.</li>
+  <li><strong>Election storms</strong> — flapping network causes repeated failovers; writes error with "not master".</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Is a query using an index? Look for stage COLLSCAN vs IXSCAN
+db.orders.find({userId: 42}).explain("executionStats")
+
+# Current slow / long-running ops (kill the offender)
+db.currentOp({"secs_running": {$gt: 5}})
+db.killOp(&lt;opid&gt;)
+
+# Replica set health, member state, optimes, lag
+rs.status()
+rs.printSecondaryReplicationInfo()   # replication lag per secondary
+
+# Oplog window (how long can a secondary be down?)
+db.getReplicationInfo()
+
+# WiredTiger cache pressure + eviction
+db.serverStatus().wiredTiger.cache
+
+# Sharding: chunk distribution, balancer state, jumbo chunks
+sh.status()
+sh.getBalancerState()
+db.chunks.find({jumbo: true})
+
+# Profiler — capture ops slower than 100ms
+db.setProfilingLevel(1, {slowms: 100})
+db.system.profile.find().sort({ts:-1}).limit(5)
+
+# Index usage stats (find unused indexes to drop)
+db.orders.aggregate([{$indexStats:{}}])</code></pre>
+<div class="callout tip"><strong>Say this:</strong> "First thing I run on a slow query is <code>explain('executionStats')</code> and look at <code>totalDocsExamined</code> vs <code>nReturned</code> — if the ratio is far from 1, the index is wrong or missing."</div>
+
+<h2>Monitoring</h2>
+<table>
+  <tr><th>Metric</th><th>Meaning</th><th>Healthy / Alert</th></tr>
+  <tr><td>replication lag (s)</td><td>Secondary behind primary optime</td><td>&lt; 1s healthy; alert &gt; 10s</td></tr>
+  <tr><td>oplog window (h)</td><td>Time span the oplog covers</td><td>&gt; 24h healthy; alert &lt; 4h</td></tr>
+  <tr><td>wiredTiger cache used %</td><td>Cache fill</td><td>&lt; 80% healthy; alert &gt; 95%</td></tr>
+  <tr><td>cache dirty %</td><td>Unwritten dirty pages</td><td>&lt; 5% healthy; alert &gt; 20% (checkpoint stall)</td></tr>
+  <tr><td>evicted pages/s</td><td>Eviction pressure</td><td>Low/stable; spikes = working set &gt; RAM</td></tr>
+  <tr><td>opcounters (q/i/u/d)</td><td>Ops per second by type</td><td>Baseline; alert on sudden shifts</td></tr>
+  <tr><td>queues.readers/writers</td><td>Ops waiting on tickets</td><td>~0; sustained &gt; 0 = ticket exhaustion</td></tr>
+  <tr><td>connections current</td><td>Open connections</td><td>Alert &gt; 80% of ulimit / max</td></tr>
+  <tr><td>page faults / disk latency</td><td>Cache misses to disk</td><td>Low; high = memory pressure</td></tr>
+  <tr><td>scanned/returned ratio</td><td>Index efficiency</td><td>~1; high = missing index</td></tr>
+  <tr><td>election count</td><td>Failover frequency</td><td>Rare; frequent = instability</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<h3>Vertical, then read, then shard</h3>
+<ol>
+  <li><strong>Vertical:</strong> more RAM so the working set + indexes fit WiredTiger cache; NVMe SSD for journal/checkpoint I/O.</li>
+  <li><strong>Read scaling:</strong> add secondaries and route reads with <code>secondaryPreferred</code> (accept staleness) or use hidden/analytics nodes for reporting.</li>
+  <li><strong>Write scaling → sharding:</strong> the only way to scale writes past one primary. Choose a shard key that is high-cardinality, evenly distributed, and matches your query filter (so queries are targeted, not scatter-gather).</li>
+</ol>
+<pre class="mermaid">
+flowchart LR
+  W["Write load rising"] --> V["Add RAM and SSD"]
+  V --> R["Add secondaries for reads"]
+  R --> SH["Shard the collection"]
+  SH --> K1["Hashed key even spread"]
+  SH --> K2["Ranged key range queries"]
+  SH --> B["Balancer spreads chunks"]
+</pre>
+<ul>
+  <li><strong>Chunks</strong> default 128 MB; split automatically, migrated by the balancer to equalize chunk count per shard.</li>
+  <li><strong>Compound shard key</strong> (e.g. <code>{tenantId:1, orderDate:1}</code>) avoids the monotonic hot-shard problem while keeping locality.</li>
+  <li><strong>Zone sharding</strong> pins ranges to specific shards (data residency / tiered storage).</li>
+  <li><strong>Resharding</strong> (5.0+) can change the key online but rewrites the whole collection — plan disk + time.</li>
+</ul>
+<div class="callout warn"><strong>Watch out:</strong> A low-cardinality shard key (e.g. <code>country</code> for a mostly-one-country app) caps you at as many chunks as distinct values and creates unsplittable jumbo chunks. Cardinality is king.</div>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>AuthN:</strong> SCRAM-SHA-256 (default), x.509 certs, LDAP/Kerberos (Enterprise), AWS IAM (Atlas). Always enable auth — an open <code>0.0.0.0</code> bind with no auth is the classic ransom-attack vector.</li>
+  <li><strong>AuthZ:</strong> role-based access control — built-in roles (<code>read</code>, <code>readWrite</code>, <code>dbAdmin</code>, <code>clusterAdmin</code>) plus custom roles scoped per database/collection. Principle of least privilege for app users.</li>
+  <li><strong>Encryption in transit:</strong> TLS/SSL for client↔server and intra-cluster (<code>--tlsMode requireTLS</code>).</li>
+  <li><strong>Encryption at rest:</strong> WiredTiger native encryption (Enterprise/Atlas, AES-256) with KMIP/KMS-managed keys.</li>
+  <li><strong>Client-Side Field Level Encryption (CSFLE) / Queryable Encryption:</strong> fields encrypted by the driver before they ever reach the server — the DB never sees plaintext PII.</li>
+  <li><strong>Network isolation:</strong> bind to private subnets, VPC peering / PrivateLink, IP allowlists, no public exposure of 27017.</li>
+  <li><strong>Common CVEs/mistakes:</strong> NoSQL injection via unsanitized query operators (e.g. passing <code>{$gt:""}</code> as a password field), default no-auth pre-3.6 binds, over-privileged app accounts.</li>
+</ul>
+<div class="callout warn"><strong>Watch out:</strong> NoSQL injection — never pass raw request JSON straight into a query. <code>{username: req.body.user}</code> becomes <code>{username: {$ne: null}}</code> if the client sends an object. Cast to string / validate types.</div>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>Working set in RAM</strong> is the #1 lever. A cache miss to SSD turns a ~100 µs read into a ~100 µs-1 ms+ disk read; miss to spinning disk is catastrophic.</li>
+  <li><strong>Indexes:</strong> follow the <strong>ESR rule</strong> for compound indexes — <em>Equality</em> fields first, then <em>Sort</em>, then <em>Range</em>. A covered query (all fields in the index, none from the doc) skips fetching documents entirely.</li>
+  <li><strong>Concurrency tickets:</strong> WiredTiger historically capped concurrent read/write tickets (128 each); ticket exhaustion shows as queued ops. Modern versions auto-tune, but it's a real ceiling under storage saturation.</li>
+  <li><strong>Write concern latency:</strong> <code>w:1</code> ≈ local write time; <code>w:majority</code> adds a network round-trip to a majority (single-digit ms same-region, tens of ms cross-AZ); <code>j:true</code> adds a journal fsync.</li>
+  <li><strong>$lookup</strong> executes as a nested loop — index the foreign key on the joined collection or it's O(n·m). Prefer embedding for hot joins.</li>
+  <li><strong>Batch:</strong> <code>bulkWrite</code> / <code>insertMany</code> amortizes round-trips; <code>ordered:false</code> parallelizes.</li>
+  <li><strong>Ballparks:</strong> indexed point read from cache ~sub-ms; well-indexed query a few ms; a single primary handles tens of thousands of simple ops/s; scale beyond by sharding.</li>
+</ul>
+<div class="callout tip"><strong>Say this:</strong> "ESR — Equality, Sort, Range. If I put a range field before a sort field, the index can't serve the sort and Mongo does an in-memory sort, which blows up on large result sets (32 MB sort limit without an index)."</div>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Monotonic shard key</strong> (<code>_id</code>/timestamp) → hot shard. <em>Fix:</em> hashed key or compound key with a high-cardinality prefix.</li>
+  <li><strong>Compound index in wrong order</strong> → index unused for sort/filter. <em>Fix:</em> ESR rule; verify with <code>explain</code>.</li>
+  <li><strong>Unbounded arrays</strong> (<code>$push</code> forever) → doc bloat + 16 MB wall. <em>Fix:</em> bucketing pattern or reference into a child collection.</li>
+  <li><strong>Over-indexing</strong> → every write updates every index, slowing writes and eating RAM. <em>Fix:</em> drop unused via <code>$indexStats</code>.</li>
+  <li><strong>Passing raw user JSON into queries</strong> → NoSQL injection. <em>Fix:</em> validate/cast types.</li>
+  <li><strong>Assuming multi-doc atomicity without a transaction</strong> → partial updates. <em>Fix:</em> model as one doc, or use a transaction.</li>
+  <li><strong>Reading from secondaries and being surprised by staleness.</strong> <em>Fix:</em> use causal consistency or read from primary for read-your-writes.</li>
+  <li><strong>Undersized oplog</strong> → secondaries need full resync after brief downtime. <em>Fix:</em> size oplog for &gt; maintenance window.</li>
+  <li><strong>No connection pooling limits</strong> → connection storms exhaust the server. <em>Fix:</em> tune driver <code>maxPoolSize</code>.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+  <tr><th>Company</th><th>Plausible MongoDB usage</th></tr>
+  <tr><td>Google</td><td>Not a core store (they use Spanner/Bigtable), but likely runs MongoDB in acquired products and offers managed MongoDB-compatible workloads on GCP marketplace; internal teams likely use it for flexible-schema microservices.</td></tr>
+  <tr><td>Amazon</td><td>Offers DocumentDB (MongoDB-API-compatible) on AWS; internally favors DynamoDB. Many AWS customers run self-managed MongoDB/Atlas for catalogs and user profiles.</td></tr>
+  <tr><td>Netflix</td><td>Likely uses MongoDB for some tooling/metadata and flexible-schema services, though Cassandra/EVCache dominate their viewing-history and streaming path.</td></tr>
+  <tr><td>Uber</td><td>Historically documented moving off Mongo to Schemaless (on MySQL) for trips; likely still uses MongoDB in peripheral services needing flexible documents.</td></tr>
+  <tr><td>Swiggy</td><td>Likely uses MongoDB for restaurant/menu catalogs and content that changes shape per merchant — classic embedding + read-heavy pattern, with sharding by city/merchant.</td></tr>
+  <tr><td>PhonePe</td><td>Payments core is likely strongly-consistent RDBMS; MongoDB likely powers catalog, offers, notifications, and semi-structured metadata where flexible schema helps.</td></tr>
+  <tr><td>Razorpay</td><td>Ledger/settlement likely on MySQL/Postgres for ACID; MongoDB likely for merchant configs, dashboards, and event/metadata stores with evolving schemas.</td></tr>
+  <tr><td>Atlassian</td><td>Jira/Confluence core relies on relational stores, but MongoDB likely appears in newer flexible-schema services and analytics/metadata pipelines.</td></tr>
+</table>
+<div class="callout warn"><strong>Watch out:</strong> In interviews, hedge these with "likely" — internal stacks change and are rarely fully public. Show you know <em>why</em> a workload fits Mongo (flexible schema, read-together aggregate) vs why the money-path stays relational (strict ACID invariants).</div>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>What's the difference between JSON and BSON, and why BSON?
+    <ol><li><em>Answer pointer:</em> BSON is binary, typed (ObjectId, Date, Decimal128, binary), length-prefixed for fast skipping, and traversable without full parse.</li></ol>
+  </li>
+  <li>Why is there a 16 MB document limit?
+    <ol><li><em>Answer pointer:</em> Bounds memory/network per doc, discourages unbounded growth; use GridFS or referencing for larger data.</li></ol>
+  </li>
+  <li>Walk me through what WiredTiger does on a single write.
+    <ol><li><em>Answer pointer:</em> Doc-level lock → cache page (MVCC) → journal WAL group-commit → oplog entry → checkpoint every 60s.</li></ol>
+  </li>
+  <li>How does crash recovery work? What can you lose?
+    <ol><li><em>Answer pointer:</em> Load last checkpoint, replay journal forward; lose at most the ~50 ms uncommitted journal window (0 if <code>j:true</code>).</li></ol>
+  </li>
+  <li>Explain the oplog. Why must its entries be idempotent?
+    <ol><li><em>Answer pointer:</em> Capped collection secondaries tail; idempotency (rewriting <code>$inc</code> to <code>$set</code>) makes replays safe on retry/resync.</li></ol>
+  </li>
+  <li>How does a primary election work and how long does it take?
+    <ol><li><em>Answer pointer:</em> PV1 Raft-like, terms + 2s heartbeats, <code>electionTimeoutMillis</code> 10s → new primary in ~10-12s; needs majority.</li></ol>
+  </li>
+  <li>Why do you need an odd number of voting members / an arbiter?
+    <ol><li><em>Answer pointer:</em> To break ties and always be able to form a majority; arbiter votes but holds no data.</li></ol>
+  </li>
+  <li>Difference between <code>w:1</code>, <code>w:majority</code>, and <code>j:true</code>?
+    <ol><li><em>Answer pointer:</em> Ack count vs durability; majority survives failover without rollback; j forces journal fsync.</li></ol>
+  </li>
+  <li>What can roll back, and when?
+    <ol><li><em>Answer pointer:</em> Writes acked at <code>w:1</code> but not replicated to majority when the primary crashes → rolled back on rejoin.</li></ol>
+  </li>
+  <li>Explain read concern <code>local</code> vs <code>majority</code> vs <code>linearizable</code>.
+    <ol><li><em>Answer pointer:</em> Local may read uncommitted; majority reads durable snapshot; linearizable adds real-time ordering (primary only, slow).</li></ol>
+  </li>
+  <li>How do you get read-your-own-writes off a secondary?
+    <ol><li><em>Answer pointer:</em> Causal consistency (client session with afterClusterTime) or just read primary.</li></ol>
+  </li>
+  <li>How do you choose a shard key? What makes a bad one?
+    <ol><li><em>Answer pointer:</em> High cardinality, even distribution, query-aligned; bad = monotonic/low-cardinality → hot shard / jumbo chunks.</li></ol>
+  </li>
+  <li>Hashed vs ranged sharding — trade-off?
+    <ol><li><em>Answer pointer:</em> Hashed spreads evenly but scatter-gathers range queries; ranged is range-efficient but hot-shard prone.</li></ol>
+  </li>
+  <li>A shard is hot despite the balancer. Diagnose.
+    <ol><li><em>Answer pointer:</em> Monotonic key → all inserts on max chunk; check <code>sh.status()</code> for skew and jumbo chunks; consider hashed/compound key or resharding.</li></ol>
+  </li>
+  <li>Explain the ESR rule and covered queries.
+    <ol><li><em>Answer pointer:</em> Equality, Sort, Range order for compound index; covered = all needed fields in index, no doc fetch.</li></ol>
+  </li>
+  <li>How do multi-document transactions work and what do they cost?
+    <ol><li><em>Answer pointer:</em> Snapshot isolation over a session, 60s default limit, hold locks, WriteConflict retries; costly — prefer single-doc atomicity.</li></ol>
+  </li>
+  <li>Your p99 read latency spiked with no traffic change. Where do you look?
+    <ol><li><em>Answer pointer:</em> WiredTiger cache eviction/dirty %, page faults, working set &gt; RAM, a new index build, or a COLLSCAN from a deployed query.</li></ol>
+  </li>
+  <li>How would you migrate a bad shard key in production?
+    <ol><li><em>Answer pointer:</em> Online resharding (5.0+) if feasible, else dump/reload into a new collection; plan double disk + downtime window.</li></ol>
+  </li>
+  <li>How do you enforce schema if you need it?
+    <ol><li><em>Answer pointer:</em> JSON Schema validators on the collection with <code>validationLevel</code>/<code>validationAction</code>.</li></ol>
+  </li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>After replication:</strong> CAP theorem (Mongo is CP by default), Raft vs Paxos, quorum math, split-brain prevention — expect them to ask how majority prevents two primaries.</li>
+  <li><strong>After sharding:</strong> consistent hashing vs range partitioning, hot partitions, rebalancing cost, scatter-gather queries — pivot to how Cassandra/Dynamo partition differently.</li>
+  <li><strong>After WiredTiger:</strong> B-tree vs LSM-tree (RocksDB/Cassandra), write amplification, compaction, MVCC vs locking — be ready to contrast with Postgres MVCC and vacuum.</li>
+  <li><strong>After indexes:</strong> query planner, index selectivity, when the planner picks the wrong index, plan cache, hints — and B-tree height/fanout math.</li>
+  <li><strong>After transactions:</strong> isolation levels, snapshot isolation vs serializable, two-phase commit across shards, distributed transaction cost.</li>
+  <li><strong>After consistency:</strong> read-your-writes, monotonic reads, linearizability vs eventual consistency, hybrid logical clocks / cluster time.</li>
+  <li><strong>After schema design:</strong> normalization vs denormalization trade-offs, event sourcing/CQRS, outbox pattern for reliable events.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+<h3>Incident 1 — Hot shard melts one node</h3>
+<table>
+  <tr><th>Symptoms</th><td>One shard at 100% CPU/disk, others idle; write latency p99 climbing; balancer constantly migrating.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td><code>sh.status()</code> shows chunk skew toward the max chunk; <code>db.currentOp()</code> shows inserts concentrated; shard key is <code>_id</code>/timestamp.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Monotonically increasing shard key — every new insert targets the top chunk on one shard.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Reshard to a hashed key or a compound key with a high-cardinality prefix (e.g. <code>{tenantId, createdAt}</code>); enable resharding online.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Vet shard-key cardinality/monotonicity in design review; simulate distribution before go-live.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"All inserts hit the max chunk because the key was monotonic. I confirmed skew in sh.status, then resharded to a compound key with a tenant prefix so writes spread across chunks."</td></tr>
+</table>
+<h3>Incident 2 — Writes stall, replication lag exploding</h3>
+<table>
+  <tr><th>Symptoms</th><td><code>w:majority</code> writes timing out; <code>rs.printSecondaryReplicationInfo()</code> shows a secondary tens of minutes behind.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td>Lagging secondary has an in-progress foreground index build / long op saturating I/O; oplog window shrinking toward the lag.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Secondary can't keep up applying oplog; majority can't be reached in time → majority writes block.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Build indexes in the background/rolling fashion, throttle the offending op, add IOPS; temporarily relax to <code>w:1</code> only if data-loss risk is acceptable.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Rolling index builds, oplog sized for maintenance windows, alert on lag &gt; 10s.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"Majority writes stalled because a secondary lagged during an index build. I did rolling index builds and sized the oplog for the window; alert fires at 10s lag."</td></tr>
+</table>
+<h3>Incident 3 — p99 latency spike, cache thrash</h3>
+<table>
+  <tr><th>Symptoms</th><td>Reads that were sub-ms now tens of ms; disk read IOPS up; CPU in iowait.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td><code>serverStatus().wiredTiger.cache</code> shows high eviction and dirty %; page faults up; data + index size grew past RAM.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Working set no longer fits WiredTiger cache → constant eviction and disk reads.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Scale RAM, drop unused indexes (<code>$indexStats</code>), archive cold data (TTL index), or shard to spread the working set.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Track index+data size vs cache; alert on cache used &gt; 95% and rising eviction.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"Working set outgrew the cache, so every read hit disk. I dropped dead indexes and added RAM, then TTL-archived cold docs to shrink the hot set."</td></tr>
+</table>
+<h3>Incident 4 — Missing index deploy tanks the DB</h3>
+<table>
+  <tr><th>Symptoms</th><td>After a feature deploy, CPU spikes, queue lengths grow, timeouts across unrelated endpoints.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td>Profiler shows a new query doing COLLSCAN; <code>explain</code> confirms <code>totalDocsExamined</code> ≫ <code>nReturned</code>.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>New query path had no supporting index; full scans hold cache and starve other ops.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Create the compound index (ESR-ordered) with a rolling build; add index checks to CI.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Query-review gate + explain in staging; block deploys with COLLSCAN on hot collections.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"A new query shipped without an index and scanned the collection. Profiler + explain pinpointed it; I added an ESR compound index via rolling build and gated future deploys."</td></tr>
+</table>
+<h3>Incident 5 — Election storm, "not master" errors</h3>
+<table>
+  <tr><th>Symptoms</th><td>Intermittent write failures with "not primary / not master"; election count metric spiking.</td></tr>
+  <tr><td><strong>Investigation</strong></td><td><code>rs.status()</code> shows rapid state changes; logs show heartbeat timeouts; network between AZs flapping.</td></tr>
+  <tr><td><strong>Root Cause</strong></td><td>Network partition/latency causing repeated failovers; primary keeps stepping down.</td></tr>
+  <tr><td><strong>Solution</strong></td><td>Fix the network path, raise <code>electionTimeoutMillis</code> if flaps are brief, ensure driver retryable writes are on; place majority in one region.</td></tr>
+  <tr><td><strong>Prevention</strong></td><td>Retryable writes enabled, sane heartbeat/timeout tuning, topology that keeps a stable majority.</td></tr>
+  <tr><td><strong>Interview Answer</strong></td><td>"Flapping cross-AZ network triggered repeated elections. I stabilized the network, tuned election timeout, and relied on retryable writes so transient failovers didn't surface as errors."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Exactly how does WiredTiger guarantee durability across a crash, and where does the 50 ms come from?</summary><p>WiredTiger keeps a write-ahead journal (WAL). Each write is buffered and journal records are flushed to disk on a group-commit cycle, by default every ~50 ms, unless the op requests <code>j:true</code> (immediate fsync) or the journal buffer fills. Separately, every 60s WiredTiger writes a checkpoint — a consistent copy-on-write snapshot of the B-trees to disk. On crash recovery, WiredTiger opens the last durable checkpoint and replays journal entries created after it, forward to the last fsynced record. So worst-case data loss without <code>j:true</code> is the last unsynced ~50 ms of journal; with <code>j:true</code> it's zero (for that node). Durability against node loss is a separate axis handled by write concern <code>w:majority</code>.</p></details>
+  <details><summary>Why does <code>w:majority</code> plus <code>readConcern:majority</code> guarantee no rollbacks, and what's the latency cost?</summary><p>A majority-acked write is on a majority of voting members, so any newly elected primary (which also needs a majority) is guaranteed to contain it — nothing acked at majority can be lost in a failover. <code>readConcern:majority</code> only returns data from the majority-committed snapshot, so reads never expose writes that could later roll back. Cost: the write waits for a network round-trip to a majority of members — single-digit ms same-region, tens of ms cross-AZ — roughly 2x the <code>w:1</code> latency, and the majority snapshot lags the latest optime slightly so majority reads see marginally stale data.</p></details>
+  <details><summary>Give the precise ESR rule and show why a range-before-sort index fails.</summary><p>For a compound index serving a query, order fields as Equality → Sort → Range. Equality fields pin the index to a single value prefix; the sort field then lets the index return already-ordered results; range fields last narrow within that. If you put a range field before the sort field, the index entries within the range are ordered by the range field, not the sort field, so Mongo can't stream them in sort order — it does a blocking in-memory sort, which is capped at 32 MB (without <code>allowDiskUse</code>) and fails or spills on large result sets. Verify with <code>explain</code>: a good plan shows the sort satisfied by the index (no <code>SORT</code> stage).</p></details>
+  <details><summary>Walk through a MongoDB primary election step by step.</summary><p>Protocol Version 1 (Raft-like). Members exchange heartbeats every 2s. If a secondary misses heartbeats for <code>electionTimeoutMillis</code> (default 10s), it increments the <em>term</em> and calls for votes. Each member votes at most once per term and only for a candidate whose oplog is at least as fresh as its own. A candidate that wins a majority of votes becomes primary for that term, immediately catching writes; stale members that had unreplicated writes roll them back on rejoin. Priority settings bias which node wins; a member with <code>priority:0</code> can't be primary. End-to-end a clean failover is typically ~10-12s. Arbiters vote but store no data, purely to reach a majority in even-membership sets.</p></details>
+  <details><summary>How do multi-document transactions actually work internally, and why the 60s limit?</summary><p>A transaction runs inside a client session using WiredTiger snapshot isolation: at start it pins a snapshot (an MVCC read view) and buffers writes, taking document locks as it writes. Conflicting concurrent writes cause a <code>WriteConflict</code> which the driver can retry (transient-transaction-error retry). On commit it becomes an atomic apply, replicated as a single oplog entry group (an <code>applyOps</code>) and honoring the transaction's write concern. On sharded clusters (4.2+) it's coordinated two-phase commit across participating shards. The default <code>transactionLifetimeLimitSeconds</code> is 60s because a long-running transaction pins a snapshot, which prevents WiredTiger from evicting old versions — holding it too long causes cache pressure and blocks checkpointing. So keep transactions short; prefer single-document atomicity (Mongo guarantees a single doc update is atomic) whenever the model allows.</p></details>
+  <details><summary>When would embedding hurt you, and how does the bucketing pattern fix unbounded arrays?</summary><p>Embedding hurts when the embedded data is unbounded (e.g. every sensor reading pushed into one device doc) or updated independently at high frequency — the doc grows, forcing rewrites/moves, and eventually hits 16 MB. Bucketing fixes this by capping each doc: instead of one doc per device with a giant array, you create bucket docs holding, say, 200 readings each (<code>{deviceId, startTs, count, readings:[...]}</code>), rolling to a new bucket when full. This keeps docs small and bounded, keeps time-locality for range reads, and dramatically reduces index entries versus one-doc-per-reading. MongoDB's native time-series collections automate exactly this bucketing under the hood.</p></details>
+  <details><summary>What's the difference between hashed and ranged sharding at the query level?</summary><p>Ranged sharding partitions the key space into contiguous ranges (chunks), so a range query like <code>createdAt between A and B</code> is <em>targeted</em> to the few shards owning that range — efficient. But a monotonic key means all new inserts land in the top range on one shard (hot shard). Hashed sharding applies a hash to the key so consecutive values scatter across shards — great even write distribution, no hot shard — but a range query can no longer be localized, so it becomes a <em>scatter-gather</em> to all shards and merge. Point queries on the exact key are fine either way. The compound-key trick (high-cardinality prefix + time) often gives distribution without fully sacrificing range locality.</p></details>
+  <details><summary>How do you diagnose a query that's suddenly slow?</summary><p>Run <code>db.coll.find(...).explain("executionStats")</code>. Check the winning plan stage: <code>IXSCAN</code> good, <code>COLLSCAN</code> bad. Compare <code>totalDocsExamined</code> vs <code>nReturned</code> — near 1:1 is efficient; a big ratio means the index is missing or non-selective. Look for a blocking <code>SORT</code> stage (index doesn't cover the sort). Check <code>totalKeysExamined</code> for over-broad index scans. Cross-reference the profiler (<code>system.profile</code>) for frequency, <code>db.currentOp()</code> for a blocking op, and <code>$indexStats</code> to see if the intended index is even used. If the planner chose the wrong index, pin it with <code>.hint()</code> and investigate plan-cache staleness.</p></details>
+  <details><summary>What is causal consistency and when do you need it?</summary><p>Causal consistency guarantees that operations that are causally related are seen in order — specifically read-your-writes, monotonic reads/writes, and writes-follow-reads — even when reading from secondaries. It's implemented with cluster time / hybrid logical clocks: a client session tracks the <code>operationTime</code> of its last op, and subsequent reads specify <code>afterClusterTime</code> so a secondary waits until it has applied at least up to that time before answering. You need it when you scale reads to secondaries but still require a user to see their own just-made write — without it, a read routed to a lagging secondary could miss it. The alternative is simply reading from the primary.</p></details>
+  <details><summary>Why can a jumbo chunk form and how do you resolve it?</summary><p>The balancer splits chunks and migrates them to equalize count. A chunk can only be split at shard-key value boundaries. If a huge number of documents share the exact same shard-key value (low cardinality), that chunk can't be split below one key value; once it exceeds the max chunk size it's flagged <code>jumbo</code> and the balancer refuses to move it (moving would be too large/slow). It then sits on one shard causing imbalance. Resolution: the real fix is a higher-cardinality shard key (reshard), or a compound key that adds a distinguishing field. Short-term you can manually clear the jumbo flag and force a move if the chunk is actually movable, but that's a band-aid.</p></details>
+  <details><summary>How does MongoDB avoid split-brain (two primaries)?</summary><p>Elections require a strict majority of voting members, and each member grants at most one vote per term. Since two disjoint majorities of the same set can't exist, only one candidate can win a given term, so at most one primary exists per term. If a primary is network-partitioned into the minority side, it can't confirm it still has majority support (heartbeats fail) and steps itself down to secondary — it stops accepting writes. Combined with terms increasing monotonically, a stale primary that rejoins sees a higher term and yields, rolling back any writes that never reached the new majority.</p></details>
+  <details><summary>What's the working-set-in-RAM rule and how do you measure if you've blown it?</summary><p>MongoDB is fast when the frequently-accessed documents and their indexes fit in the WiredTiger cache (default 50% of RAM minus 1 GB). When the working set exceeds cache, WiredTiger must evict pages and re-read from disk, turning sub-ms cache hits into disk reads and spiking p99. Measure via <code>serverStatus().wiredTiger.cache</code>: watch "bytes currently in the cache" vs "maximum bytes configured", "unmodified pages evicted" and "pages evicted by application threads" (app-thread eviction means you're behind), and OS page-fault / disk-read rates. Rising eviction with rising disk IOPS and iowait is the signature. Fixes: more RAM, fewer/smaller indexes, TTL-archive cold data, or shard to divide the working set.</p></details>
+  <details><summary>Explain index intersection and why a single compound index usually beats it.</summary><p>Index intersection lets the planner use two separate single-field indexes for one query, scanning both and intersecting the matching record ids. It's a fallback that helps ad-hoc queries, but it's usually slower than a purpose-built compound index because it examines more keys, can't serve a sort from the intersection, and can't produce a covered query. A single compound index ordered by ESR scans one contiguous range, can satisfy the sort, and can cover the query (no doc fetch). So for known hot query shapes you design a compound index; intersection is for the long tail you didn't index specifically.</p></details>
+  <details><summary>What does a $lookup cost and how do you make it acceptable?</summary><p><code>$lookup</code> is executed as a nested-loop join: for each input document from the pipeline, it runs a query against the foreign collection. If the foreign collection's join field isn't indexed, each lookup is a COLLSCAN and the whole thing is O(n·m) — deadly. To make it acceptable: (1) index the foreign field so each lookup is an IXSCAN; (2) reduce the left-side cardinality with <code>$match</code>/<code>$limit</code> before the <code>$lookup</code>; (3) prefer embedding for hot, always-together reads so no join is needed at all. Even indexed, cross-collection joins on large data are far more expensive than an RDBMS hash/merge join, so treat frequent <code>$lookup</code> as a modeling smell.</p></details>
+  <details><summary>How would you size and monitor the oplog, and why does it matter?</summary><p>The oplog is a capped collection; its size in bytes determines how much <em>time</em> of operations it retains, which is your replication safety window. If a secondary is offline (or lagging) longer than the oplog window, the ops it needs have been overwritten and it must do a full initial resync — expensive and slow on large data. Size it (via <code>replSetResizeOplog</code>) so the window comfortably exceeds your longest expected maintenance/downtime — often 24-72h. Monitor with <code>db.getReplicationInfo()</code> (time span) and alert when the window drops below a few hours or when secondary lag approaches the window.</p></details>
+  <details><summary>Give the concrete NoSQL-injection failure and the fix.</summary><p>Consider login code <code>db.users.findOne({user: req.body.user, pass: req.body.pass})</code>. If the client sends JSON <code>{"user":"admin","pass":{"$ne":null}}</code>, the query becomes <code>{user:"admin", pass:{$ne:null}}</code>, matching admin regardless of password. Operators like <code>$ne</code>, <code>$gt</code>, <code>$regex</code> injected as object values subvert the query. Fix: validate/cast inputs to their expected primitive types (ensure <code>pass</code> is a string), reject objects where scalars are expected, use schema validation at the API layer, and never pass raw request bodies straight into query filters. Parameterize by explicitly constructing the query from typed fields.</p></details>
+</div>

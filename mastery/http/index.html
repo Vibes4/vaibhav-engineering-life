@@ -1,0 +1,353 @@
+<h1>HTTP/1.1 · 2 · 3 · QUIC <span class="tag express">Mastery</span></h1>
+<p>The application protocol that carries almost every request you'll ever debug — and a 25-year fight against one enemy: <strong>head-of-line blocking</strong>. Each version is an answer to where the previous one still stalled.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "HTTP is a request/response protocol, and its versions are a story of removing head-of-line blocking. HTTP/1.1 reuses one TCP connection with keep-alive but sends one request at a time, so browsers open ~6 connections per origin. HTTP/2 multiplexes many streams over a single TCP connection with a binary framing layer and HPACK header compression — but a single lost TCP segment still stalls every stream because TCP delivers bytes in order. HTTP/3 moves onto QUIC over UDP: streams are independent at the transport layer so loss on one stream doesn't block the others, TLS 1.3 is baked into the handshake for 1-RTT (or 0-RTT) setup, and a connection ID lets a session survive an IP change. Same semantics — methods, status codes, headers, caching — different wire transport."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>HTTP <em>semantics</em> (methods, status codes, headers, caching, conditional requests) are stable across versions; what changes is the <em>wire format</em> and the transport underneath.</p>
+<ul>
+<li><strong>HTTP/1.0</strong>: one TCP connection per request — connect, send, receive, close. TLS + TCP handshakes paid on every object. Brutal on latency.</li>
+<li><strong>HTTP/1.1</strong>: persistent connections (<code>Connection: keep-alive</code>), <code>chunked</code> transfer-encoding for streaming unknown-length bodies, mandatory <code>Host</code> header (enables virtual hosting), and pipelining — which failed in practice because responses must return in order, so one slow response blocks the rest (application-level HOL blocking). Browsers worked around single-request-per-connection by opening <strong>6 parallel connections per origin</strong>.</li>
+<li><strong>HTTP/2</strong>: a <strong>binary framing layer</strong> over one TCP connection. Requests become <strong>streams</strong> (odd-numbered IDs from client), each carrying <code>HEADERS</code> and <code>DATA</code> frames interleaved and multiplexed. <strong>HPACK</strong> compresses headers with static + dynamic tables. Per-stream and per-connection <strong>flow control</strong> via <code>WINDOW_UPDATE</code>. Fixes application HOL blocking — but <strong>TCP-level HOL blocking remains</strong>: TCP is a single ordered byte stream, so one dropped segment stalls delivery of <em>all</em> streams until retransmit.</li>
+<li><strong>HTTP/3 over QUIC</strong>: QUIC is a reliable multiplexed transport on top of <strong>UDP</strong>. Each stream is independently ordered, so packet loss on stream 3 does not block stream 5 — the real fix for HOL blocking. TLS 1.3 is <em>integrated into</em> the QUIC handshake (1-RTT, 0-RTT resumption). Connections are identified by a <strong>connection ID</strong>, not the 4-tuple, so a session survives Wi-Fi→cellular handoff (connection migration). Header compression is <strong>QPACK</strong> (HPACK adapted so it doesn't reintroduce HOL blocking).</li>
+</ul>
+<p>The unifying metric: how many round trips before first byte, and whether one lost packet stalls unrelated work. HTTP/3 minimises both.</p>
+
+<h2>Internal Working</h2>
+<h3>HTTP/1.1 on the wire</h3>
+<ol>
+<li>Client opens TCP (1 RTT) + TLS (1 RTT for TLS 1.3) to <code>host:443</code>.</li>
+<li>Sends a text request line + headers ending in <code>\r\n\r\n</code>: <code>GET /a HTTP/1.1</code>, <code>Host: x</code>, <code>Connection: keep-alive</code>.</li>
+<li>Server responds with status line + headers + body. Body length is either <code>Content-Length: N</code> or <code>Transfer-Encoding: chunked</code> (hex-size chunks terminated by a <code>0\r\n\r\n</code> chunk).</li>
+<li>Connection stays open for the next request (keep-alive). Only <strong>one</strong> request may be outstanding at a time on a given connection unless pipelining is used — and pipelined responses must come back in request order, so the head response blocks the line.</li>
+</ol>
+<h3>HTTP/2 framing</h3>
+<ol>
+<li>After ALPN negotiates <code>h2</code>, the client sends the connection preface (<code>PRI * HTTP/2.0...</code>) then a <code>SETTINGS</code> frame.</li>
+<li>Everything is a <strong>frame</strong>: 9-byte header (24-bit length, 8-bit type, 8-bit flags, 31-bit stream ID) + payload. Types: <code>HEADERS</code>, <code>DATA</code>, <code>SETTINGS</code>, <code>WINDOW_UPDATE</code>, <code>PRIORITY</code>, <code>RST_STREAM</code>, <code>PING</code>, <code>GOAWAY</code>, <code>PUSH_PROMISE</code>.</li>
+<li>A request = a <strong>stream</strong> (client streams are odd IDs, server-initiated even). Frames from many streams interleave on the one connection — that's multiplexing.</li>
+<li><strong>HPACK</strong> compresses headers against a <strong>static table</strong> (61 common header entries) plus a per-connection <strong>dynamic table</strong>; repeated headers become 1-byte references. Huffman coding for literals.</li>
+<li><strong>Flow control</strong>: each stream and the whole connection have a window (default 65,535 bytes). Receiver sends <code>WINDOW_UPDATE</code> to grant more. A stuck consumer that never updates its window stalls the sender.</li>
+<li><strong>Prioritization</strong>: <code>PRIORITY</code> frames form a dependency tree with weights (largely replaced by the simpler HTTP/3 priority scheme). Server push (<code>PUSH_PROMISE</code>) is <strong>deprecated</strong> — Chrome removed it in 2022 because it wasted bandwidth pushing already-cached assets.</li>
+</ol>
+<h3>QUIC / HTTP/3</h3>
+<ol>
+<li>Handshake: a single QUIC <code>Initial</code> packet carries the TLS 1.3 ClientHello (crypto frames). Server responds; keys derived and data flows in <strong>1 RTT</strong>. Resumption ticket enables <strong>0-RTT</strong> early data.</li>
+<li>Reliability lives in QUIC: monotonically increasing <strong>packet numbers</strong> (never reused, unlike TCP seq), per-stream offsets, ACK ranges, and loss detection with RTT estimation and a Reno/CUBIC-style congestion controller in user space.</li>
+<li>Each stream has its own byte offset and ordering. Loss of a packet only blocks the streams whose bytes were in it, not all streams — no cross-stream HOL blocking.</li>
+<li><strong>Connection ID</strong>: the connection is keyed by a server-chosen ID, so if your phone's IP/port changes (NAT rebinding, Wi-Fi→LTE) the session continues — connection migration.</li>
+<li><strong>QPACK</strong>: like HPACK but uses a separate unidirectional stream for dynamic-table updates and lets encoders avoid references that would block a header block on a not-yet-received table update.</li>
+</ol>
+
+<h2>Why was this built?</h2>
+<p>Tim Berners-Lee's HTTP/0.9 (1991) was one line: <code>GET /page</code>, response was raw HTML, connection closed. HTTP/1.0 (1996) added headers, status codes and content types but still one connection per request — on a page with 50 assets you paid 50 TCP (and later TLS) handshakes. People hacked around it with image sprites, domain sharding, and inlining.</p>
+<ul>
+<li><strong>HTTP/1.1</strong> (1997/1999) added keep-alive to amortise handshakes, <code>Host</code> to host many sites per IP, chunked encoding, caching headers, and ranges. Pipelining promised concurrency but broke on buggy proxies and HOL blocking, so it was never enabled by default.</li>
+<li><strong>SPDY</strong> (Google, 2009) proved multiplexing + header compression cut page load ~2×; it became <strong>HTTP/2</strong> (RFC 7540, 2015).</li>
+<li>HTTP/2 still sat on TCP, and mobile networks with 1-2% packet loss exposed TCP HOL blocking badly. Google's <strong>QUIC</strong> (2013, deployed on Chrome↔Google) became IETF QUIC and <strong>HTTP/3</strong> (RFC 9114, 2022).</li>
+</ul>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Approach</th><th>What it fixes</th><th>Where it loses</th><th>When it wins</th></tr>
+<tr><td>HTTP/1.1 + 6 connections</td><td>Simple, universally supported, no TLS-version coupling</td><td>Handshake overhead ×6, no header compression, HOL per connection</td><td>Internal service-to-service on reliable LAN, tiny sites, curl scripts</td></tr>
+<tr><td>HTTP/2</td><td>One connection, multiplexing, HPACK, flow control</td><td>TCP HOL blocking under loss; single connection = single congestion-control victim</td><td>HTTPS websites on decent networks, gRPC transport</td></tr>
+<tr><td>HTTP/3 / QUIC</td><td>Per-stream independence, 0/1-RTT, connection migration</td><td>UDP blocked/throttled by some firewalls; higher CPU (userspace, no kernel offload)</td><td>Mobile, lossy/high-latency networks, CDN edge</td></tr>
+<tr><td>WebSocket</td><td>Full-duplex bidirectional frames</td><td>No request semantics, no caching, custom protocol on top</td><td>Chat, live feeds, collaborative editing</td></tr>
+<tr><td>gRPC (over HTTP/2)</td><td>Typed contracts, streaming, codegen</td><td>Not browser-native without a proxy; binary, harder to debug</td><td>Internal microservices RPC</td></tr>
+<tr><td>Raw TCP</td><td>Zero framing overhead</td><td>You reinvent everything — framing, retries, TLS</td><td>Custom high-perf protocols (databases, Redis)</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Stable semantics</strong>: methods, status codes, headers and caching carry across every version — you upgrade transport without rewriting apps.</li>
+<li><strong>HTTP/2 multiplexing</strong>: dozens of parallel requests on one connection, one TLS handshake, one congestion window to warm up.</li>
+<li><strong>HPACK/QPACK</strong>: repeated headers (cookies, user-agent) shrink from hundreds of bytes to a byte or two.</li>
+<li><strong>HTTP/3 loss resilience</strong>: on a 2% loss mobile link, page load and video rebuffering improve markedly because unrelated streams keep flowing.</li>
+<li><strong>0-RTT</strong>: returning clients send request data in the very first packet.</li>
+<li><strong>Connection migration</strong>: no reconnection storm when a phone switches networks.</li>
+<li><strong>Caching & conditional requests</strong>: ETag/Last-Modified turn most reloads into cheap <code>304 Not Modified</code>.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>HTTP/1.1</strong>: no multiplexing, verbose uncompressed headers, connection-count limits, HOL blocking.</li>
+<li><strong>HTTP/2</strong>: TCP HOL blocking under loss; a single connection means one lost packet or one aggressive stream can starve others; HPACK dynamic table is a shared mutable state that complicates proxies.</li>
+<li><strong>HTTP/3</strong>: UDP is blocked/rate-limited on ~3-5% of networks (fallback to h2 needed); CPU cost is higher because congestion control and crypto run in userspace with no NIC segmentation offload (mitigated by UDP GSO/GRO); harder to debug — no plaintext, needs <code>SSLKEYLOGFILE</code> + Wireshark QUIC dissector.</li>
+<li><strong>0-RTT</strong> early data is replayable — must be restricted to idempotent requests.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<table>
+<tr><th>Axis</th><th>Trade-off</th></tr>
+<tr><td>Connections</td><td>HTTP/1.1 many connections = independent congestion windows but no compression and handshake ×N; HTTP/2 one connection = compression + one warm window but one loss stalls all.</td></tr>
+<tr><td>Ordering</td><td>TCP guarantees total order (simple) but couples all streams; QUIC gives per-stream order (complex) but decouples them.</td></tr>
+<tr><td>Kernel vs userspace</td><td>TCP is kernel-optimised with offload; QUIC is userspace — flexible, upgradable without OS changes, but more CPU.</td></tr>
+<tr><td>0-RTT</td><td>Lower latency vs replay-attack surface.</td></tr>
+<tr><td>Header compression</td><td>Smaller headers vs stateful table that adds HOL-blocking risk (HPACK) or coordination cost (QPACK).</td></tr>
+</table>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong>
+<ul>
+<li>Don't force <strong>HTTP/3</strong> where UDP is blocked (corporate proxies, some datacenter security groups) without a robust h2 fallback — you'll get silent stalls and timeouts.</li>
+<li>Don't use <strong>HTTP/2 single connection</strong> for large bulk transfers on a lossy link where per-connection HOL blocking dominates — parallel HTTP/1.1 or HTTP/3 may beat it.</li>
+<li>Don't reach for HTTP at all for <strong>low-latency full-duplex</strong> messaging where WebSocket/gRPC-streaming fits, or for <strong>sub-millisecond internal RPC</strong> where framing overhead matters — consider raw TCP/gRPC.</li>
+<li>Don't enable <strong>0-RTT</strong> for non-idempotent endpoints (payments, order creation) — replay risk.</li>
+<li>Don't rely on <strong>HTTP/2 server push</strong> — deprecated and removed from Chrome; use <code>103 Early Hints</code> + preload instead.</li>
+</ul>
+</div>
+
+<h2>Production Architecture</h2>
+<p>Typical topology: clients speak HTTP/3 (with h2/h1.1 fallback) to a CDN/edge; the edge terminates TLS and translates to HTTP/2 or HTTP/1.1 toward the origin's L7 load balancer, which fans out to backend services (often gRPC over HTTP/2). Protocol is negotiated per hop.</p>
+<pre class="mermaid">
+flowchart LR
+  C["Browser"] -->|"HTTP/3 QUIC UDP 443"| EDGE["CDN edge"]
+  C -.->|"fallback h2 h1.1 TCP"| EDGE
+  EDGE -->|"HTTP/2 TCP"| LB["L7 load balancer"]
+  LB -->|"HTTP/1.1 keep-alive"| S1["Service A"]
+  LB -->|"gRPC over HTTP/2"| S2["Service B"]
+  EDGE --> CACHE["Edge cache ETag"]
+</pre>
+<ul>
+<li><strong>ALPN</strong> during TLS chooses <code>h2</code> vs <code>http/1.1</code>; HTTP/3 is advertised by the origin/CDN via the <code>Alt-Svc: h3=":443"</code> header so the browser retries over QUIC next time.</li>
+<li>The edge maintains a warm pool of long-lived HTTP/2 connections to origin, amortising handshakes across millions of client requests.</li>
+<li>Caching happens at the edge keyed by URL + <code>Vary</code> headers; conditional revalidation with <code>If-None-Match</code> keeps origin load low.</li>
+</ul>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>HTTP/2 connection coalescing gone wrong</strong>: browsers reuse one h2 connection for multiple hostnames sharing a cert + IP; a misrouted request lands on the wrong backend → 421 Misdirected Request.</li>
+<li><strong>Head-of-line under loss</strong>: h2 latency spikes on mobile even though throughput is fine — one connection, TCP retransmit stalls everything.</li>
+<li><strong>UDP throttling</strong>: some networks rate-limit UDP, so HTTP/3 is slower than h2; needs happy-eyeballs-style racing and fallback.</li>
+<li><strong>HPACK bomb / header table pressure</strong>: huge dynamic tables or many unique headers blow memory on proxies; enforce <code>SETTINGS_HEADER_TABLE_SIZE</code> and max header list size.</li>
+<li><strong>keep-alive vs LB idle timeout mismatch</strong>: client reuses a connection the LB already closed → sporadic <code>502</code>/connection resets. Set client idle &lt; server idle.</li>
+<li><strong>Rapid Reset (CVE-2023-44487)</strong>: attacker opens+RST_STREAMs floods of h2 streams cheaply → DoS. Mitigate by capping stream churn per connection.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Which protocol negotiated?
+curl -sI --http3 https://example.com | head -1
+curl -sw '%{http_version}\n' -o /dev/null https://example.com   # 2, 3, 1.1
+
+# See HTTP/2 frames / streams
+nghttp -nv https://example.com          # prints HEADERS/DATA/SETTINGS/WINDOW_UPDATE
+curl --http2 -v https://example.com 2&gt;&amp;1 | grep -i 'ALPN\|HTTP/2'
+
+# HTTP/3 support + Alt-Svc advertisement
+curl -sI https://example.com | grep -i alt-svc
+
+# Decrypt QUIC/TLS in Wireshark
+export SSLKEYLOGFILE=/tmp/keys.log &amp;&amp; chromium --enable-quic
+#   Wireshark: TLS &gt; (Pre)-Master-Secret log filename = /tmp/keys.log; filter: quic || http3
+
+# Watch caching / conditional
+curl -sD - -o /dev/null -H 'If-None-Match: "abc"' https://x/asset   # expect 304
+
+# Connection reuse / keep-alive
+ss -tanp | grep :443
+</code></pre>
+<ul>
+<li>Chrome <code>chrome://net-export</code> + netlog-viewer shows per-request protocol, stream IDs, and QUIC events.</li>
+<li>Chrome DevTools Network → Protocol column: <code>h3</code>, <code>h2</code>, <code>http/1.1</code>.</li>
+<li><code>GOAWAY</code> frames in nghttp output mean the peer is draining the connection.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>Meaning</th><th>Healthy / alert</th></tr>
+<tr><td>Protocol mix (h3/h2/h1.1 %)</td><td>Share of requests per version</td><td>h3 climbing on mobile; alert if h3 drops to ~0 (UDP blocked)</td></tr>
+<tr><td>TTFB</td><td>Time to first byte incl. handshake</td><td>&lt;200 ms edge; alert &gt;500 ms p95</td></tr>
+<tr><td>TLS/QUIC handshake time</td><td>Setup RTT cost</td><td>1-RTT ≈ 1×RTT; 0-RTT near 0; alert on rising full handshakes (resumption failing)</td></tr>
+<tr><td>Streams per connection</td><td>h2/h3 multiplexing depth</td><td>Steady; spike + RST = Rapid Reset attack</td></tr>
+<tr><td>RST_STREAM / GOAWAY rate</td><td>Aborted streams / draining</td><td>Near 0; alert on surge</td></tr>
+<tr><td>Retransmit / QUIC loss rate</td><td>Network loss</td><td>&lt;1%; &gt;3% degrades h2 badly</td></tr>
+<tr><td>Cache hit ratio / 304 ratio</td><td>Revalidation efficiency</td><td>&gt;85% edge hit for static; falling = cache key/Vary issue</td></tr>
+<tr><td>5xx / 421 / 502 rate</td><td>Backend + coalescing/keep-alive errors</td><td>&lt;0.1%; 421 spike = coalescing misroute</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>HTTP scales horizontally behind L7 LBs and CDNs; the protocol choices interact with how connections spread load.</p>
+<pre class="mermaid">
+flowchart TD
+  U["Millions of clients"] --> ANY["Anycast edge PoPs"]
+  ANY --> T["TLS QUIC termination"]
+  T --> POOL["Warm origin connection pool"]
+  POOL --> A1["Backend replica 1"]
+  POOL --> A2["Backend replica 2"]
+  POOL --> A3["Backend replica N"]
+</pre>
+<ul>
+<li><strong>Connection concentration</strong>: HTTP/2's single connection is great for clients but means an LB sees fewer, longer connections — balance on <em>requests</em> not connections (L7), or you get hot backends.</li>
+<li><strong>Origin pooling</strong>: edges keep persistent h2 pools to origin; tune <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> (commonly 100-250) to bound per-connection concurrency.</li>
+<li><strong>QUIC CPU</strong>: scale UDP receive with SO_REUSEPORT sharding across cores + UDP GSO/GRO to batch packets; QUIC has no kernel TSO so this matters.</li>
+<li><strong>Anycast + connection migration</strong>: QUIC connection IDs let you steer a migrated connection back to the right server via routable CIDs.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+<li><strong>TLS everywhere</strong>: h2 and h3 are effectively HTTPS-only in browsers; h3 mandates TLS 1.3. Use HSTS (<code>Strict-Transport-Security</code>) to prevent downgrade.</li>
+<li><strong>Cookies</strong>: set <code>Secure</code> (HTTPS only), <code>HttpOnly</code> (no JS access — blocks XSS token theft), and <code>SameSite=Lax/Strict</code> (CSRF defense). <code>SameSite=None</code> requires <code>Secure</code>.</li>
+<li><strong>CORS</strong>: cross-origin requests trigger a preflight <code>OPTIONS</code> with <code>Access-Control-Request-Method/Headers</code>; the server must return matching <code>Access-Control-Allow-*</code>. Never reflect arbitrary <code>Origin</code> with credentials.</li>
+<li><strong>0-RTT replay</strong>: early data can be replayed; restrict to safe/idempotent methods (GET/HEAD) and add anti-replay windows.</li>
+<li><strong>DoS</strong>: HTTP/2 Rapid Reset (CVE-2023-44487), HPACK memory bombs, Slowloris (slow headers) — cap concurrent streams, header sizes, and enforce request timeouts.</li>
+<li><strong>Request smuggling</strong>: conflicting <code>Content-Length</code> vs <code>Transfer-Encoding</code> between front/back proxies (CL.TE / TE.CL) lets attackers desync. Normalise/ reject ambiguous framing; h2/h3 binary framing removes this class.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>Round trips</strong>: TCP+TLS1.3 = 2 RTT to first byte; QUIC = 1 RTT; QUIC 0-RTT ≈ 0 RTT. On a 100 ms RTT link that's 200 ms vs 100 ms vs ~0 saved before data.</li>
+<li><strong>Header size</strong>: HPACK/QPACK cut a ~800-byte cookie-laden header set to tens of bytes after the dynamic table warms.</li>
+<li><strong>Flow control default</strong> 65,535 bytes per stream stalls high-BDP transfers — raise <code>SETTINGS_INITIAL_WINDOW_SIZE</code> and connection window (e.g. to 16 MB) for CDN/large downloads.</li>
+<li><strong>Concurrency</strong>: h1.1 = 6 connections/origin; h2/h3 = up to <code>MAX_CONCURRENT_STREAMS</code> (default ~100) on one connection.</li>
+<li><strong>Loss sensitivity</strong>: at 2% packet loss h2 throughput can collapse due to TCP HOL blocking + cwnd cuts; h3 keeps unrelated streams moving.</li>
+<li><strong>CPU</strong>: QUIC ~2× the CPU/byte of TCP without offload; mitigate with GSO/GRO, hardware crypto (AES-NI), and pacing. Enable Brotli (<code>br</code>) for text (~15-20% smaller than gzip) via <code>Accept-Encoding</code>.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>Domain sharding under HTTP/2</strong> — splitting assets across hostnames defeats multiplexing and adds handshakes. Fix: single origin, let h2 multiplex.</li>
+<li><strong>Leaving flow-control windows at 65 KB</strong> for bulk transfer. Fix: raise initial window sizes.</li>
+<li><strong>Client idle timeout ≥ server idle</strong> → reuse of a half-closed socket → intermittent 502. Fix: client idle a few seconds below LB idle.</li>
+<li><strong>Using <code>Cache-Control: no-cache</code> thinking it means "don't store"</strong> — it means "revalidate before use". For secrets use <code>no-store</code>.</li>
+<li><strong>Forgetting <code>Vary</code></strong> on content that changes by <code>Accept-Encoding</code>/<code>Accept-Language</code> → caches serve the wrong variant.</li>
+<li><strong>Non-idempotent GET</strong> or idempotent-but-side-effecting endpoints — breaks retries and caching assumptions.</li>
+<li><strong>Assuming server push helps</strong> — it's deprecated. Fix: <code>103 Early Hints</code> + <code>&lt;link rel=preload&gt;</code>.</li>
+<li><strong>No h2/h1.1 fallback for h3</strong> — UDP-blocked users hang. Fix: advertise via Alt-Svc and race.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they likely use it</th></tr>
+<tr><td>Google</td><td>Invented SPDY and QUIC; Search/YouTube/Gmail serve HTTP/3 by default from Google Front Ends, with 0-RTT resumption and connection migration for mobile.</td></tr>
+<tr><td>Amazon</td><td>CloudFront supports HTTP/3; ALB/API Gateway terminate h2/h1.1; internal service mesh largely gRPC-over-HTTP/2. S3 leans on ranges + conditional GET (ETag) for multipart and resumable downloads.</td></tr>
+<tr><td>Netflix</td><td>Open Connect CDN appliances serve video over HTTP; likely HTTP/2 with large flow-control windows and byte-range requests for adaptive bitrate segments; evaluating/using h3 for lossy last-mile.</td></tr>
+<tr><td>Uber</td><td>Mobile-heavy; benefits strongly from HTTP/3 connection migration across cellular handoffs; gRPC/HTTP2 internally for its microservice mesh.</td></tr>
+<tr><td>Swiggy</td><td>Likely CDN-fronted h2/h3 for app API and image assets on flaky Indian mobile networks; aggressive edge caching with ETag revalidation for menu/restaurant data.</td></tr>
+<tr><td>PhonePe</td><td>Payments over TLS 1.3 h2; would avoid 0-RTT for transaction endpoints (replay risk), using it only for idempotent reads; strict SameSite/Secure cookies.</td></tr>
+<tr><td>Razorpay</td><td>API + checkout over HTTPS h2; strong CORS config for merchant-embedded checkout; idempotency keys on POST to make payment creation safely retryable.</td></tr>
+<tr><td>Atlassian</td><td>Jira/Confluence Cloud behind CDN with h2/h3; heavy conditional-request caching for static bundles; long-lived connections for real-time collaboration surfaces.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What problem does each HTTP version solve?
+  <ol><li>Answer pointer: 1.1 keep-alive → 2 multiplexing/HPACK → 3 removes TCP HOL blocking via QUIC.</li></ol></li>
+<li>Why did HTTP/1.1 pipelining fail?
+  <ol><li>Responses must return in request order → one slow response blocks all (application HOL blocking) + buggy proxies.</li></ol></li>
+<li>Why 6 connections per origin in browsers?
+  <ol><li>Only one in-flight request per h1.1 connection; 6 gives pseudo-concurrency within fairness limits.</li></ol></li>
+<li>How does HTTP/2 multiplexing work internally?
+  <ol><li>Binary frames tagged with stream IDs interleave on one TCP connection; HEADERS+DATA per stream.</li></ol></li>
+<li>What is TCP head-of-line blocking and why does h2 still have it?
+  <ol><li>TCP is one ordered byte stream; a lost segment stalls delivery of all multiplexed streams until retransmit.</li></ol></li>
+<li>How does QUIC eliminate it?
+  <ol><li>Independent per-stream offsets/ordering over UDP; loss affects only the streams whose bytes were lost.</li></ol></li>
+<li>How does HPACK compression work?
+  <ol><li>Static table (61 entries) + per-connection dynamic table + Huffman literals; repeats become index references.</li></ol></li>
+<li>Why is QPACK different from HPACK?
+  <ol><li>HPACK's ordered table updates would reintroduce HOL blocking on independent QUIC streams; QPACK uses a separate encoder stream + blocked-references control.</li></ol></li>
+<li>How does h2/h3 flow control work?
+  <ol><li>Per-stream + per-connection windows; receiver grants credit via WINDOW_UPDATE; default 65,535 bytes.</li></ol></li>
+<li>Explain the QUIC handshake RTTs.
+  <ol><li>TLS 1.3 folded into transport → 1-RTT to data; resumption ticket → 0-RTT early data (replay-limited).</li></ol></li>
+<li>What is connection migration?
+  <ol><li>Connection keyed by connection ID not 4-tuple, so IP/port change (NAT/Wi-Fi→LTE) keeps the session alive.</li></ol></li>
+<li>How is HTTP/3 negotiated?
+  <ol><li>Server advertises <code>Alt-Svc: h3</code>; client retries over QUIC; falls back to h2/h1.1 if UDP fails.</li></ol></li>
+<li>Which methods are idempotent/safe?
+  <ol><li>Safe: GET/HEAD/OPTIONS. Idempotent: GET/HEAD/PUT/DELETE/OPTIONS. Not: POST, PATCH.</li></ol></li>
+<li>How does caching decide freshness?
+  <ol><li>Cache-Control max-age/no-cache/no-store/private/public; then revalidate with ETag/If-None-Match or Last-Modified/If-Modified-Since → 304.</li></ol></li>
+<li>What breaks under 2% packet loss for h2 vs h3?
+  <ol><li>h2 throughput collapses (HOL + cwnd cut); h3 keeps unrelated streams flowing.</li></ol></li>
+<li>Why is HTTP/2 server push deprecated?
+  <ol><li>Pushed already-cached assets waste bandwidth; replaced by 103 Early Hints + preload.</li></ol></li>
+<li>What is HTTP/2 Rapid Reset?
+  <ol><li>CVE-2023-44487: cheap open+RST_STREAM flood → DoS; mitigate by capping stream churn.</li></ol></li>
+<li>How do you debug which protocol a request used?
+  <ol><li>curl <code>%{http_version}</code>, DevTools Protocol column, chrome://net-export, nghttp frames.</li></ol></li>
+<li>When would you deliberately choose h1.1?
+  <ol><li>UDP/h2 blocked, trivial internal LAN calls, tooling/debuggability, or bulk transfer where independent congestion windows help.</li></ol></li>
+<li>How does request smuggling relate to framing?
+  <ol><li>CL/TE ambiguity in h1.1 desyncs proxies; h2/h3 binary length framing removes the ambiguity.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>TCP/TLS internals</strong> → 3-way handshake, cwnd/slow-start, TLS 1.3 1-RTT, ALPN/SNI. Angle: explain the RTT stack under HTTP.</li>
+<li><strong>Caching & CDNs</strong> → edge cache keys, Vary, stale-while-revalidate, cache stampede. Angle: how conditional requests cut origin load.</li>
+<li><strong>gRPC / microservices</strong> → why gRPC rides HTTP/2, streaming RPC, deadlines. Angle: h2 as an RPC transport.</li>
+<li><strong>WebSockets / SSE</strong> → when to leave request/response for push. Angle: full-duplex vs h2 streams.</li>
+<li><strong>Load balancing</strong> → L4 vs L7, request-based balancing with sticky h2 connections, connection draining/GOAWAY.</li>
+<li><strong>Security</strong> → CORS, cookies SameSite/HttpOnly, CSRF/XSS, HSTS, request smuggling.</li>
+<li><strong>Performance/Web vitals</strong> → TTFB, preload/Early Hints, Brotli, resource prioritization.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+<h3>Mobile app latency spikes on flaky networks (h2 HOL blocking)</h3>
+<table>
+<tr><th>Symptoms</th><td>p99 request latency spikes on cellular though bandwidth is fine; correlates with packet loss.</td></tr>
+<tr><td>Investigation</td><td>net-export shows one h2 connection; retransmits high; all streams stall together during a loss event.</td></tr>
+<tr><td>Root cause</td><td>TCP HOL blocking — a lost segment blocks delivery of every multiplexed stream until retransmit.</td></tr>
+<tr><td>Solution</td><td>Enable HTTP/3 (Alt-Svc h3) at the edge; QUIC isolates streams from cross-stream loss.</td></tr>
+<tr><td>Prevention</td><td>Track protocol mix + loss rate per network type; keep h3 default with h2 fallback.</td></tr>
+<tr><td>Interview answer</td><td>"Bandwidth was fine but a single connection meant one lost TCP segment stalled all streams; moving to QUIC decoupled them."</td></tr>
+</table>
+<h3>Intermittent 502s after deploy (keep-alive race)</h3>
+<table>
+<tr><th>Symptoms</th><td>~0.2% of requests fail with 502/connection reset, no backend errors logged.</td></tr>
+<tr><td>Investigation</td><td>Failures cluster on reused connections; LB idle timeout 60 s, client keep-alive 75 s.</td></tr>
+<tr><td>Root cause</td><td>Client reuses a connection the LB already closed; request races the FIN.</td></tr>
+<tr><td>Solution</td><td>Set client idle timeout below server/LB idle (e.g. 55 s); enable retry on idempotent methods.</td></tr>
+<tr><td>Prevention</td><td>Standardise idle-timeout hierarchy client &lt; LB &lt; origin; alert on reset rate.</td></tr>
+<tr><td>Interview answer</td><td>"Classic keep-alive race — client thought the socket was alive; fix is timeout ordering plus idempotent retry."</td></tr>
+</table>
+<h3>HTTP/3 slower than expected (UDP throttling)</h3>
+<table>
+<tr><th>Symptoms</th><td>h3 clients on a corporate network have worse TTFB than h2.</td></tr>
+<tr><td>Investigation</td><td>Wireshark shows QUIC Initial retransmits and rate limiting; some clients never complete handshake.</td></tr>
+<tr><td>Root cause</td><td>Middlebox throttles/blocks UDP 443.</td></tr>
+<tr><td>Solution</td><td>Robust fallback: race h3 vs h2, cap h3 attempt time, remember failure per network.</td></tr>
+<tr><td>Prevention</td><td>Monitor h3 success rate by ASN/network; disable h3 where it consistently fails.</td></tr>
+<tr><td>Interview answer</td><td>"QUIC rides UDP which some networks throttle; the answer is fast fallback and per-network learning, not blind h3."</td></tr>
+</table>
+<h3>Cache serving wrong language/encoding (missing Vary)</h3>
+<table>
+<tr><th>Symptoms</th><td>Some users get gzip when they can't decode it, or wrong-language pages.</td></tr>
+<tr><td>Investigation</td><td>Edge cache key ignores Accept-Encoding/Accept-Language; one variant cached for all.</td></tr>
+<tr><td>Root cause</td><td>Response lacked <code>Vary: Accept-Encoding, Accept-Language</code>.</td></tr>
+<tr><td>Solution</td><td>Add correct Vary headers; normalise Accept-Encoding at edge to bound variants.</td></tr>
+<tr><td>Prevention</td><td>Cache-key linting; test with varied Accept-* headers.</td></tr>
+<tr><td>Interview answer</td><td>"Caches key on URL unless told otherwise; Vary tells them which request headers change the response."</td></tr>
+</table>
+<h3>Payment double-charge after 0-RTT retry</h3>
+<table>
+<tr><th>Symptoms</th><td>Rare duplicate charges on flaky mobile connections.</td></tr>
+<tr><td>Investigation</td><td>0-RTT early data replayed by network; POST reached backend twice.</td></tr>
+<tr><td>Root cause</td><td>Non-idempotent POST sent as replayable 0-RTT early data.</td></tr>
+<tr><td>Solution</td><td>Disable 0-RTT for non-idempotent endpoints; require server-side idempotency keys on payment creation.</td></tr>
+<tr><td>Prevention</td><td>Policy: 0-RTT only for GET/HEAD; idempotency keys mandatory on mutating APIs.</td></tr>
+<tr><td>Interview answer</td><td>"0-RTT trades a round trip for replay risk; mutations need idempotency keys and should not ride early data."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Walk me through exactly what happens on the wire from typing a URL to first byte over HTTP/3.</summary><p>DNS resolves the name (possibly HTTPS/SVCB record hinting h3). The client sends a QUIC Initial UDP packet to :443 carrying CRYPTO frames with the TLS 1.3 ClientHello (key share, SNI, ALPN=h3). The server replies with its ServerHello, cert and Finished inside QUIC packets; both derive keys via ECDHE. After one RTT the handshake completes and the client opens an HTTP/3 request stream (a QUIC bidirectional stream), sends a QPACK-encoded HEADERS frame, and the server responds with HEADERS + DATA. If the client had a resumption ticket it could have sent the request as 0-RTT early data in that first flight. Meanwhile packet numbers, ACK ranges and a userspace congestion controller manage loss and pacing.</p></details>
+  <details><summary>Why can't HTTP/2 just fix HOL blocking by itself?</summary><p>Because the blocking lives one layer below HTTP/2, in TCP. TCP presents a single in-order byte stream to the application; if segment N is lost, the kernel buffers N+1, N+2… and refuses to deliver them to the h2 layer until N is retransmitted and arrives. So even though h2 logically has independent streams, they're all serialised through one TCP receive buffer. No amount of h2 framing can reorder around a missing TCP segment. The only fix is a transport that keeps per-stream ordering — QUIC.</p></details>
+  <details><summary>Explain HPACK and the specific way it can be dangerous.</summary><p>HPACK compresses headers using a static table of 61 common entries and a per-connection dynamic table that both peers mutate as headers repeat, plus Huffman-encoded literals. Repeated headers collapse to a 1-2 byte index. Danger: the dynamic table is shared mutable state — a malicious peer can force large tables (memory pressure) or, historically, CRIME/BREACH-style attacks used compression to leak secrets, which is why HPACK never compresses across the security boundary the way naive gzip did. You bound it with SETTINGS_HEADER_TABLE_SIZE and a max header list size. QPACK exists because HPACK's requirement that both sides process table updates in order would reintroduce HOL blocking across QUIC's independent streams.</p></details>
+  <details><summary>How does QPACK avoid reintroducing HOL blocking?</summary><p>QPACK splits dynamic-table maintenance onto dedicated unidirectional QUIC streams (encoder and decoder streams) separate from the request streams. A header block on a request stream may reference dynamic-table entries, but the encoder can choose to only reference entries it knows the decoder already has, or mark a block as "blocked" with a required insert count. The decoder tracks how many insertions it's seen; a block that references not-yet-received entries waits only for that specific table update, not for unrelated streams. The <code>SETTINGS_QPACK_BLOCKED_STREAMS</code> knob bounds how many streams may be blocked at once, letting you trade compression ratio against blocking risk.</p></details>
+  <details><summary>0-RTT sounds free — what's the catch and how do you use it safely?</summary><p>0-RTT lets a returning client send request data in the first packet using keys derived from a prior session's PSK. The catch is replay: because there's no round trip to prove freshness, an on-path attacker can capture and resend that early data, and the server can't distinguish it from a legitimate retransmit. So 0-RTT must be limited to idempotent, side-effect-free requests (GET/HEAD). Servers implement anti-replay via single-use tickets or a bounded replay window, and reject or defer non-idempotent requests to 1-RTT. For payments/order creation you additionally require server-side idempotency keys regardless of 0-RTT.</p></details>
+  <details><summary>A single h2 connection concentrates load — how do you keep backends balanced?</summary><p>Because one client uses one long-lived h2 connection, an L4 load balancer that hashes on connection would pin all that client's requests to one backend, creating hot spots and making draining hard. You balance at L7, distributing per <em>request</em> (per stream) across backends, or you split the client-facing connection from origin connections at the edge and pool many short requests over a warm origin fleet. You also use GOAWAY for graceful connection draining during deploys, and cap MAX_CONCURRENT_STREAMS so no single connection monopolises a backend.</p></details>
+  <details><summary>Contrast Cache-Control no-cache, no-store, must-revalidate, and private.</summary><p><code>no-store</code>: never write to any cache — for secrets. <code>no-cache</code>: you may store it, but must revalidate with the origin (conditional request) before serving. <code>must-revalidate</code>: once stale, you must revalidate rather than serve stale on error. <code>private</code>: only the browser may cache, not shared/CDN caches (for per-user content); <code>public</code>: shared caches may store even normally-uncacheable responses. <code>max-age=N</code> sets freshness lifetime. A common correct combo for versioned static assets is <code>public, max-age=31536000, immutable</code>; for HTML often <code>no-cache</code> so it always revalidates.</p></details>
+  <details><summary>How do conditional requests turn a reload into a 304?</summary><p>On first response the server sends a validator: <code>ETag: "v1"</code> (a content hash/version) and/or <code>Last-Modified</code>. The cache stores it. On revalidation the client sends <code>If-None-Match: "v1"</code> (or <code>If-Modified-Since</code>). If unchanged the server returns <code>304 Not Modified</code> with no body — the client reuses its cached copy. This saves the body bytes but still costs a round trip; strong caching with max-age avoids even that. ETags also power optimistic concurrency on writes via <code>If-Match</code> (return 412 Precondition Failed on conflict).</p></details>
+  <details><summary>Explain the CORS preflight sequence precisely.</summary><p>For a "non-simple" cross-origin request (custom headers, methods beyond GET/POST/HEAD, or JSON content-type), the browser first sends an <code>OPTIONS</code> preflight with <code>Origin</code>, <code>Access-Control-Request-Method</code> and <code>Access-Control-Request-Headers</code>. The server must respond with matching <code>Access-Control-Allow-Origin</code> (a specific origin, or <code>*</code> but not <code>*</code> with credentials), <code>Access-Control-Allow-Methods/Headers</code>, and optionally <code>Access-Control-Max-Age</code> to cache the preflight. Only then does the browser send the real request. With <code>credentials: include</code> you must echo the exact origin and set <code>Access-Control-Allow-Credentials: true</code>. CORS is browser-enforced; it doesn't protect servers, so don't rely on it for authorization.</p></details>
+  <details><summary>What exactly is HTTP request smuggling and how do the versions differ?</summary><p>In HTTP/1.1 a message body length is defined by either <code>Content-Length</code> or <code>Transfer-Encoding: chunked</code>. If a front-end proxy and back-end server disagree on which to honour (CL.TE, TE.CL, TE.TE), an attacker crafts a request whose boundary each parses differently, "smuggling" a partial request that prepends to the next victim's request — enabling cache poisoning, auth bypass, credential theft. Fixes: reject messages with both headers, normalise before forwarding, use the same parser front/back. HTTP/2 and /3 use explicit binary length framing with no ambiguous dual-length signalling, so this whole class largely disappears — though downgrade points (h2→h1.1 at a proxy) can re-expose it.</p></details>
+  <details><summary>Why is QUIC more CPU-hungry and how do you mitigate it?</summary><p>TCP benefits from decades of kernel optimisation and NIC offload (TSO/GSO/GRO, checksum offload) plus segmentation in hardware. QUIC runs congestion control, loss detection, and per-packet crypto (AEAD) in userspace over UDP, and historically sent one packet per syscall — so it can cost ~2× CPU per byte. Mitigations: UDP Generic Segmentation/Receive Offload (GSO/GRO) to batch many QUIC packets per syscall, SO_REUSEPORT to shard UDP flows across cores, AES-NI hardware crypto, sendmmsg/recvmmsg batching, and pacing to smooth bursts. Kernel and NIC QUIC/UDP-segmentation offload is closing the gap.</p></details>
+  <details><summary>When would you deliberately keep HTTP/1.1 in 2026?</summary><p>Internal service-to-service calls on a reliable low-latency LAN where multiplexing buys little and h1.1's simplicity/debuggability wins; environments where UDP and even h2 are blocked; bulk parallel downloads where several independent TCP connections each get their own congestion window and HOL blocking is contained per-file; tooling and quick <code>curl</code>/log debugging where plaintext framing is a feature. For a browser-facing site at scale, though, you want h2/h3.</p></details>
+  <details><summary>How does connection migration actually work and why doesn't it break security?</summary><p>QUIC identifies a connection by a server-chosen Connection ID carried in each packet, not by the UDP 4-tuple. When a client's address changes (NAT rebind, Wi-Fi→cellular), packets arrive from a new IP/port but the same Connection ID, so the server maps them to the existing connection and its keys — no new handshake. To prevent an attacker spoofing a migration to redirect traffic, QUIC requires path validation: the server sends a PATH_CHALLENGE random token to the new address and only fully migrates after a matching PATH_RESPONSE, proving the peer actually owns the new path. Connection IDs are also rotated to avoid linkability/tracking across paths.</p></details>
+  <details><summary>Your h2 service is being DoS'd by Rapid Reset — what's happening and what do you do?</summary><p>CVE-2023-44487: an attacker opens a stream (HEADERS) and immediately sends RST_STREAM, cancelling it before the server finishes. Because canceled streams don't count against MAX_CONCURRENT_STREAMS, the attacker can churn effectively unlimited request work per connection at almost no client cost, exhausting server CPU/memory. Mitigation: track and rate-limit RST_STREAM / stream-creation churn per connection, cap total streams (including reset ones) per connection over time, and close/GOAWAY connections that exceed a reset ratio. Patched server libraries (nghttp2, Go net/http, Envoy) added exactly these counters.</p></details>
+  <details><summary>Explain HTTP/2 flow control and a realistic way it stalls throughput.</summary><p>There are two windows: per-stream and per-connection, both default 65,535 bytes. The sender may have at most that many unacknowledged DATA bytes in flight; the receiver replenishes credit via WINDOW_UPDATE as it consumes data. On a high bandwidth-delay-product link (say 100 Mbps, 100 ms RTT → ~1.25 MB BDP) a 64 KB window caps throughput far below the pipe because the sender keeps waiting for updates. Fix: raise SETTINGS_INITIAL_WINDOW_SIZE and the connection window (e.g. to a few MB), and ensure the app drains fast so WINDOW_UPDATEs flow. A slow/blocked reader that never updates its window will stall the sender entirely.</p></details>
+  <details><summary>What's the difference between idempotent and safe, and why does it matter for retries and caches?</summary><p>Safe = no server state change (GET, HEAD, OPTIONS) — cacheable and prefetchable. Idempotent = repeating the request has the same effect as doing it once (GET, HEAD, PUT, DELETE, OPTIONS). POST and PATCH are neither safe nor guaranteed idempotent. This matters because middleboxes, browsers and client libraries will automatically <em>retry</em> idempotent requests on connection failure — safe to do for PUT/DELETE, dangerous for POST (double-charge). It also governs caching: only safe methods are cached. To make a POST safely retryable you add an idempotency key so the server dedupes replays.</p></details>
+</div>

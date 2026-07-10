@@ -1,0 +1,346 @@
+<h1>Load Balancing &amp; Proxies <span class="tag express">Mastery</span></h1>
+<p>A load balancer is a traffic director that spreads connections or requests across a fleet so no single box melts and dead boxes stop getting traffic. This page pushes past "round-robin across servers" into L4 vs L7 internals, Maglev consistent hashing, power-of-two-choices, health-check-induced cascades, retry storms, connection draining, and the proxy taxonomy (forward / reverse / gateway / sidecar) that Staff interviewers keep drilling.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "A load balancer distributes incoming traffic across a pool of backends to maximize throughput, minimize latency, and survive individual failures. There are two layers: L4 balances at the transport level — it forwards TCP/UDP by IP:port, is protocol-agnostic and blazing fast, but can't see HTTP. L7 terminates the connection, parses HTTP, and routes by host, path, or header, does TLS termination, retries and sticky sessions — richer but more CPU and latency. It picks a backend with an algorithm (round-robin, least-connections, consistent hashing, power-of-two-choices), removes unhealthy nodes via active or passive health checks, and drains connections gracefully on deploy so no in-flight request is killed."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The fuller answer names the internals an interviewer is fishing for:</p>
+<ul>
+  <li><strong>Layer split:</strong> <strong>L4</strong> operates on TCP/UDP — it sees only the 5-tuple (src IP, src port, dst IP, dst port, protocol). It forwards packets via NAT (rewrite dst IP, both directions flow through the LB) or DSR/direct-server-return (LB rewrites only the inbound path; backend replies directly to the client, so the LB never sees the response — huge for asymmetric traffic like video). <strong>L7</strong> terminates TCP, reads the HTTP request line and headers, and can route by <code>Host</code>, path prefix, method, cookie, or JWT claim; it owns TLS, HTTP/2 multiplexing, retries, rewrites, and buffering.</li>
+  <li><strong>Algorithms:</strong> round-robin and weighted RR (weight by CPU/capacity), least-connections and least-response-time (EWMA of latency), IP-hash / consistent hashing (for cache affinity and stateful routing, minimizes remap on scale change), and <strong>power-of-two-choices</strong> — pick two random backends, send to the less loaded — which gets near-optimal load spread without the herding problem of global least-connections.</li>
+  <li><strong>Health checks:</strong> <em>active</em> probes (HTTP <code>/healthz</code> or TCP connect on an interval, with unhealthy/healthy thresholds and slow-start on recovery) plus <em>passive</em> outlier detection (eject a host after N consecutive 5xx or timeouts on real traffic).</li>
+  <li><strong>Resiliency toolkit:</strong> retry budgets (cap retries at e.g. 20% of requests so a retry storm can't 3x load), jittered exponential backoff, circuit breaking, outlier ejection, deadline/timeout propagation, and load shedding under overload.</li>
+  <li><strong>Global vs local:</strong> GSLB / anycast / Global Accelerator route users to the nearest healthy region (DNS or BGP anycast); a local LB spreads within a datacenter. Google's <strong>Maglev</strong> is a software L4 LB that uses consistent hashing plus ECMP from routers and connection tracking to survive re-hashing.</li>
+  <li><strong>Proxy taxonomy:</strong> forward proxy (client-side egress), reverse proxy (server-side, the LB itself), API gateway (reverse proxy + auth + rate limit + routing), and sidecar (Envoy per-pod, the service-mesh data plane).</li>
+</ul>
+
+<h2>Internal Working</h2>
+<p>Trace one request through an L7 reverse proxy (Envoy/NGINX style):</p>
+<ol>
+  <li><strong>Accept:</strong> the listener socket accepts a connection off the kernel accept queue (sized by <code>somaxconn</code> + the app's <code>backlog</code>). The FD count is bounded by <code>ulimit -n</code>; a busy LB needs 100k+ FDs.</li>
+  <li><strong>TLS handshake (if terminating):</strong> ClientHello → certificate → key exchange. Session tickets / session IDs let repeat clients resume without a full handshake. This is the CPU hot spot — ECDSA certs are ~5-10x cheaper than RSA-2048 to sign.</li>
+  <li><strong>Parse:</strong> read the request line and headers into a structured request. For HTTP/2 the LB demultiplexes streams over one connection; for HTTP/1.1 it uses keepalive to reuse connections.</li>
+  <li><strong>Route match:</strong> match against a route table — virtual host by <code>Host</code> header + SNI, then longest-prefix or regex path match, then header/weight predicates. This produces a <em>cluster</em> (upstream pool).</li>
+  <li><strong>Endpoint selection:</strong> run the load-balancing policy over healthy endpoints in the cluster — round-robin cursor, least-request via P2C, or ring-hash / Maglev table for consistent hashing. Ejected outliers are skipped.</li>
+  <li><strong>Connection pooling:</strong> grab an idle upstream connection from the per-endpoint pool or open a new one (respecting <code>max_connections</code>, <code>max_pending_requests</code> circuit-breaker limits).</li>
+  <li><strong>Forward + timeouts:</strong> proxy the request with a per-try timeout and an overall route timeout; the remaining deadline is propagated downstream (e.g. gRPC <code>grpc-timeout</code> header).</li>
+  <li><strong>Response handling:</strong> on 5xx/timeout/connect-failure, consult the retry policy + retry budget; otherwise stream the response back (DSR skips this for L4). Update passive-health counters and EWMA latency.</li>
+  <li><strong>Draining on shutdown:</strong> on deploy, the endpoint is marked draining — new requests stop, in-flight ones finish, then the connection closes after <code>drain-timeout</code>.</li>
+</ol>
+<div class="callout tip"><strong>Say this:</strong> "The load balancer is a state machine over a route table and an endpoint pool. Health checks decide the pool membership; the algorithm decides which member; circuit breakers and retry budgets decide whether to even try."</div>
+
+<h3>Consistent hashing — the K/N remap problem</h3>
+<p>Naive <code>hash(key) % N</code> remaps <em>almost every</em> key when N changes (add one node, ~all keys move). Consistent hashing places nodes and keys on a hash ring; adding/removing a node only remaps ~1/N of keys. <strong>Virtual nodes</strong> (each physical node gets ~100-200 ring positions) smooth out the otherwise lumpy distribution. Maglev builds a fixed lookup table (size ~65537, a prime) via a permutation algorithm so lookups are O(1) and disruption on node change is minimal.</p>
+
+<h2>Why was this built?</h2>
+<p>Before load balancers, you scaled vertically — one bigger server — until you hit a ceiling and a single point of failure. Early horizontal attempts used <strong>DNS round-robin</strong>: return multiple A records and let clients pick. It "works" but has no health awareness (dead IPs still returned), caching means TTLs pin clients to a box for minutes, and there's zero connection-level balancing. Then came hardware appliances (F5 BIG-IP, Citrix NetScaler) — expensive, vertically scaled boxes doing L4/L7 in ASICs. The cloud era pushed load balancing into software (HAProxy, NGINX, Envoy) and into the network fabric (Google Maglev, AWS NLB/ALB) so it scales horizontally with ECMP and commodity servers instead of a $50k appliance.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>Approach</th><th>How it works</th><th>When it wins</th><th>Why not always</th></tr>
+  <tr><td>DNS round-robin</td><td>Multiple A records, client picks</td><td>Cheap coarse global spread, region selection</td><td>No health awareness, TTL caching pins clients, uneven</td></tr>
+  <tr><td>Anycast (BGP)</td><td>Same IP announced from many sites, routers pick nearest</td><td>Global L3 spread, DDoS absorption, low latency</td><td>Route flaps reset TCP; hard to pin sessions</td></tr>
+  <tr><td>Client-side LB</td><td>Client library picks endpoint (gRPC, Ribbon)</td><td>No extra hop, latency-aware, mesh</td><td>Logic in every client/language; needs service discovery</td></tr>
+  <tr><td>Hardware LB (F5)</td><td>ASIC appliance</td><td>Ultra-high throughput, mature L7</td><td>Cost, vertical scaling, vendor lock-in</td></tr>
+  <tr><td>L4 software (NLB/Maglev)</td><td>Kernel/DPDK packet forwarding</td><td>Millions of conns, protocol-agnostic, low latency</td><td>Can't route by HTTP, no TLS termination</td></tr>
+  <tr><td>L7 software (Envoy/ALB)</td><td>HTTP-aware reverse proxy</td><td>Path routing, retries, TLS, observability</td><td>More CPU, higher latency, TLS cost</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Horizontal scale + HA:</strong> add backends without client changes; dead backends removed automatically.</li>
+  <li><strong>Zero-downtime deploys:</strong> connection draining + rolling restarts behind a stable VIP.</li>
+  <li><strong>TLS offload:</strong> terminate once at the edge; backends speak cheap HTTP internally (or re-encrypt for zero-trust).</li>
+  <li><strong>Traffic control:</strong> canary weights, blue-green, header-based routing, rate limiting, WAF at L7.</li>
+  <li><strong>Observability choke point:</strong> centralized metrics, access logs, and tracing headers injected in one place.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>Single point of failure</strong> if not itself redundant — you now need to make the LB HA (active-active, ECMP, floating VIP).</li>
+  <li><strong>Extra hop + latency</strong> — L7 adds parse/buffer/TLS cost (often 1-5 ms; TLS handshake tens of ms cold).</li>
+  <li><strong>State/affinity headaches</strong> — sticky sessions break clean stateless scaling and rebalancing.</li>
+  <li><strong>Failure amplifier</strong> — a bad health check or retry policy can turn a small blip into a fleet-wide cascade.</li>
+  <li><strong>Config complexity</strong> — route tables, timeouts, circuit breakers, and cert rotation are their own operational surface.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<table>
+  <tr><th>Dimension</th><th>Option A</th><th>Option B</th><th>Call it</th></tr>
+  <tr><td>Layer</td><td>L4: fast, protocol-agnostic, no HTTP visibility</td><td>L7: rich routing, TLS, retries, more CPU</td><td>L4 for raw TCP/UDP + throughput; L7 when you need HTTP logic</td></tr>
+  <tr><td>TLS</td><td>Terminate at LB (cheap backends, LB sees payload)</td><td>Passthrough (E2E encryption, LB blind) / re-encrypt (zero-trust)</td><td>Terminate for observability; re-encrypt for compliance</td></tr>
+  <tr><td>Return path</td><td>NAT (symmetric, LB sees both ways)</td><td>DSR (backend replies direct, LB not on egress)</td><td>DSR for video/asymmetric high egress</td></tr>
+  <tr><td>Algorithm</td><td>Least-connections (global state)</td><td>P2C (two random picks, no herding)</td><td>P2C at scale; least-conn for small pools</td></tr>
+  <tr><td>Affinity</td><td>Sticky sessions (easy)</td><td>Stateless + external session store</td><td>Externalize state; stickiness is a last resort</td></tr>
+</table>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't reach for a heavy L7 LB when:
+<ul>
+  <li>You have a single backend or trivial traffic — you've added a SPOF and a hop for nothing.</li>
+  <li>You need true end-to-end encryption with no middlebox seeing plaintext — use L4 passthrough, not L7 termination.</li>
+  <li>Latency budget is microseconds (HFT, some RPC) — an L7 proxy hop can blow the budget; use client-side LB or L4/DSR.</li>
+  <li>You're balancing long-lived stateful connections that must pin to one node (WebSocket to in-memory game state) without external state — stickiness will bite you on rebalance/deploy.</li>
+  <li>Traffic is naturally partitioned by key and clients can route themselves (consistent-hash client-side) — an intermediary just adds a hop.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical multi-tier production topology: BGP anycast / GSLB steers users to the nearest region; an L4 layer (ECMP + Maglev-style) fans packets to a fleet of L7 proxies that terminate TLS and route by path to service clusters, each fronted by health-checked endpoints. Envoy sidecars handle service-to-service inside the mesh.</p>
+<pre class="mermaid">
+flowchart TD
+  U["Users worldwide"] --> DNS["GSLB or Anycast VIP"]
+  DNS --> L4["L4 fleet ECMP plus Maglev"]
+  L4 --> P1["L7 proxy A"]
+  L4 --> P2["L7 proxy B"]
+  P1 --> SVC["Service cluster"]
+  P2 --> SVC
+  SVC --> S1["Backend 1 healthy"]
+  SVC --> S2["Backend 2 healthy"]
+  SVC --> S3["Backend 3 draining"]
+  HC["Health checker"] -.probe.-> S1
+  HC -.probe.-> S2
+  HC -.eject.-> S3
+</pre>
+<p>The L4 tier is stateless and scales by adding hosts behind the same anycast VIP — routers ECMP-hash the 5-tuple across them. Maglev's connection tracking keeps existing flows pinned to the same L7 proxy even when the L4 set changes, avoiding mid-connection resets. The L7 tier owns TLS certs, route tables, and circuit breakers; it's where canary weights and WAF rules live.</p>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>Retry storms / metastable failure:</strong> a latency blip causes clients to retry, retries triple load, backends slow further, more retries — the system stays collapsed even after the original trigger is gone. Fix: retry budgets + circuit breakers + jitter.</li>
+  <li><strong>Health-check induced cascade:</strong> too-aggressive checks eject a slow-but-alive node, dumping its load on peers, which then trip the same threshold — the whole fleet ejects itself. Fix: eject a bounded percentage (outlier <code>max_ejection_percent</code>), panic mode.</li>
+  <li><strong>Thundering herd on failover:</strong> a region fails, all its traffic lands on the standby at once; cold caches + cold connection pools + JIT warmup overwhelm it.</li>
+  <li><strong>Sticky-session hot spots:</strong> one whale tenant's session pins to one backend and saturates it while peers idle.</li>
+  <li><strong>Connection pool exhaustion:</strong> LB→backend keepalive pool caps at <code>max_connections</code>; a slow backend fills the pool and requests queue in <code>max_pending_requests</code> then fail fast.</li>
+  <li><strong>TLS CPU saturation:</strong> handshake storms (no session resumption) peg cores; p99 spikes.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Is the backend even reachable / listening?
+ss -ltnp | grep :8080          # listen sockets + accept queue (Recv-Q = backlog used)
+ss -s                          # socket summary, count of TIME_WAIT / ESTAB
+
+# Accept queue overflow (backlog too small vs somaxconn)
+nstat -az | grep -i listendrop      # TcpExtListenDrops / ListenOverflows &gt; 0 = drops
+sysctl net.core.somaxconn           # raise if app backlog is capped by it
+
+# FD exhaustion on the proxy
+cat /proc/$(pgrep envoy)/limits | grep 'open files'
+ls /proc/$(pgrep envoy)/fd | wc -l  # current FDs vs ulimit -n
+
+# Envoy live state
+curl -s localhost:9901/clusters | grep -E 'health_flags|cx_active|rq_pending'
+curl -s localhost:9901/stats | grep -E 'upstream_rq_retry|ejections|overflow'
+curl -s localhost:9901/server_info   # draining state on shutdown
+
+# NGINX upstream health / timing
+tail -f access.log   # log $upstream_addr $upstream_status $upstream_response_time
+curl -w '@curl-fmt' -o /dev/null -s https://vip/   # DNS/connect/TLS/TTFB breakdown
+
+# Is it the LB or the backend? bypass the LB
+curl --resolve svc:443:10.0.0.5 https://svc/healthz  # hit one backend directly</code></pre>
+<div class="callout tip"><strong>Say this:</strong> "First I split LB-vs-backend by curling a backend directly with <code>--resolve</code>. Then I check the accept queue (<code>ListenOverflows</code>), FD count, and the proxy's <code>rq_pending</code>/<code>ejections</code> stats. Retry-related stats and EWMA latency tell me if it's a storm or a genuinely slow backend."</div>
+
+<h2>Monitoring</h2>
+<table>
+  <tr><th>Metric</th><th>What it means</th><th>Healthy / alert</th></tr>
+  <tr><td>Healthy host count / pool</td><td>Endpoints passing health checks</td><td>Alert if &lt; N-1 or drops &gt;25% suddenly</td></tr>
+  <tr><td>upstream_rq_5xx rate</td><td>Backend errors seen by LB</td><td>&lt;0.1%; page at &gt;1% sustained</td></tr>
+  <tr><td>p50 / p99 upstream latency</td><td>Backend response time</td><td>p99 within SLO; alert on 2x baseline</td></tr>
+  <tr><td>upstream_rq_pending_active</td><td>Requests queued for a connection</td><td>Near 0; sustained &gt;0 = pool exhaustion</td></tr>
+  <tr><td>upstream_rq_retry ratio</td><td>Fraction retried</td><td>&lt;5%; spike = storm forming</td></tr>
+  <tr><td>outlier ejections</td><td>Hosts ejected by passive health</td><td>Occasional; churn = flapping</td></tr>
+  <tr><td>connection accept queue overflow</td><td>Kernel dropped SYNs</td><td>0; any = raise backlog/somaxconn</td></tr>
+  <tr><td>TLS handshakes/sec + resume ratio</td><td>Crypto load</td><td>Resume &gt;80%; low resume = CPU risk</td></tr>
+  <tr><td>Active connections / FD usage</td><td>Capacity headroom</td><td>&lt;70% of ulimit -n</td></tr>
+  <tr><td>Draining hosts</td><td>Endpoints mid-deploy</td><td>Brief; stuck = drain-timeout too long</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>The LB tier itself scales horizontally: put multiple L4 nodes behind one anycast VIP and let routers ECMP-hash flows across them; add L7 proxies behind the L4 tier. The bottleneck moves from a single box to the aggregate NIC/PPS and the crypto cores. Autoscale L7 proxies on connection count + CPU; keep L4 stateless so scaling it never resets flows (with connection tracking).</p>
+<pre class="mermaid">
+flowchart LR
+  R["Edge routers"] -->|ECMP hash 5-tuple| M1["Maglev node 1"]
+  R --> M2["Maglev node 2"]
+  R --> M3["Maglev node 3"]
+  M1 -->|consistent hash| B["Backend pool"]
+  M2 --> B
+  M3 --> B
+  B --> A["Autoscaler adds pods on CPU and rq load"]
+</pre>
+<ul>
+  <li><strong>Scale-out knobs:</strong> more proxy replicas, more crypto cores (offload TLS to AES-NI/QAT), bigger connection pools.</li>
+  <li><strong>Vertical:</strong> raise <code>somaxconn</code>, <code>nofile</code> (FD limit), <code>net.ipv4.ip_local_port_range</code> (ephemeral ports for upstream conns), tune <code>tcp_tw_reuse</code>.</li>
+  <li><strong>Warmup:</strong> slow-start ramps traffic to newly healthy nodes over a window so cold caches/JIT don't get slammed.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>TLS termination is a trust boundary:</strong> plaintext exists inside the LB — restrict who can read logs/heap; re-encrypt to backends (mTLS) for zero-trust.</li>
+  <li><strong>DDoS / SYN floods:</strong> anycast to absorb, SYN cookies (<code>net.ipv4.tcp_syncookies</code>), connection rate limits, and a WAF at L7.</li>
+  <li><strong>Header spoofing:</strong> the LB must overwrite (not append) <code>X-Forwarded-For</code>/<code>X-Real-IP</code> from untrusted clients, else attackers forge source IPs.</li>
+  <li><strong>Request smuggling:</strong> mismatched <code>Content-Length</code> vs <code>Transfer-Encoding</code> parsing between LB and backend — normalize and reject ambiguous framing.</li>
+  <li><strong>Cert management:</strong> automate rotation (ACME), disable weak ciphers/TLS 1.0/1.1, enforce OCSP stapling.</li>
+  <li><strong>Sticky-session cookies</strong> must be signed/encrypted so a client can't rewrite them to target a specific backend.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>L7 proxy overhead:</strong> typically adds ~0.5-3 ms per hop for parse + route + buffer; keep it out of ultra-low-latency paths.</li>
+  <li><strong>TLS handshake:</strong> full handshake ~1 RTT (TLS 1.3) plus signing cost; resumption/0-RTT avoids the round trip. RSA-2048 sign is the CPU hog — ECDSA P-256 is ~5-10x cheaper; use AES-NI for bulk.</li>
+  <li><strong>Connection reuse:</strong> upstream keepalive + HTTP/2 multiplexing cut connection setup cost dramatically; without it you burn ephemeral ports and hit <code>ip_local_port_range</code> (~28k default) limits.</li>
+  <li><strong>Buffering:</strong> L7 buffering (NGINX <code>proxy_buffering on</code>) protects slow-client-slow-backend but adds memory + latency; disable for streaming.</li>
+  <li><strong>Kernel limits to tune:</strong> <code>somaxconn</code> (accept queue, raise to 65535), <code>tcp_max_syn_backlog</code>, <code>nofile</code> (1M+), <code>tcp_tw_reuse</code> for high TIME_WAIT churn.</li>
+  <li><strong>Throughput:</strong> a single Maglev/NLB node moves millions of PPS via DSR; an L7 proxy is limited by crypto + syscall overhead — tens to low-hundreds of k RPS per core class.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Retries without a budget →</strong> retry storm. Fix: cap retries (e.g. Envoy retry budget 20%), add jitter, retry only idempotent + retriable statuses.</li>
+  <li><strong>Health check hits <code>/</code> or a DB-heavy path →</strong> a slow dependency fails the check and ejects healthy app instances. Fix: shallow <code>/healthz</code> (liveness) vs deep <code>/readyz</code>.</li>
+  <li><strong>No connection draining →</strong> deploys kill in-flight requests (client 502s). Fix: drain + preStop hook + graceful shutdown.</li>
+  <li><strong>Sticky sessions as the primary scaling model →</strong> hot spots + broken rebalance. Fix: externalize session state (Redis).</li>
+  <li><strong>Ejecting too many hosts →</strong> cascade. Fix: <code>max_ejection_percent</code> + panic mode (route to all if too few healthy).</li>
+  <li><strong>Timeouts not propagated →</strong> LB waits full timeout on a request the client already abandoned. Fix: deadline propagation.</li>
+  <li><strong>somaxconn/backlog too small →</strong> silent SYN drops under burst. Fix: raise both kernel and app backlog together.</li>
+  <li><strong>Same timeout at every layer →</strong> inner retries stack past outer timeout. Fix: shrinking timeout budget per layer.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+  <tr><th>Company</th><th>How they use it (likely)</th></tr>
+  <tr><td>Google</td><td>Maglev software L4 LB — consistent hashing + ECMP from routers + connection tracking; GSLB for global steering; Envoy/GFE at L7 for HTTP.</td></tr>
+  <tr><td>Amazon</td><td>ELB family: NLB (L4, static IP, millions of flows, source-preserving), ALB (L7 path/host routing, TLS, WAF), Global Accelerator (anycast edge steering).</td></tr>
+  <tr><td>Netflix</td><td>Zuul edge gateway (L7 routing, retries, canaries) + Ribbon client-side LB historically; EVCache affinity; regional failover across AWS regions.</td></tr>
+  <tr><td>Uber</td><td>Envoy-based mesh with per-service sidecars; likely ring-hash/consistent hashing for stateful geo services; deadline propagation for the request tree.</td></tr>
+  <tr><td>Swiggy</td><td>Likely HAProxy/Envoy at edge, geo/GSLB to route to nearest region, weighted routing for surge scaling of order/delivery services during peak dinner load.</td></tr>
+  <tr><td>PhonePe</td><td>Likely L4+L7 tiers for UPI traffic with strict idempotency and tight retry budgets (money paths can't blindly retry); active-active across DCs.</td></tr>
+  <tr><td>Razorpay</td><td>Likely API gateway (auth + rate limit + routing) fronting payment services; mTLS re-encryption for PCI compliance; circuit breakers around bank/PSP integrations.</td></tr>
+  <tr><td>Atlassian</td><td>Likely AWS ALB/NLB + envoy mesh across tenants; sticky-per-tenant routing for shard affinity; blue-green + connection draining for continuous deploy of Jira/Confluence.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>What's the difference between L4 and L7 load balancing?
+    <ol><li>L4 = transport, 5-tuple, protocol-agnostic, fast, no HTTP; L7 = HTTP-aware, routes by host/path/header, TLS, retries.</li></ol></li>
+  <li>How does DSR differ from NAT?
+    <ol><li>NAT: both directions through LB; DSR: backend replies directly to client, LB only on ingress — great for asymmetric egress.</li></ol></li>
+  <li>Why is <code>hash % N</code> bad and what fixes it?
+    <ol><li>Remaps ~all keys on N change; consistent hashing + virtual nodes remaps only ~1/N.</li></ol></li>
+  <li>Why is power-of-two-choices better than pure least-connections at scale?
+    <ol><li>Global least-conn needs shared state and causes herding onto one "least" node; P2C picks 2 random + lesser — near-optimal, no herding, no global state.</li></ol></li>
+  <li>Active vs passive health checks?
+    <ol><li>Active = synthetic probe on interval; passive = outlier detection on real traffic (eject after N 5xx/timeouts).</li></ol></li>
+  <li>What is a retry storm and how do you prevent it?
+    <ol><li>Retries amplify load during a blip → metastable collapse; prevent with retry budgets, jitter, circuit breakers.</li></ol></li>
+  <li>What is metastable failure?
+    <ol><li>System stays collapsed even after trigger removed because a sustaining feedback loop (retries) persists; needs load shedding to break.</li></ol></li>
+  <li>How does connection draining work on deploy?
+    <ol><li>Mark endpoint draining → no new requests → let in-flight finish → close after drain-timeout.</li></ol></li>
+  <li>How do health checks cause cascades?
+    <ol><li>Ejecting a slow node dumps load on peers that then trip too; bound with max_ejection_percent + panic mode.</li></ol></li>
+  <li>Sticky sessions — mechanism and downside?
+    <ol><li>Cookie or source-IP affinity; downside = hot spots, broken rebalance, deploy pain. Externalize state instead.</li></ol></li>
+  <li>TLS termination vs passthrough vs re-encryption?
+    <ol><li>Terminate = LB decrypts (observability, cheap backends); passthrough = E2E, LB blind; re-encrypt = decrypt+re-encrypt for zero-trust.</li></ol></li>
+  <li>What is slow-start on recovery?
+    <ol><li>Ramp traffic to a newly healthy node over a window so cold caches/pools don't get slammed.</li></ol></li>
+  <li>How does GSLB/anycast pick a region?
+    <ol><li>DNS-based geo/latency steering, or BGP anycast where routers route the shared IP to nearest site.</li></ol></li>
+  <li>What's deadline propagation and why does it matter?
+    <ol><li>Pass remaining time budget downstream so no hop works on an abandoned request; prevents wasted work + stacked timeouts.</li></ol></li>
+  <li>How does Maglev survive re-hashing when nodes change?
+    <ol><li>Consistent-hash lookup table + connection tracking pins existing flows to the same backend despite table changes.</li></ol></li>
+  <li>Forward proxy vs reverse proxy vs API gateway vs sidecar?
+    <ol><li>Forward = client egress; reverse = server-side entry; gateway = reverse + auth/rate-limit/routing; sidecar = per-pod Envoy in a mesh.</li></ol></li>
+  <li>How do you make the LB itself HA?
+    <ol><li>Active-active behind anycast VIP + ECMP, or floating VIP with VRRP/keepalived failover.</li></ol></li>
+  <li>What kernel knobs matter under high connection load?
+    <ol><li>somaxconn, tcp_max_syn_backlog, nofile (FDs), ip_local_port_range, tcp_tw_reuse.</li></ol></li>
+  <li>How do you canary with a load balancer?
+    <ol><li>Weighted routing (e.g. 1% to new cluster) or header-based routing; watch error/latency, then ramp.</li></ol></li>
+  <li>Why can't L4 do TLS termination or path routing?
+    <ol><li>It never parses the application payload — it forwards packets by 5-tuple; TLS/HTTP live above L4.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>Service discovery:</strong> how endpoints get into the pool — DNS SRV, Consul/etcd, Kubernetes Endpoints, xDS. Expected angle: LB subscribes to a discovery source; EDS pushes changes to Envoy.</li>
+  <li><strong>Circuit breakers &amp; bulkheads:</strong> pivot from retries — trip open on error rate, isolate pools so one bad dependency can't drain all connections.</li>
+  <li><strong>Rate limiting:</strong> token bucket / leaky bucket at the gateway; global vs local; how it interacts with load shedding.</li>
+  <li><strong>Service mesh:</strong> Envoy data plane + control plane (Istio); mTLS, per-request routing, observability moved to sidecars.</li>
+  <li><strong>CDN &amp; edge:</strong> caching + TLS + anycast at the edge; how it offloads origin LBs.</li>
+  <li><strong>CAP / consistency:</strong> for stateful routing (consistent hashing to shards) — how rebalancing interacts with data locality.</li>
+  <li><strong>Autoscaling:</strong> which LB metric drives HPA (RPS, connections, CPU) and the feedback loop with slow-start.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Incident 1 — Retry storm collapses the checkout service</h3>
+<table>
+  <tr><th>Symptoms</th><td>p99 spikes, 503s climb, backend CPU pinned, error rate stays high even after the triggering dependency recovers.</td></tr>
+  <tr><th>Investigation</th><td><code>upstream_rq_retry</code> ratio jumped to 60%; backend request rate is 3x client rate; circuit breakers not tripping.</td></tr>
+  <tr><th>Root Cause</th><td>Aggressive retries (3 attempts, no budget, no jitter) amplified a brief DB slowdown into a self-sustaining metastable collapse.</td></tr>
+  <tr><th>Solution</th><td>Add retry budget (max 20% of active requests), jittered backoff, retry only on connect-failure/503, enable load shedding to break the loop.</td></tr>
+  <tr><th>Prevention</th><td>Load-test with fault injection; alert on retry ratio; per-layer shrinking timeout budget.</td></tr>
+  <tr><th>Interview Answer</th><td>"Classic metastable failure — retries became the sustaining feedback. I cap retries with a budget, add jitter, and shed load so the system can escape the collapsed state, not just wait it out."</td></tr>
+</table>
+
+<h3>Incident 2 — Health check ejects the whole fleet</h3>
+<table>
+  <tr><th>Symptoms</th><td>Sudden mass ejection, then no healthy hosts, then all traffic 503s across the cluster.</td></tr>
+  <tr><th>Investigation</th><td>Health check probed <code>/</code> which touches the DB; a slow DB made every instance fail the probe near-simultaneously.</td></tr>
+  <tr><th>Root Cause</th><td>Deep dependency-coupled health check + no floor on healthy hosts (no panic mode).</td></tr>
+  <tr><th>Solution</th><td>Split liveness <code>/healthz</code> (shallow) from readiness <code>/readyz</code>; enable panic mode (route to all when healthy% drops below threshold) and <code>max_ejection_percent</code>.</td></tr>
+  <tr><th>Prevention</th><td>Never fail liveness on a shared dependency; test health-check behavior under dependency failure.</td></tr>
+  <tr><th>Interview Answer</th><td>"A health check should test the instance, not its dependencies. When a shared dependency slows, everyone fails at once — so I cap ejection percentage and use panic mode as a floor."</td></tr>
+</table>
+
+<h3>Incident 3 — 502s on every deploy</h3>
+<table>
+  <tr><th>Symptoms</th><td>Bursts of client 502/504 exactly during rolling deploys; clean between deploys.</td></tr>
+  <tr><th>Investigation</th><td>Pods received SIGTERM and exited while the LB still had them in rotation and in-flight requests open.</td></tr>
+  <tr><th>Root Cause</th><td>No connection draining — endpoint removal wasn't propagated before the process died; no preStop delay.</td></tr>
+  <tr><th>Solution</th><td>Add drain: mark endpoint out of rotation, sleep in preStop for propagation, finish in-flight, then exit; set <code>terminationGracePeriod</code> &gt; drain window.</td></tr>
+  <tr><th>Prevention</th><td>Graceful-shutdown handler; readiness gate flips first; verify with a load test during rollout.</td></tr>
+  <tr><th>Interview Answer</th><td>"502-on-deploy is almost always a draining gap. The endpoint must leave the pool and let the discovery change propagate before the process stops accepting."</td></tr>
+</table>
+
+<h3>Incident 4 — One tenant saturates a single backend</h3>
+<table>
+  <tr><th>Symptoms</th><td>One backend at 100% CPU, peers near idle, that tenant's latency terrible, others fine.</td></tr>
+  <tr><th>Investigation</th><td>Source-IP sticky sessions pinned a high-volume tenant (behind one NAT egress IP) to a single node.</td></tr>
+  <tr><th>Root Cause</th><td>Affinity by source IP created a hot spot; the algorithm couldn't spread that tenant.</td></tr>
+  <tr><th>Solution</th><td>Drop source-IP stickiness; externalize session to Redis and go stateless, or use least-request P2C with per-tenant rate limits.</td></tr>
+  <tr><th>Prevention</th><td>Avoid stickiness as a scaling model; add per-tenant fairness/quota.</td></tr>
+  <tr><th>Interview Answer</th><td>"Source-IP affinity buckets everyone behind a NAT into one backend. I externalize state so routing can stay stateless and even, and add per-tenant limits for fairness."</td></tr>
+</table>
+
+<h3>Incident 5 — Ephemeral port / FD exhaustion at the proxy</h3>
+<table>
+  <tr><th>Symptoms</th><td>Intermittent connect failures to upstreams, <code>cannot assign requested address</code>, rising latency under load.</td></tr>
+  <tr><th>Investigation</th><td><code>ss -s</code> shows huge TIME_WAIT count; upstream connections opened per-request with no keepalive; FD count near <code>ulimit -n</code>.</td></tr>
+  <tr><th>Root Cause</th><td>No upstream connection reuse → ephemeral port range exhausted and FDs maxed.</td></tr>
+  <tr><th>Solution</th><td>Enable upstream keepalive/HTTP-2 pooling, raise <code>nofile</code> to 1M, widen <code>ip_local_port_range</code>, enable <code>tcp_tw_reuse</code>.</td></tr>
+  <tr><th>Prevention</th><td>Monitor FD usage and TIME_WAIT; default to pooled upstream connections.</td></tr>
+  <tr><th>Interview Answer</th><td>"Per-request upstream connections burn ephemeral ports and FDs. Connection pooling plus raised limits and tw_reuse fixes it — reuse beats reopen."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Walk me through exactly what NAT vs DSR rewrite at L4.</summary><p>In NAT mode the LB rewrites the destination IP (and often source, SNAT) on the inbound packet so the backend sees the LB or client; the return packet must traverse the LB again to reverse the translation, so the LB is on both legs. In DSR (direct server return), the LB leaves the destination IP as the VIP and forwards the frame to the backend (e.g. via MAC rewrite or IP-in-IP/GRE tunnel); the backend is configured with the VIP on a loopback and replies directly to the client, source-IP = VIP. The LB never sees the response. DSR wins for asymmetric, high-egress workloads (video, downloads) because the response bytes bypass the LB entirely, but it can't do L7 things and needs backend loopback config + ARP suppression.</p></details>
+  <details><summary>Why does power-of-two-choices beat both random and global least-connections?</summary><p>Pure random gives O(log n / log log n) max load imbalance — some node gets unlucky and piles up. Global least-connections needs a synchronized view of every node's load; at scale that view is stale and multiple balancers all pick the same "least" node simultaneously (herding), overshooting it. P2C samples two nodes at random and sends to the lesser of the two — this exponentially improves the max-load bound to O(log log n) with no global coordination and no herding, because the two-sample comparison self-corrects locally. Envoy's default LEAST_REQUEST is P2C for exactly this reason.</p></details>
+  <details><summary>Design a retry policy that can't cause a storm.</summary><p>Retry only idempotent methods and retriable outcomes (connect-failure, 503 with Retry-After, gateway timeout — never a 400/409/business error). Cap attempts (1 retry, maybe 2). Enforce a <em>retry budget</em>: total retries ≤ X% (e.g. 20%) of active requests over a window — once exceeded, retries are disabled, converting a storm into fail-fast. Add full jitter to backoff so retries don't synchronize. Propagate the deadline so a retry that can't finish in the remaining budget is never issued. Pair with a circuit breaker so a persistently failing upstream is skipped entirely.</p></details>
+  <details><summary>How does Maglev keep a flow on the same backend when the LB set changes?</summary><p>Two layers. Routers ECMP-hash the 5-tuple across Maglev nodes — if a Maglev node dies, ECMP re-hashes and some flows land on a different Maglev node. That new node might select a different backend, which would reset the connection. Maglev solves this with (a) a consistent-hash lookup table built by a permutation algorithm so the same 5-tuple maps to the same backend on any node that shares the same backend set, and (b) per-flow connection tracking so an established flow sticks to its chosen backend even if the table changes. The combination means backend or Maglev churn disrupts only a small fraction of flows.</p></details>
+  <details><summary>You have to route by JWT tenant claim to a per-tenant shard. L4 or L7, and how?</summary><p>Must be L7 — the claim is inside the TLS-encrypted HTTP body/header, invisible to L4. Terminate TLS at the proxy, parse the Authorization bearer token, extract the tenant claim, and use it as the hash key into a consistent-hash ring (ring-hash / Maglev LB policy in Envoy) whose members are the shard backends. Consistent hashing keeps a tenant pinned to its shard and remaps only ~1/N tenants when shards change. Validate the JWT signature at the edge so a client can't forge the routing key, and cache the decode to avoid per-request crypto cost.</p></details>
+  <details><summary>What's the difference between liveness and readiness, and why does the LB care?</summary><p>Liveness answers "is this process wedged and should it be restarted?" — it must be shallow and dependency-free, or a slow DB triggers pointless restarts. Readiness answers "should this instance receive traffic right now?" — it can gate on warm caches, open pools, or migration completion. The LB routes only to <em>ready</em> endpoints. Conflating them is the classic cascade: a deep health check that touches a shared dependency fails on every instance at once, the LB ejects the entire fleet, and you get a total outage from a partial dependency slowdown. Keep them separate and cap ejection percentage.</p></details>
+  <details><summary>Explain metastable failure and how load shedding escapes it.</summary><p>A metastable failure is a stable-bad equilibrium: some trigger (latency blip, cache flush) pushes the system into overload, and a sustaining effect — usually retries or queue buildup — keeps it overloaded even after the trigger is gone. Goodput drops while offered load stays high. You can't wait it out because the feedback loop is self-reinforcing. Load shedding breaks it: reject a fraction of requests fast (429/503) so backends get below the saturation threshold, drain queues, and recover; then you ramp load back. The key insight is that reducing accepted load <em>increases</em> successful throughput while collapsed — counterintuitive but necessary.</p></details>
+  <details><summary>How do you do zero-downtime deploys behind an LB, precisely?</summary><p>Rolling: for each instance — (1) flip readiness to NotReady so the LB stops sending new requests; (2) wait for the discovery/EDS change to propagate (a preStop sleep of a few seconds, because removal isn't instantaneous); (3) stop accepting new connections but let in-flight requests complete (graceful shutdown handler on SIGTERM); (4) close idle keepalive connections with a GOAWAY/Connection: close; (5) exit before <code>terminationGracePeriodSeconds</code>. The grace period must exceed drain time or the orchestrator SIGKILLs mid-request. Combine with maxSurge/maxUnavailable so capacity never dips below demand.</p></details>
+  <details><summary>Consistent hashing distributes unevenly — why, and what's the fix?</summary><p>With few nodes placed once on the ring, the arc each node owns varies wildly — one node might own 40% of the ring by luck, creating a hot spot. The fix is virtual nodes (replicas): each physical node is hashed to ~100-200 ring positions, so the law of large numbers smooths ownership to near-1/N with low variance. Maglev takes a different route — it builds a fixed-size table (a prime like 65537) by interleaving each backend's preference permutation, guaranteeing near-perfect balance and O(1) lookup while keeping disruption minimal on membership change. Trade-off: more vnodes = smoother but more memory and slower ring rebuild.</p></details>
+  <details><summary>When would you choose TLS passthrough over termination?</summary><p>Passthrough (L4, SNI-based routing without decrypting) when: end-to-end encryption is a hard requirement and no middlebox may see plaintext (regulatory, or the backend does client-cert mTLS the LB can't proxy); when you want the LB to stay dumb and cheap; or when the backend must terminate TLS itself for protocol reasons. You lose L7 routing, retries, and observability of the payload — you can still route on the SNI hostname from the ClientHello, which is cleartext. If you need both E2E crypto and L7 features, use re-encryption: terminate, inspect, then open a fresh TLS connection to the backend (double crypto cost, but zero-trust internal + full L7).</p></details>
+  <details><summary>How does deadline propagation prevent wasted work?</summary><p>The client sets an overall deadline (say 2s). Each hop passes the <em>remaining</em> budget downstream (gRPC does this natively via the <code>grpc-timeout</code> header; you can carry it in a custom header for HTTP). A downstream service that receives 50ms remaining knows not to start a 500ms query — it fails fast instead of doing work whose result will be discarded when the client has already timed out. Without propagation, every layer uses its own fixed timeout, so an abandoned request keeps consuming DB connections and CPU up and down the tree — a major amplifier during overload. It also stops nested retries from exceeding the outer deadline.</p></details>
+  <details><summary>Your L7 proxy is CPU-bound. What's eating it and how do you fix it?</summary><p>Usually TLS. Profile: if it's asymmetric crypto (handshakes), the fix is session resumption (tickets/IDs) and 0-RTT to avoid full handshakes, plus switching RSA-2048 certs to ECDSA P-256 (5-10x cheaper signatures). If it's bulk symmetric crypto, ensure AES-NI is used (or offload to QAT). Beyond TLS: HTTP/1.1 without keepalive burns connection setup — enable pooling and HTTP/2. Excessive header manipulation, large access-log formatting, and per-request Lua/WASM filters also cost. Scale out proxy replicas since the tier is stateless, and pin to cores / disable HT contention for crypto workloads.</p></details>
+  <details><summary>Difference between an API gateway and a plain reverse proxy?</summary><p>A reverse proxy terminates and forwards — routing, TLS, load balancing, caching. An API gateway is a reverse proxy plus application-level concerns: authentication/authorization (validate JWT/API keys), rate limiting and quotas, request/response transformation, protocol translation (REST↔gRPC), API composition/aggregation, and per-consumer analytics/billing. It's the single managed entry point for an API product. The line blurs — Envoy can be either depending on filters enabled. Interview framing: "gateway = reverse proxy + policy + product concerns; if all I need is LB and TLS, a reverse proxy is enough and cheaper."</p></details>
+  <details><summary>How does outlier detection differ from active health checks, and how do they interact?</summary><p>Active health checks send synthetic probes on a fixed interval and require consecutive successes/failures to flip state — good for detecting a dead process but blind to partial or intermittent failure between probes. Outlier detection (passive) watches <em>real</em> traffic: after N consecutive 5xx or gateway failures, or when a host's error rate deviates from the pool, it ejects the host for a base duration that grows with repeat ejections (exponential). They complement each other — active for coarse liveness, passive for "serving errors right now." Both must respect <code>max_ejection_percent</code> so they can't eject the whole pool, and passive ejection should have a floor (panic mode) to avoid cascade.</p></details>
+  <details><summary>What kernel-level tuning does a high-traffic LB need and why?</summary><p><code>net.core.somaxconn</code> and the app's listen backlog (both, the smaller wins) — sizes the accept queue so bursts don't drop SYN-ACKed connections (watch <code>ListenOverflows</code>). <code>net.ipv4.tcp_max_syn_backlog</code> for the half-open queue under SYN load, with <code>tcp_syncookies</code> for flood resistance. <code>nofile</code> (ulimit -n) to 1M+ because every client and upstream connection is an FD. <code>net.ipv4.ip_local_port_range</code> widened because each upstream connection consumes an ephemeral port; <code>tcp_tw_reuse</code> to recycle TIME_WAIT sockets. <code>tcp_fin_timeout</code> lower to release closed conns faster. On the NIC: RSS/RPS to spread interrupts across cores, and enough rx/tx ring buffers.</p></details>
+  <details><summary>A newly added backend gets slammed and its p99 spikes right after joining. Why and fix?</summary><p>Cold start: the instance joins the pool at full weight instantly, but its caches are empty, its connection pools to dependencies aren't warm, and a JIT runtime (JVM) hasn't compiled hot paths — so it's temporarily slow, yet least-connections/round-robin sends it a full share (or more, since it has zero active connections, least-conn actually <em>favors</em> it). The fix is slow-start: ramp the new host's traffic weight linearly over a warmup window (e.g. Envoy <code>slow_start_window</code>) so it gets a trickle first, warms up, then reaches full weight. Also pre-warm caches and pools in the readiness gate so it doesn't go Ready until it can actually serve.</p></details>
+</div>

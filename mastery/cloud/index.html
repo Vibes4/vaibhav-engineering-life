@@ -1,0 +1,352 @@
+<h1>Cloud <span class="tag express">Mastery</span></h1>
+<p>"The cloud" is someone else's data centre exposed as APIs, billed by the second, with the undifferentiated heavy lifting (power, cooling, hypervisors, replication, patching) owned by the provider. As a backend engineer your job is to compose the right primitives — compute, storage, network, identity — into a system that is available, durable, secure and cost-sane. This page drills AWS-first (the interview default) but the mental models carry to GCP/Azure.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Cloud is on-demand, API-driven infrastructure billed by usage. I think in four primitive layers: compute (EC2 VMs, ECS/EKS containers, Lambda functions), storage (S3 object, EBS block, EFS file), networking (VPC, subnets, security groups, route tables), and identity (IAM roles + STS temporary credentials). Everything else is a managed service built on those. The key operating principle is the shared responsibility model — the provider secures the cloud, I secure what I put in it — and I design for failure across Availability Zones because individual instances and even whole AZs will die."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The fuller answer layers in the trade-offs an SDE3 is expected to reason about:</p>
+<ul>
+  <li><strong>Shared responsibility.</strong> AWS owns "security <em>of</em> the cloud" (hardware, hypervisor, physical DC, managed-service internals). I own "security <em>in</em> the cloud" (IAM policies, OS patching on EC2, encryption config, security groups, my application code). The line moves right as you go IaaS → PaaS → serverless: on Lambda you own almost nothing but code + IAM.</li>
+  <li><strong>Compute spectrum.</strong> EC2 gives you full control and steady-state cost efficiency but you patch the OS and manage scaling. Containers (ECS on Fargate, or EKS) give portability and faster deploys. Lambda gives zero-idle-cost, event-driven scale but with cold starts and a 15-minute wall-clock cap. You pick by traffic shape: spiky/event-driven → Lambda; steady high-throughput → EC2/containers.</li>
+  <li><strong>Storage by access pattern.</strong> S3 for objects (11 nines durability, strong read-after-write consistency since Dec 2020, cheap, infinitely scalable, but it's HTTP not a filesystem). EBS for a single-instance block device (needs provisioned IOPS for databases). EFS for shared POSIX file access across many instances.</li>
+  <li><strong>Networking.</strong> A VPC is your private IP space. Public subnets route to an Internet Gateway; private subnets egress via a NAT Gateway. Security groups are stateful instance-level allow-lists; NACLs are stateless subnet-level rules. PrivateLink / VPC endpoints keep traffic to AWS services off the public internet.</li>
+  <li><strong>Identity.</strong> Never long-lived keys on instances — attach an <em>IAM role</em> via an instance profile; the SDK fetches short-lived STS credentials from the metadata service and rotates them automatically. Cross-account access = <code>sts:AssumeRole</code>.</li>
+  <li><strong>HA design.</strong> Regions are independent geographies; each has 3+ Availability Zones (isolated DCs, &lt;1–2 ms apart). Spread instances across AZs behind a load balancer, run RDS Multi-AZ, and you survive an AZ outage. Multi-region is for disaster recovery / global latency and is much harder (data replication + failover).</li>
+</ul>
+
+<h2>Internal Working</h2>
+<p>What actually happens when you "launch a t3.large in a private subnet with a role"? Step by step:</p>
+<ol>
+  <li><strong>Control plane call.</strong> Your SDK signs a <code>RunInstances</code> request with SigV4 (HMAC-SHA256 over a canonical request using your credentials). The API endpoint authenticates via IAM and authorizes against your policies.</li>
+  <li><strong>Placement.</strong> The EC2 placement service picks a physical host in the requested AZ with free capacity matching the instance type, then the <strong>Nitro hypervisor</strong> (a lightweight KVM-based hypervisor offloaded to dedicated Nitro cards) carves out vCPUs, memory and the ENI.</li>
+  <li><strong>Networking attach.</strong> An Elastic Network Interface is created in your subnet, gets a private IP from the subnet CIDR, and the security group rules are programmed into the Nitro card (packet filtering happens in hardware, not the guest).</li>
+  <li><strong>Storage attach.</strong> The root EBS volume is a network block device; reads/writes go over the Nitro storage fabric to a replicated backend (each volume is replicated within its AZ). It is NOT local disk unless you use instance store.</li>
+  <li><strong>Identity injection.</strong> The instance profile links a role; the <strong>Instance Metadata Service (IMDSv2)</strong> at <code>169.254.169.254</code> serves session-token-gated, time-limited STS credentials which the SDK's default credential chain discovers.</li>
+  <li><strong>Boot.</strong> The AMI's kernel boots, cloud-init runs your user-data script, the ENI comes up, and route tables decide egress: a private subnet's <code>0.0.0.0/0</code> route points at a NAT Gateway ENI in a public subnet, which SNATs traffic through the Internet Gateway.</li>
+  <li><strong>Steady state.</strong> CloudWatch agent ships metrics/logs; the Auto Scaling Group's target-tracking policy watches (say) average CPU and adds/removes instances by adjusting desired capacity.</li>
+</ol>
+<p>For <strong>Lambda</strong> the flow differs: on invoke, the Lambda service finds a warm <strong>execution environment</strong> (a Firecracker microVM) or, on a cold start, downloads your deployment package, spins a fresh Firecracker microVM (~125 ms VM boot), initializes the runtime, and runs your init code — then the handler. The microVM is frozen after the response and thawed for the next invoke; concurrency scales by having many microVMs.</p>
+
+<h2>Why was this built?</h2>
+<p>Before cloud, you did <strong>capacity planning</strong>: forecast peak load 12–18 months out, submit a purchase order, wait weeks for servers to rack, over-provision by 3–5x to survive spikes and hardware failure, and eat the capex whether or not traffic came. A startup needed real money and a data-centre lease just to launch. Scaling for a Black-Friday spike meant buying hardware you'd idle for 360 days a year.</p>
+<p>AWS launched S3 and EC2 in 2006 to sell Amazon's own spare capacity and the operational muscle it built for its retail site. The pitch: turn capex into opex, provision in minutes via API, pay per hour (now per second), and treat servers as disposable cattle. This unlocked elastic autoscaling, global reach without global data centres, and let small teams run infrastructure that previously needed a dedicated ops org.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>Option</th><th>What it is</th><th>When it wins</th></tr>
+  <tr><td>On-prem / colocation</td><td>You own the hardware in your DC or a rented rack</td><td>Predictable steady load at large scale (cheaper long-run), hard data-residency/latency, regulatory isolation. Reserved on-prem beats cloud on pure $/compute at high sustained utilization.</td></tr>
+  <tr><td>Managed hosting / VPS (DigitalOcean, Hetzner)</td><td>Simpler VMs, flat pricing, no sprawling service catalog</td><td>Small teams, predictable workloads, cost-sensitive side projects. Far less egress cost, simpler mental model.</td></tr>
+  <tr><td>Hybrid cloud</td><td>On-prem core + cloud burst (via Direct Connect)</td><td>Existing DC investment, latency-bound core systems, gradual migration.</td></tr>
+  <tr><td>Multi-cloud</td><td>Workloads split across AWS/GCP/Azure</td><td>Avoiding lock-in, best-of-breed services, negotiating leverage — but you pay in complexity and cross-cloud egress.</td></tr>
+  <tr><td>Public cloud (AWS/GCP/Azure)</td><td>Full on-demand primitive catalog</td><td>Spiky/unknown load, global reach, small ops team, need for managed databases/ML/queues without running them.</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "Cloud is not automatically cheaper — at very high, steady utilization on-prem can be 2–3x cheaper per core. Cloud wins on elasticity, time-to-market, and offloading ops. The break-even is about how spiky and how large your load is, plus how many engineers you'd otherwise spend on undifferentiated ops."</div>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Elasticity</strong> — scale from 2 to 2,000 instances in minutes; scale to zero with serverless.</li>
+  <li><strong>Opex not capex</strong> — no upfront hardware; pay per second of use.</li>
+  <li><strong>Global footprint</strong> — 30+ regions, deploy near users without building DCs.</li>
+  <li><strong>Managed services</strong> — RDS, DynamoDB, SQS, Kinesis offload patching, replication, backups.</li>
+  <li><strong>Built-in HA primitives</strong> — multi-AZ, cross-region replication, 11-nines storage durability.</li>
+  <li><strong>Security tooling</strong> — IAM, KMS, VPC isolation, GuardDuty, compliance attestations out of the box.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>Cost surprises</strong> — egress fees ($0.09/GB out), idle NAT Gateways, orphaned EBS/EIPs, per-request charges that compound.</li>
+  <li><strong>Lock-in</strong> — DynamoDB, Lambda, SQS have no drop-in equivalent; migration is expensive.</li>
+  <li><strong>Complexity</strong> — 200+ services, IAM policy sprawl, shared responsibility gaps cause breaches.</li>
+  <li><strong>Noisy-neighbour / shared tenancy</strong> — variable performance without dedicated hosts.</li>
+  <li><strong>Provider outages</strong> — you inherit region/AZ failures and control-plane incidents you cannot fix.</li>
+  <li><strong>Cold starts, quotas, throttling</strong> — soft limits and per-API rate limits bite at scale.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><strong>Consistency vs availability</strong> — DynamoDB global tables give multi-region availability but last-writer-wins eventual consistency; RDS Multi-AZ gives strong consistency but a failover blip (~60–120 s).</li>
+  <li><strong>Latency vs durability</strong> — S3 is durable but ~tens of ms per object GET; EBS io2 is low-latency but replicated only within one AZ. Synchronous cross-AZ DB replication (Multi-AZ) adds write latency for zero-RPO durability.</li>
+  <li><strong>Cost vs resilience</strong> — Multi-AZ NAT Gateways, replicas and cross-region DR double/triple spend; single-AZ is cheaper but a coin-flip on outage day.</li>
+  <li><strong>Control vs convenience</strong> — EC2 = full control, more ops; Lambda = near-zero ops, less control, cold starts and 15-min cap.</li>
+  <li><strong>Reserved/Savings Plans vs On-Demand vs Spot</strong> — commit 1–3 yrs for ~40–72% off but lose flexibility; Spot is ~70–90% off but can be reclaimed with a 2-minute warning.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Cloud is the wrong default when: (1) load is large and dead-steady — a fleet of fully-utilized reserved boxes on-prem is cheaper; (2) you're egress-heavy (video/CDN origin serving PBs out) — egress will dwarf compute; (3) hard data-residency/air-gap requirements the provider can't meet in-region; (4) ultra-low deterministic latency (HFT single-digit microseconds) where the hypervisor + network jitter is unacceptable; (5) a tiny predictable app where a $5 VPS beats the cognitive and billing overhead of a VPC + IAM + NAT Gateway. Also don't reach for Lambda for long-running (&gt;15 min), CPU-bound batch jobs or steady high-QPS services where per-invoke cost exceeds a reserved box.</div>
+
+<h2>Production Architecture</h2>
+<p>A canonical resilient 3-tier web app in a single region, spread across two AZs, with a private data tier and controlled egress:</p>
+<pre class="mermaid">
+flowchart TD
+  U["Users"] --> R53["Route 53 DNS"]
+  R53 --> ALB["Application Load Balancer, public subnets"]
+  ALB --> A1["EC2 app AZ-a"]
+  ALB --> A2["EC2 app AZ-b"]
+  A1 --> RDSP["RDS primary AZ-a"]
+  A2 --> RDSP
+  RDSP -. "sync replication" .-> RDSS["RDS standby AZ-b"]
+  A1 --> NAT["NAT Gateway public subnet"]
+  A2 --> NAT
+  NAT --> IGW["Internet Gateway"]
+  A1 --> S3["S3 via VPC endpoint"]
+  A2 --> S3
+</pre>
+<p>Key points an interviewer probes: the ALB lives in <strong>public subnets</strong> across both AZs; app instances live in <strong>private subnets</strong> (no public IP) inside an Auto Scaling Group; the RDS is <strong>Multi-AZ</strong> (synchronous standby, automatic failover on primary loss); outbound patching/API traffic from private instances goes through a <strong>NAT Gateway</strong> (one per AZ for true HA — a common exam trap is a single NAT that dies with its AZ); and S3 access uses a <strong>gateway VPC endpoint</strong> so traffic never touches the internet and dodges NAT egress cost. Security groups only allow ALB→app on 443 and app→RDS on 5432.</p>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>NAT Gateway single point of failure / cost</strong> — one NAT in one AZ means cross-AZ data-processing charges plus an outage when that AZ fails.</li>
+  <li><strong>IMDSv1 SSRF</strong> — an app-layer SSRF hits <code>169.254.169.254</code> and steals role credentials (the Capital One 2019 breach). Enforce IMDSv2.</li>
+  <li><strong>DynamoDB hot partitions</strong> — a skewed partition key throttles a single partition while total provisioned capacity looks fine.</li>
+  <li><strong>Lambda cold starts under spike</strong> — a burst past warm concurrency causes p99 latency cliffs; VPC-attached Lambdas historically added ENI-attach latency.</li>
+  <li><strong>Account/service quota walls</strong> — hitting the default 1,000 concurrent-Lambda limit, EIP limits, or API throttling during a scale-out event.</li>
+  <li><strong>Cross-AZ / egress cost creep</strong> — chatty services in different AZs rack up $0.01/GB each way; internet egress at $0.09/GB.</li>
+  <li><strong>Clock/credential expiry</strong> — SigV4 requests fail with skewed clocks; expired assumed-role sessions break long jobs.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<p>Concrete tools and signals when things misbehave:</p>
+<pre><code># Who am I / which role am I using?
+aws sts get-caller-identity
+
+# From an EC2 box: verify IMDSv2 and the role creds it hands out
+TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# Why was this API call denied? decode the encoded authorization message
+aws sts decode-authorization-message --encoded-message &lt;msg&gt;
+
+# Trace what an identity is allowed to do (policy simulator)
+aws iam simulate-principal-policy --policy-source-arn &lt;arn&gt; \
+  --action-names s3:GetObject --resource-arns &lt;bucket-arn&gt;
+
+# Networking: is the flow reaching the instance? read VPC Flow Logs (ACCEPT/REJECT)
+# Reachability Analyzer for path debugging between two ENIs
+aws ec2 create-network-insights-path --source &lt;eni&gt; --destination &lt;eni&gt; --protocol tcp
+
+# Lambda: tail logs + look for Init Duration (cold start) in REPORT lines
+aws logs tail /aws/lambda/my-fn --follow
+
+# What is costing money? Cost Explorer grouped by service, or:
+aws ce get-cost-and-usage --time-period Start=2026-06-01,End=2026-07-01 \
+  --granularity MONTHLY --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE</code></pre>
+<ul>
+  <li><strong>Access denied</strong> → check the intersection of identity policy, resource policy, SCPs, and permission boundaries. Use the IAM policy simulator and CloudTrail's <code>errorCode</code>.</li>
+  <li><strong>Can't reach a service</strong> → walk the path: security group (stateful) → NACL (stateless, needs ephemeral return ports) → route table → IGW/NAT → DNS. VPC Reachability Analyzer pinpoints the blocking hop.</li>
+  <li><strong>Intermittent 5xx</strong> → ALB target-group health checks, then per-target CloudWatch <code>HTTPCode_Target_5XX</code>, then app logs.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+  <tr><th>Metric</th><th>What it means</th><th>Healthy / alert threshold</th></tr>
+  <tr><td>EC2 CPUUtilization</td><td>Average vCPU busy</td><td>Steady &lt;70%; ASG scales at target 60–70%; alarm &gt;85% sustained</td></tr>
+  <tr><td>ALB TargetResponseTime</td><td>Backend latency</td><td>Track p99; alarm if p99 &gt; SLO (e.g. 300 ms)</td></tr>
+  <tr><td>ALB HTTPCode_Target_5XX</td><td>Backend errors</td><td>Alarm on rate &gt; ~1% of requests</td></tr>
+  <tr><td>ALB HealthyHostCount</td><td>In-service targets</td><td>Alarm if &lt; desired (e.g. &lt;2 across AZs)</td></tr>
+  <tr><td>Lambda Throttles</td><td>Invokes rejected past concurrency</td><td>Should be 0; any sustained &gt;0 = raise concurrency</td></tr>
+  <tr><td>Lambda Duration / Init Duration</td><td>Run time / cold-start time</td><td>Duration &lt; timeout with margin; watch Init spikes</td></tr>
+  <tr><td>SQS ApproximateAgeOfOldestMessage</td><td>Backlog staleness</td><td>Alarm if age climbs (consumers can't keep up)</td></tr>
+  <tr><td>SQS ApproximateNumberOfMessagesVisible</td><td>Queue depth</td><td>Trend up = under-provisioned consumers</td></tr>
+  <tr><td>DynamoDB ThrottledRequests / ConsumedRCU-WCU</td><td>Capacity pressure / hot partition</td><td>Throttles should be ~0; alarm on any sustained throttle</td></tr>
+  <tr><td>RDS FreeableMemory / ReadIOPS / ReplicaLag</td><td>DB health</td><td>ReplicaLag &lt; a few seconds; low freeable memory = scale up</td></tr>
+  <tr><td>NATGateway ErrorPortAllocation</td><td>SNAT port exhaustion</td><td>Any &gt;0 = too many concurrent connections per destination</td></tr>
+</table>
+<p>Wire these as <strong>CloudWatch Alarms</strong> → SNS → PagerDuty/Slack. Use composite alarms to reduce noise and CloudWatch Logs Insights for ad-hoc query over structured logs.</p>
+
+<h2>Scaling</h2>
+<p>Cloud scales on two axes. <strong>Vertical</strong>: bigger instance types (more vCPU/RAM) or higher provisioned IOPS — simple but capped and needs a restart. <strong>Horizontal</strong>: more instances/functions/shards behind a distributor — the real answer at scale.</p>
+<pre class="mermaid">
+flowchart LR
+  CW["CloudWatch metric, avg CPU"] --> TT["Target tracking policy, target 60 pct"]
+  TT --> ASG["Auto Scaling Group"]
+  ASG --> E1["Instance 1"]
+  ASG --> E2["Instance 2"]
+  ASG --> E3["Instance N, added on demand"]
+  ALB2["Load balancer"] --> E1
+  ALB2 --> E2
+  ALB2 --> E3
+</pre>
+<ul>
+  <li><strong>Compute</strong> — Auto Scaling Groups with <em>target-tracking</em> (keep avg CPU at 60%) or step scaling; predictive scaling for known daily curves. Lambda scales by concurrency (burst then +500/min per region, up to your account limit).</li>
+  <li><strong>Databases</strong> — RDS: read replicas for read scale (async), Multi-AZ for HA (not scale). Aurora: up to 15 low-lag replicas sharing one storage volume, Aurora Serverless v2 auto-scales ACUs. DynamoDB: auto-partitions by key; each partition caps ~3,000 RCU / 1,000 WCU, so design a high-cardinality partition key.</li>
+  <li><strong>Storage</strong> — S3 scales essentially without limit; ~3,500 PUT and 5,500 GET per prefix per second, so shard across prefixes for extreme throughput.</li>
+  <li><strong>Limits to name</strong> — default 1,000 concurrent Lambdas/region, VPC 5 per region (soft), 200 subnets/VPC, SQS standard = near-unlimited throughput, FIFO = 300 msg/s (3,000 batched).</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>AuthN/AuthZ</strong> — IAM identities (users, roles) authenticate via SigV4-signed requests; authorization = union of identity policies, resource policies, SCPs (org guardrails), permission boundaries, and session policies. Deny always wins. Prefer <strong>roles + STS temporary credentials</strong> over long-lived access keys; use instance profiles on EC2 and IRSA (IAM Roles for Service Accounts) on EKS.</li>
+  <li><strong>Least privilege</strong> — scope actions and resources tightly; use <code>Condition</code> keys (source IP, MFA present, VPC endpoint) and permission boundaries to cap delegated admins.</li>
+  <li><strong>Encryption in transit</strong> — TLS everywhere; terminate at ALB/CloudFront with ACM certs; enforce <code>aws:SecureTransport</code> on buckets.</li>
+  <li><strong>Encryption at rest</strong> — KMS-backed envelope encryption for S3 (SSE-KMS), EBS, RDS, DynamoDB. KMS keys with rotation and key policies; CloudHSM for FIPS/custom key custody.</li>
+  <li><strong>Network isolation</strong> — private subnets, security groups (stateful, allow-only), NACLs (stateless subnet layer), PrivateLink/VPC endpoints to keep service traffic off the internet, WAF + Shield on the edge.</li>
+  <li><strong>Common CVEs / breach patterns</strong> — public S3 buckets (block-public-access at account level), IMDSv1 SSRF credential theft (enforce IMDSv2 + hop limit 1), over-privileged roles, leaked long-lived keys in git (rotate + use short-lived creds), confused-deputy in cross-account roles (use <code>ExternalId</code>).</li>
+</ul>
+<div class="callout warn"><strong>Watch out:</strong> The single most common real breach is not a provider bug — it's a misconfiguration you own: a public S3 bucket, an over-broad <code>*</code> IAM policy, or an SSRF that steals instance-role creds. Turn on GuardDuty, Config rules, Access Analyzer, and enforce IMDSv2.</div>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>Compute</strong> — right-size instance families (compute-, memory-, network-optimized); Nitro instances get near-bare-metal perf. Enable enhanced networking (ENA/EFA) for high PPS/HPC.</li>
+  <li><strong>Lambda cold starts</strong> — ~100–500 ms for JS/Python, up to seconds for JVM/.NET; kill them with <strong>provisioned concurrency</strong> (pre-warmed envs, no init on invoke) or SnapStart (Java). Keep packages small, init SDK clients outside the handler, reuse connections.</li>
+  <li><strong>Storage numbers</strong> — S3 GET first-byte ~tens of ms; EBS gp3 baseline 3,000 IOPS / 125 MB/s (provision up to 16,000 IOPS / 1,000 MB/s); io2 Block Express up to 256,000 IOPS &amp; sub-ms; instance store (local NVMe) is fastest but ephemeral.</li>
+  <li><strong>Databases</strong> — DynamoDB single-digit-ms reads, DAX caches to microseconds; RDS/Aurora tune with connection pooling (RDS Proxy) to avoid connection storms; Aurora replica lag typically &lt;100 ms.</li>
+  <li><strong>Network</strong> — same-AZ &lt;1 ms, cross-AZ ~1–2 ms, cross-region tens–hundreds of ms. Put chatty tiers in the same AZ (placement groups) but replicas across AZs.</li>
+  <li><strong>Tuning knobs</strong> — provisioned IOPS, provisioned concurrency, connection pooling, caching (CloudFront/ElastiCache/DAX), batching (SQS/Kinesis), and choosing async (queue) over sync where latency budget allows.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Long-lived access keys on instances</strong> → use instance-profile roles + STS. <em>Fix:</em> delete keys, attach a role.</li>
+  <li><strong>Single NAT Gateway for HA design</strong> → one per AZ; route each private subnet to its own NAT.</li>
+  <li><strong>Confusing Multi-AZ with read scaling</strong> → Multi-AZ standby is NOT readable (RDS); it's for failover. Use read replicas for read scale.</li>
+  <li><strong>Poor DynamoDB partition key</strong> → low-cardinality/hot keys throttle. Use high-cardinality/composite keys, add write sharding suffixes.</li>
+  <li><strong>Using SQS Standard when order/dedup matters</strong> → Standard is at-least-once, best-effort order. Use FIFO for exactly-once processing + ordering.</li>
+  <li><strong>Forgetting NACL return traffic</strong> → NACLs are stateless; you must allow ephemeral ports (1024–65535) for responses.</li>
+  <li><strong>No lifecycle policies</strong> → S3 objects and orphaned EBS snapshots pile up cost. Tier to IA/Glacier, expire logs.</li>
+  <li><strong>Public S3 bucket by accident</strong> → enable account-level Block Public Access.</li>
+  <li><strong>Retries without backoff/jitter</strong> → retry storms amplify throttling. Use exponential backoff + jitter (SDK does this by default — don't disable it).</li>
+  <li><strong>Deploying Lambda for a steady 500 QPS service</strong> → per-invoke cost + cold starts lose to a reserved container fleet.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+  <tr><th>Company</th><th>How they plausibly use it</th></tr>
+  <tr><td>Google</td><td>Runs its own cloud (GCP) on the same Borg/Spanner infrastructure powering Search; externally, GCP customers use GKE, BigQuery, Spanner (globally-consistent DB via TrueTime). Google itself is the provider, not a tenant.</td></tr>
+  <tr><td>Amazon</td><td>Amazon.com retail runs on AWS — the origin of the whole platform. Likely uses DynamoDB (born from the retail cart), S3, EC2 Auto Scaling for Prime Day spikes, and internal microservices behind ALBs across many AZs.</td></tr>
+  <tr><td>Netflix</td><td>Canonical all-in AWS shop: tens of thousands of EC2 instances across 3 regions, Cassandra + DynamoDB for data, S3 for the media catalog, and Chaos Monkey / Chaos Kong to routinely kill instances and even regions to prove resilience. Open-sourced Eureka, Hystrix, Spinnaker.</td></tr>
+  <tr><td>Uber</td><td>Mix of on-prem and cloud (multi-cloud with GCP + Oracle Cloud announced); likely uses cloud object storage and managed compute for elastic surge, with geospatial services and Kafka-scale event pipelines. Cost/egress at their scale drives careful placement.</td></tr>
+  <tr><td>Swiggy</td><td>Likely AWS-heavy (Indian region ap-south-1): EC2/EKS for order + delivery services, DynamoDB/Aurora for orders, SQS/Kinesis for the fulfilment and location event streams, autoscaling for lunch/dinner peaks, CloudFront for the app/CDN.</td></tr>
+  <tr><td>PhonePe</td><td>Runs largely on-prem/private cloud for regulatory + scale reasons (UPI volume is enormous), but the pattern is cloud-native: heavy sharding, multi-AZ-style datacentre redundancy, and event-driven pipelines. Publicly moved off public cloud to control cost/latency at UPI scale.</td></tr>
+  <tr><td>Razorpay</td><td>Likely AWS in ap-south-1: PCI-DSS-scoped VPCs with strict segmentation, KMS encryption for card data, RDS/Aurora for the ledger, SQS/Kinesis for webhooks and settlement, and IAM least-privilege plus VPC endpoints for compliance.</td></tr>
+  <tr><td>Atlassian</td><td>Migrated Jira/Confluence Cloud onto AWS: multi-tenant microservices on ECS/EKS, sharded tenant data across RDS/Aurora, S3 for attachments, SQS/Kinesis for async, and per-tenant isolation. Publicly documented large-scale AWS migration and Vertigo project.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>Define the shared responsibility model.
+    <ol><li><em>Pointer:</em> Provider secures the cloud; you secure what's in it; the line shifts right as you move IaaS→serverless.</li></ol></li>
+  <li>Difference between a Region and an Availability Zone?
+    <ol><li><em>Pointer:</em> Region = independent geography; AZ = isolated DC within a region, 3+ per region, low-latency interconnect, separate power/cooling.</li></ol></li>
+  <li>How do you make an app survive an AZ failure?
+    <ol><li><em>Pointer:</em> Instances in an ASG across ≥2 AZs behind an ALB, RDS Multi-AZ, NAT per AZ, stateless app + shared state in managed stores.</li></ol></li>
+  <li>Security group vs NACL — differences?
+    <ol><li><em>Pointer:</em> SG stateful, instance-level, allow-only; NACL stateless, subnet-level, allow+deny, needs explicit return-port rules.</li></ol></li>
+  <li>How does an EC2 instance get AWS credentials without stored keys?
+    <ol><li><em>Pointer:</em> Instance profile → role → STS temporary creds served by IMDSv2 at 169.254.169.254, auto-rotated.</li></ol></li>
+  <li>What is IMDSv2 and why does it matter?
+    <ol><li><em>Pointer:</em> Session-token-gated metadata (PUT to get token first) with hop-limit; defends against SSRF credential theft (Capital One).</li></ol></li>
+  <li>RDS Multi-AZ vs read replica?
+    <ol><li><em>Pointer:</em> Multi-AZ = synchronous standby for HA/failover, not readable; read replica = async copy for read scaling, can lag.</li></ol></li>
+  <li>Why can a DynamoDB table throttle when it has spare provisioned capacity?
+    <ol><li><em>Pointer:</em> Hot partition — capacity is per-partition (~3k RCU/1k WCU); skewed key concentrates load. Fix key design / add sharding.</li></ol></li>
+  <li>Explain Lambda cold starts and how to eliminate them.
+    <ol><li><em>Pointer:</em> New Firecracker microVM + runtime init on scale-out; use provisioned concurrency / SnapStart, small packages, init outside handler.</li></ol></li>
+  <li>What are Lambda's hard limits?
+    <ol><li><em>Pointer:</em> 15-min max, 10 GB memory, 512 MB–10 GB /tmp, 6 MB sync payload, default 1,000 concurrency/region.</li></ol></li>
+  <li>SQS Standard vs FIFO — when each?
+    <ol><li><em>Pointer:</em> Standard = at-least-once, best-effort order, near-infinite throughput; FIFO = exactly-once + ordering, 300/3,000 msg/s.</li></ol></li>
+  <li>How does S3 guarantee durability and consistency?
+    <ol><li><em>Pointer:</em> 11 nines via replication across ≥3 AZs; strong read-after-write consistency for all operations since Dec 2020.</li></ol></li>
+  <li>Design multi-region DR — what are RTO/RPO trade-offs?
+    <ol><li><em>Pointer:</em> Backup-restore (cheap, high RTO), pilot light, warm standby, active-active (low RTO/RPO, costly). Data replication + Route 53 failover.</li></ol></li>
+  <li>How do you debug "Access Denied" on an API call?
+    <ol><li><em>Pointer:</em> Evaluate identity policy ∩ resource policy ∩ SCP ∩ boundary ∩ session; deny wins. Use policy simulator + decode-authorization-message.</li></ol></li>
+  <li>How does autoscaling actually decide to add instances?
+    <ol><li><em>Pointer:</em> CloudWatch metric → target-tracking/step policy adjusts ASG desired capacity; cooldowns + warm-up prevent flapping.</li></ol></li>
+  <li>Where does cloud cost silently blow up?
+    <ol><li><em>Pointer:</em> Egress ($0.09/GB), cross-AZ transfer, idle NAT Gateways, orphaned EBS/EIP/snapshots, over-provisioned reserved capacity.</li></ol></li>
+  <li>How do you keep service traffic off the public internet?
+    <ol><li><em>Pointer:</em> VPC endpoints (gateway for S3/DynamoDB, interface/PrivateLink for others); saves NAT cost + improves security.</li></ol></li>
+  <li>What are the Well-Architected pillars?
+    <ol><li><em>Pointer:</em> Operational excellence, Security, Reliability, Performance efficiency, Cost optimization, Sustainability.</li></ol></li>
+  <li>How would you achieve exactly-once processing on an at-least-once queue?
+    <ol><li><em>Pointer:</em> Idempotency keys + dedup store, or FIFO with message-dedup-id; make consumers idempotent regardless.</li></ol></li>
+  <li>How do cross-account roles work securely?
+    <ol><li><em>Pointer:</em> Trust policy allows sts:AssumeRole from account B; use ExternalId to prevent the confused-deputy problem.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>After compute options →</strong> containers &amp; orchestration: "ECS vs EKS vs Fargate?", "how does Kubernetes scheduling differ from an ASG?", "sidecar vs service mesh?". Angle: ECS is AWS-native/simpler, EKS is portable Kubernetes, Fargate removes node management.</li>
+  <li><strong>After networking →</strong> "explain a full request path from browser to DB", "how does DNS failover work with Route 53?", "Direct Connect vs VPN?". Angle: trace public→private, health-check-based routing, dedicated fibre vs IPsec tunnel.</li>
+  <li><strong>After IAM →</strong> "how does SigV4 signing work?", "OIDC federation for CI/CD?", "secrets management — Secrets Manager vs Parameter Store?". Angle: HMAC canonical request, short-lived federated creds, rotation.</li>
+  <li><strong>After managed DBs →</strong> "CAP theorem placement of DynamoDB vs Aurora", "how do you shard a relational DB?", "when NoSQL over SQL?". Angle: AP vs CP, access-pattern-first modeling.</li>
+  <li><strong>After messaging →</strong> "SQS vs SNS vs Kinesis vs Kafka?", "how do you handle poison messages?", "backpressure?". Angle: queue vs pub/sub vs stream, DLQ + max-receive-count.</li>
+  <li><strong>After autoscaling →</strong> "how do you avoid scaling flapping?", "predictive vs reactive scaling?", "warm pools?". Angle: cooldowns, warm-up, scheduled/predictive for known curves.</li>
+  <li><strong>After cost →</strong> "On-Demand vs Reserved vs Spot vs Savings Plans", "how to run stateless workloads on Spot?", "FinOps tagging strategy". Angle: commit for steady, Spot for interruptible, tag-driven allocation.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Scenario 1 — Instance-role credentials stolen via SSRF</h3>
+<table>
+  <tr><th>Symptoms</th><td>Unexpected API calls from your role in CloudTrail from foreign IPs; data exfil from S3; GuardDuty <code>UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration</code> alert.</td></tr>
+  <tr><td>Investigation</td><td>Correlate CloudTrail <code>sourceIPAddress</code> + <code>userIdentity</code> with the EC2 role; check app logs for an SSRF-able endpoint hitting 169.254.169.254; confirm IMDSv1 was enabled.</td></tr>
+  <tr><td>Root Cause</td><td>App had an SSRF vuln and IMDSv1 (no token) allowed a single GET to fetch role creds, which were then used off-box.</td></tr>
+  <tr><td>Solution</td><td>Rotate/revoke the role's sessions (attach a deny with a past <code>aws:TokenIssueTime</code>), patch the SSRF, enforce IMDSv2 (<code>--http-tokens required</code>), set hop limit 1.</td></tr>
+  <tr><td>Prevention</td><td>Org-wide IMDSv2 enforcement, least-privilege role scoping, GuardDuty, egress filtering, WAF/SSRF input validation.</td></tr>
+  <tr><td>Interview Answer</td><td>"This is the Capital One pattern: SSRF + IMDSv1 = stolen role creds. I'd rotate sessions immediately, enforce IMDSv2 fleet-wide, tighten the role to least privilege, and add GuardDuty to catch credential-exfil off the instance."</td></tr>
+</table>
+
+<h3>Scenario 2 — DynamoDB throttling during a flash sale</h3>
+<table>
+  <tr><th>Symptoms</th><td>Spiking <code>ThrottledRequests</code> / <code>ProvisionedThroughputExceededException</code>, elevated p99 on writes, retries piling up — yet total ConsumedWCU is below the table's provisioned WCU.</td></tr>
+  <tr><td>Investigation</td><td>CloudWatch Contributor Insights shows one partition key dominating; check the key schema — everyone writing to the same "order#today" style key.</td></tr>
+  <tr><td>Root Cause</td><td>Hot partition: per-partition cap (~1,000 WCU) hit while table-level capacity looks fine.</td></tr>
+  <tr><td>Solution</td><td>Add a write-sharding suffix (e.g. <code>pk = order#today#{0..9}</code>), switch to on-demand mode for unpredictable spikes, add exponential backoff + jitter, cache hot reads in DAX.</td></tr>
+  <tr><td>Prevention</td><td>Model for high-cardinality partition keys up front, load-test with skew, enable adaptive capacity + Contributor Insights.</td></tr>
+  <tr><td>Interview Answer</td><td>"Throttling with spare capacity screams hot partition. DynamoDB caps ~1k WCU per partition, so I'd shard the key, flip to on-demand for the spike, and add jittered backoff — then fix the data model so one logical key isn't a single physical partition."</td></tr>
+</table>
+
+<h3>Scenario 3 — AZ outage takes the app down despite "HA" setup</h3>
+<table>
+  <tr><th>Symptoms</th><td>One AZ has an incident; app is fully down even though instances existed in two AZs; private instances can't reach the internet/patch/APIs.</td></tr>
+  <tr><td>Investigation</td><td>Route tables show both private subnets pointing at a single NAT Gateway that lived in the failed AZ; RDS was Single-AZ; ALB only had subnets in one AZ.</td></tr>
+  <tr><td>Root Cause</td><td>Hidden single points of failure: one NAT, Single-AZ RDS, ALB not spanning both AZs.</td></tr>
+  <tr><td>Solution</td><td>Deploy a NAT Gateway per AZ with per-AZ routes, enable RDS Multi-AZ, register ALB in both AZs' subnets, verify ASG spreads capacity.</td></tr>
+  <tr><td>Prevention</td><td>Chaos testing (kill an AZ), IaC review for per-AZ redundancy, GameDay drills, resilience checklists in Well-Architected reviews.</td></tr>
+  <tr><td>Interview Answer</td><td>"'Multi-AZ instances' isn't HA if the NAT, DB, or ALB is single-AZ. I'd give each private subnet its own NAT, make RDS Multi-AZ, span the ALB across AZs, and prove it with a chaos drill that kills an AZ."</td></tr>
+</table>
+
+<h3>Scenario 4 — Surprise $40k egress bill</h3>
+<table>
+  <tr><th>Symptoms</th><td>Monthly bill spikes; Cost Explorer shows "Data Transfer" and "EC2-Other" dominating, not compute.</td></tr>
+  <tr><td>Investigation</td><td>Group Cost Explorer by usage type; find high inter-AZ transfer between chatty microservices and internet egress from serving assets straight from S3/EC2 without a CDN.</td></tr>
+  <tr><td>Root Cause</td><td>Cross-AZ chatter ($0.01/GB each way) + internet egress ($0.09/GB) + a NAT Gateway processing all outbound S3 traffic instead of a VPC endpoint.</td></tr>
+  <tr><td>Solution</td><td>Add an S3 gateway VPC endpoint (free, dodges NAT), co-locate chatty services in one AZ, put CloudFront in front of static/media, compress payloads.</td></tr>
+  <tr><td>Prevention</td><td>Cost anomaly detection, tagging + budgets/alerts, architecture reviews for data-transfer paths, CDN-first for anything served to the internet.</td></tr>
+  <tr><td>Interview Answer</td><td>"Cloud bills blow up on data transfer, not compute. I'd break down Cost Explorer by usage type, kill NAT egress to S3 with a gateway endpoint, front assets with CloudFront, and reduce cross-AZ chatter — then add anomaly alerts so it never surprises us again."</td></tr>
+</table>
+
+<h3>Scenario 5 — Lambda latency cliff under a traffic burst</h3>
+<table>
+  <tr><th>Symptoms</th><td>p50 fine, p99 latency spikes to seconds during traffic bursts; CloudWatch shows high <code>Init Duration</code> and some <code>Throttles</code>.</td></tr>
+  <tr><td>Investigation</td><td>REPORT lines show cold starts on scale-out; concurrency hit the burst limit; VPC-attached function adds ENI setup; heavy init (large deps, JVM).</td></tr>
+  <tr><td>Root Cause</td><td>Many new execution environments spun up at once (each paying init cost), plus concurrency throttling past the burst ceiling.</td></tr>
+  <tr><td>Solution</td><td>Provisioned concurrency (or SnapStart for Java) to pre-warm, raise the reserved/account concurrency limit, shrink the package, move SDK/client init outside the handler, reuse DB connections via RDS Proxy.</td></tr>
+  <tr><td>Prevention</td><td>Load-test the burst profile, alarm on Throttles &gt; 0 and Init Duration, use provisioned concurrency with scheduled/auto scaling for known peaks.</td></tr>
+  <tr><td>Interview Answer</td><td>"A p99 cliff on a burst is cold starts plus concurrency throttling. I'd add provisioned concurrency to pre-warm envs, lift the concurrency limit, slim the package and init clients outside the handler — and if it's a steady high-QPS service, question whether Lambda is even the right compute."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Walk me through exactly what STS AssumeRole returns and how the SDK uses it.</summary><p>AssumeRole returns a temporary <code>AccessKeyId</code>, <code>SecretAccessKey</code>, and <code>SessionToken</code> with an expiry (default 1h, up to 12h, and ≤1h when role-chaining). The SDK caches them and includes the SessionToken in the <code>X-Amz-Security-Token</code> header alongside the SigV4 signature. STS validates the trust policy (who can assume) separately from the permission policy (what the assumed session can do); the effective permissions are the intersection with any session policy passed in. On EC2 the metadata service performs an implicit assume-role and the default credential provider chain discovers these creds, refreshing ~5 minutes before expiry. This is why you never bake keys into an AMI.</p></details>
+  <details><summary>Why is S3 read-after-write "strong" now, and what was the old failure mode?</summary><p>Pre-Dec-2020, S3 offered read-after-write consistency for new-object PUTs only, but eventual consistency for overwrite PUTs and DELETEs — a read right after an overwrite could return the old version or a 404 on a just-listed key, because the index was replicated asynchronously. AWS re-architected the metadata/index layer to be strongly consistent, so now every GET/LIST after a successful PUT/DELETE reflects the latest state, at no extra cost and no latency penalty. It's still <em>not</em> transactional across objects — there are no multi-object atomic writes; you build that with conditional writes (If-Match/ETag) or a real DB.</p></details>
+  <details><summary>How does RDS Multi-AZ failover actually work and what's the client impact?</summary><p>Multi-AZ keeps a synchronous standby in another AZ (block-level replication for RDS engines; Aurora uses a shared distributed storage volume instead). On primary failure — hardware, AZ event, or a manual reboot-with-failover — RDS flips the DNS CNAME (<code>...rds.amazonaws.com</code>) to point at the promoted standby. Clients see a connection drop and must reconnect; the DNS TTL is ~30s, and total failover is typically 60–120s (Aurora ~30s or less). The standby is <em>not</em> readable, so it doesn't help read scaling — that's what replicas are for. Key gotcha: cache TTLs and long-lived connection pools that pin the old IP will keep failing until they re-resolve; use RDS Proxy or short DNS caching.</p></details>
+  <details><summary>Security group vs NACL — give me a case where you specifically need a NACL.</summary><p>SGs are stateful and allow-only at the ENI level — great for service-to-service allow-lists. You reach for a NACL when you need a <em>deny</em> or a subnet-wide coarse control the SG model can't express: e.g., block a specific malicious CIDR at the subnet edge, or enforce that a "quarantine" subnet can't talk to the DB tier regardless of SG rules. Because NACLs are stateless, you must open the ephemeral port range (1024–65535) for return traffic — forgetting this is the classic "SG allows it but connections still hang" bug. In practice SGs do 95% of the work; NACLs are a defence-in-depth / blast-radius tool.</p></details>
+  <details><summary>Explain the DynamoDB partition math and how RCU/WCU map to physical partitions.</summary><p>DynamoDB hashes the partition key to place items; items sharing a partition key live on one physical partition. Each partition holds up to 10 GB and delivers ~3,000 RCU / 1,000 WCU. Total table capacity is spread evenly across partitions, so if traffic isn't uniform across keys you can throttle a hot partition while table-level capacity is idle — capacity is <em>allocated</em> uniformly but <em>consumed</em> per your key distribution. 1 RCU = one strongly-consistent 4 KB read/s (or two eventually-consistent); 1 WCU = one 1 KB write/s. Adaptive capacity now auto-boosts hot partitions somewhat, but the durable fix is a high-cardinality key or write-sharding. On-demand mode removes the provisioning but still respects per-partition ceilings and ramps.</p></details>
+  <details><summary>When would you pick Kinesis over SQS over SNS over Kafka?</summary><p>SQS = decoupled work queue, one consumer group draining messages, at-least-once (Standard) or exactly-once+ordered (FIFO), messages deleted after processing — use for task distribution and buffering. SNS = pub/sub fan-out, push to many subscribers (SQS, Lambda, HTTP), no retention/replay — use for broadcast. Kinesis = ordered, replayable stream with a retention window (up to 365 days), multiple independent consumers reading at their own offset, sharded by partition key — use for real-time analytics, clickstreams, log pipelines where replay and ordering-per-key matter. Kafka (MSK) = same streaming model but higher throughput, richer ecosystem, more ops; pick it when you outgrow Kinesis shard limits or need Kafka-native tooling/compaction.</p></details>
+  <details><summary>How do you design for a 4-hour RTO / 15-minute RPO across regions?</summary><p>15-min RPO means data loss ≤15 min, so you need asynchronous cross-region replication running continuously — DynamoDB global tables, Aurora global database (typical &lt;1s replica lag), or S3 Cross-Region Replication, plus regular DB snapshots. 4-hour RTO is generous enough for a <em>warm standby</em>: keep a scaled-down but running stack in the DR region (IaC-defined, minimal capacity), with Route 53 health-check failover or a manual runbook to scale up and flip DNS. You don't need active-active (which would give near-zero RTO but doubles cost and forces conflict resolution). Test the failover on a schedule — an untested DR plan is a hope, not a plan.</p></details>
+  <details><summary>Trace a packet from a user's browser to a private RDS instance.</summary><p>Browser resolves your domain via Route 53 to the ALB's public IP (or CloudFront edge first). TLS terminates at the ALB in a public subnet; the ALB's SG allows 443 in. ALB picks a healthy target and opens a connection to an app instance in a private subnet — that instance's SG allows the ALB's SG on the app port. The app queries RDS by its endpoint DNS, resolving to the primary's private IP; the RDS SG allows the app SG on 5432. Nothing in this path has a public IP except the ALB. Return traffic is stateful at each SG. If the app needed to call an external API, its route table's default route points to a NAT Gateway in a public subnet, which SNATs out through the Internet Gateway.</p></details>
+  <details><summary>What's the confused-deputy problem and how does ExternalId fix it?</summary><p>When you let a third-party SaaS assume a role in your account, its role-ARN is in your trust policy. But that SaaS uses the same role to serve many customers — an attacker who is also their customer could trick the SaaS into assuming <em>your</em> role (the deputy is confused about whose behalf it acts). ExternalId fixes it: you give the SaaS a secret string unique to you, they must pass it in the AssumeRole call, and your trust policy requires <code>sts:ExternalId</code> to match. Since the attacker doesn't know your ExternalId, they can't get the SaaS to assume your role. It's a shared-secret binding between the trust relationship and your specific tenancy.</p></details>
+  <details><summary>How does SigV4 request signing work and why does clock skew break it?</summary><p>The SDK builds a canonical request (method, URI, sorted query, canonical headers, hashed payload), creates a string-to-sign that includes a timestamp and a scope (date/region/service), derives a signing key via chained HMAC-SHA256 (secret→date→region→service→"aws4_request"), and signs the string-to-sign with it. The signature and credential scope go in the Authorization header. AWS recomputes the same signature server-side. The timestamp (<code>X-Amz-Date</code>) must be within a ~5-minute window of AWS's clock — otherwise you get <code>RequestTimeTooSkewed</code>. That's why NTP must run on your instances; a drifting clock silently breaks every API call. The signing key is never sent — only the derived signature — so it's safe over TLS and resistant to replay within the window.</p></details>
+  <details><summary>Provisioned concurrency vs reserved concurrency vs account concurrency — clarify.</summary><p>Account concurrency is the region-wide ceiling on simultaneous executions (default 1,000, raisable). Reserved concurrency <em>carves out</em> a guaranteed slice of that ceiling for one function (and caps it there) — it protects a critical function and prevents one function from starving others, but reserved instances still cold-start. Provisioned concurrency <em>pre-initializes</em> N execution environments (runs your init code ahead of time) so those invocations skip the cold start entirely — you pay for them whether used or not. Typical setup: reserved concurrency to guarantee capacity + provisioned concurrency (with auto-scaling or scheduled) to kill cold starts during known peaks.</p></details>
+  <details><summary>Why is a single NAT Gateway both a cost problem and an availability problem?</summary><p>Availability: a NAT Gateway lives in one AZ. If all your private subnets route <code>0.0.0.0/0</code> to that one NAT and its AZ fails, every private instance in <em>every</em> AZ loses internet egress — patching, external API calls, and pulling from public endpoints all break, even though your instances are alive. Cost: cross-AZ traffic to reach that NAT incurs inter-AZ data charges, plus NAT data-processing at ~$0.045/GB on top of egress. The fix is one NAT Gateway per AZ with each private subnet routing to the NAT in its own AZ — and using VPC gateway endpoints for S3/DynamoDB so that traffic bypasses the NAT entirely (free, and no processing charge).</p></details>
+  <details><summary>How would you enforce least privilege at org scale without blocking developers?</summary><p>Layered controls: (1) SCPs at the AWS Organizations level as guardrails — e.g., deny disabling CloudTrail, deny regions you don't operate in, deny public S3. (2) Permission boundaries on the roles developers can create, so they can self-serve roles but never exceed the boundary. (3) Start from AWS-managed job-function policies, then tighten to specific resources/actions using Access Analyzer, which generates least-privilege policies from CloudTrail history. (4) Use attribute-based access control (ABAC) with tags so one policy scales across teams (<code>aws:PrincipalTag/team == aws:ResourceTag/team</code>). (5) Short-lived creds via SSO/OIDC, no long-lived keys. The trick is guardrails + self-service, not a central team hand-approving every policy.</p></details>
+  <details><summary>Instance store vs EBS — when does ephemeral local disk actually win?</summary><p>Instance store is physically-attached NVMe on the host: highest IOPS/throughput and lowest latency, but the data is gone if the instance stops, hibernates, or the host fails — it's ephemeral. EBS is network-attached, persists independently, is replicated within an AZ, and can be snapshotted. Instance store wins for scratch data you can regenerate: caches, temp spill for shuffles/sorts, replicated distributed-DB nodes (Cassandra/Kafka where the cluster holds durability), and buffer/L2 caches. Use EBS for anything that must survive an instance replacement — root volumes of pets, single-node databases. A common high-perf pattern: EBS for the OS + instance-store NVMe for the DB's data files when the DB layer already replicates.</p></details>
+  <details><summary>Standard SQS is at-least-once — how do you build exactly-once processing on it?</summary><p>You make processing idempotent so duplicates are harmless. Each message carries (or derives) an idempotency key; before doing the side effect, the consumer does a conditional insert into a dedup store (DynamoDB with a conditional <code>attribute_not_exists(id)</code>, TTL'd) — if it already exists, skip. For non-idempotent effects like payments, wrap the effect + the dedup record in the same transaction (DynamoDB TransactWriteItems, or the DB's own transaction). Set the visibility timeout longer than max processing time so a slow consumer doesn't cause a second delivery mid-work, and route repeated failures to a DLQ after <code>maxReceiveCount</code>. FIFO queues give message-group ordering + provider-side dedup (5-min window) but cap throughput at 300/3,000 msg/s — if you need more, Standard + idempotency is the scalable answer.</p></details>
+  <details><summary>What are the six Well-Architected pillars and name one concrete lever per pillar?</summary><p>Operational Excellence — IaC + runbooks + game days. Security — least-privilege IAM + KMS encryption + GuardDuty. Reliability — multi-AZ + auto-recovery + backups with tested restore. Performance Efficiency — right-sized instance families + caching (CloudFront/DAX) + async where latency allows. Cost Optimization — Savings Plans/Spot + S3 lifecycle tiering + kill idle NAT/EIP. Sustainability — Graviton (ARM) instances for better perf/watt + right-sizing to reduce waste. The point in an interview isn't reciting them — it's showing you evaluate a design against all six and name the trade-off you're consciously accepting.</p></details>
+</div>

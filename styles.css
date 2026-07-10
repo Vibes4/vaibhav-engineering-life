@@ -268,3 +268,9 @@ pre { background: var(--code-bg); color: var(--code-text); padding: 16px; overfl
 .run-banner .cmd-text { color: #7ee787; }
 .run-banner .run-copy { background: var(--copy-bg); border: 1px solid var(--copy-border); color: #c9d1d9; border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
 .run-banner .run-copy:hover { filter: brightness(1.3); }
+
+/* ---------- Mermaid diagrams (Senior Backend Mastery) ---------- */
+.mermaid { margin: 16px 0; text-align: center; overflow-x: auto; }
+.mermaid svg { max-width: 100%; height: auto; }
+/* Before render, show the source as a dim monospace block rather than raw text flash */
+.mermaid:not([data-processed]) { color: var(--muted); font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; white-space: pre; text-align: left; }

@@ -1,0 +1,152 @@
+<h1>⚡ 20-Minute Interview Recap <span class="tag express">Cheat-Sheet</span></h1>
+<p>20 minutes is just enough to <em>refresh</em> your brain — not to learn new things. This is the highest-ROI sweep across the stack you'll actually be asked about: Node, Angular, SQL, ORMs, Docker, microservices, plus the soft-but-scored stuff (clean code, testing, CI/CD). Skim the headers, expand whatever feels rusty.</p>
+<div class="callout tip"><strong>How to use this:</strong> each section is collapsible — click a heading to fold it. Use <em>Collapse all</em> to see the whole map at a glance, then open the two or three areas the role leans on.</div>
+
+<h2>1 · Node.js &amp; Backend</h2>
+<h3>Event loop</h3>
+<ul>
+  <li>JavaScript runs on a <strong>single thread</strong>; async I/O is offloaded to the <strong>libuv</strong> thread pool or the OS.</li>
+  <li>The loop cycles through phases, and <strong>microtasks drain between every phase</strong>.</li>
+</ul>
+<pre><code>Phases:                         Priority (drains first → last):
+1. Timers (setTimeout/Interval)   process.nextTick()
+2. Pending callbacks              Promise.then()   (microtasks)
+3. Idle / Prepare                 setTimeout()
+4. Poll (I/O)                     setImmediate()
+5. Check (setImmediate)
+6. Close callbacks</code></pre>
+<div class="callout tip"><strong>One-liner:</strong> "Node is single-threaded for <em>your</em> JS, but I/O is concurrent because libuv and the OS do the waiting. <code>nextTick</code> and resolved promises always run before the next timer or I/O callback."</div>
+
+<h3>REST API best practices</h3>
+<pre><code>GET    /users        list
+GET    /users/:id    fetch one
+POST   /users        create
+PUT    /users/:id    full replace
+PATCH  /users/:id    partial update
+DELETE /users/:id    remove</code></pre>
+<p>Return the right status code — interviewers notice this:</p>
+<table>
+  <tr><th>2xx</th><td><code>200 OK</code> · <code>201 Created</code> · <code>204 No Content</code></td></tr>
+  <tr><th>4xx</th><td><code>400 Bad Request</code> · <code>401 Unauthorized</code> · <code>403 Forbidden</code> · <code>404 Not Found</code> · <code>409 Conflict</code></td></tr>
+  <tr><th>5xx</th><td><code>500 Internal Server Error</code></td></tr>
+</table>
+<p>Always layer in: <strong>validation</strong> · <strong>authentication</strong> · <strong>pagination</strong> · <strong>error handling</strong> · <strong>logging</strong>.</p>
+
+<h2>2 · Angular</h2>
+<pre><code>Component  →  Service  →  HTTP Client  →  Backend</code></pre>
+<p>Keep these on the tip of your tongue: <strong>Components</strong>, <strong>Services</strong>, <strong>Dependency Injection</strong>, <strong>RxJS Observables</strong>, <strong>Reactive Forms</strong>, <strong>Route Guards</strong>, <strong>Lazy Loading</strong>.</p>
+<div class="callout tip"><strong>"Why Angular?"</strong> Opinionated &amp; structured · first-class TypeScript · built-in DI · battle-tested for large enterprise apps. (Components hold view logic, services hold business logic — never the reverse.)</div>
+
+<h2>3 · SQL &amp; PostgreSQL</h2>
+<h3>Joins</h3>
+<pre><code>INNER JOIN   rows matching in both
+LEFT JOIN    all left + matches
+RIGHT JOIN   all right + matches
+FULL JOIN    everything, matched or not</code></pre>
+
+<h3>Indexes</h3>
+<p>Speed up <code>SELECT</code> / <code>WHERE</code> / <code>ORDER BY</code> / <code>JOIN</code>. <strong>Don't</strong> index low-cardinality columns (e.g. a boolean) or frequently-updated columns — the write cost outweighs the read gain.</p>
+
+<h3>EXPLAIN ANALYZE</h3>
+<pre><code>EXPLAIN ANALYZE
+SELECT ...;</code></pre>
+<p>Reveals <strong>Seq Scan vs Index Scan</strong>, estimated <strong>cost</strong>, and <strong>actual execution time</strong>. A surprise Seq Scan on a big table is your cue to add an index.</p>
+
+<h3>Query optimization</h3>
+<p>Avoid <code>SELECT *</code> → select only the columns you need (<code>SELECT id, name</code>). Then lean on <strong>indexes</strong>, <strong>LIMIT</strong>, <strong>pagination</strong>, <strong>proper JOINs</strong>, and <strong>batching</strong> instead of N+1 queries.</p>
+
+<h3>Transactions — ACID</h3>
+<p><strong>A</strong>tomicity · <strong>C</strong>onsistency · <strong>I</strong>solation · <strong>D</strong>urability.</p>
+<table>
+  <tr><th>Read Uncommitted</th><td>can see dirty (uncommitted) data</td></tr>
+  <tr><th>Read Committed</th><td><strong>Postgres default</strong> — sees only committed rows</td></tr>
+  <tr><th>Repeatable Read</th><td>same rows reread identically within the txn</td></tr>
+  <tr><th>Serializable</th><td>strongest — as if transactions ran one at a time</td></tr>
+</table>
+
+<h2>4 · ORM (TypeORM)</h2>
+<p>Benefits: <strong>entity mapping</strong>, <strong>migrations</strong>, <strong>relations</strong>, and a <strong>Query Builder</strong>.</p>
+<div class="callout warn"><strong>Know when NOT to use it:</strong> complex reporting and analytical queries → drop to <strong>raw SQL</strong>. An ORM is for CRUD and relations, not for hand-tuned 6-way reporting joins.</div>
+
+<h2>5 · SDLC &amp; Agile</h2>
+<pre><code>SDLC:   Requirement → Design → Development → Testing → Deployment → Maintenance
+
+Agile:  Sprint → Development → Testing → Review → Release  (repeat)</code></pre>
+
+<h2>6 · Git / JIRA / CI-CD</h2>
+<pre><code>Git flow:  feature branch → PR → review → merge</code></pre>
+<p>Commands worth naming: <code>git pull</code> · <code>git checkout</code> · <code>git rebase</code> · <code>git cherry-pick</code> · <code>git stash</code> · <code>git log</code>.</p>
+<pre><code>CI/CD:  Push → Build → Unit Tests → Lint → Docker Image → Deploy → Health Check</code></pre>
+
+<h2>7 · Clean Code — SOLID</h2>
+<table>
+  <tr><th>S</th><td>Single Responsibility — one reason to change</td></tr>
+  <tr><th>O</th><td>Open/Closed — open to extension, closed to modification</td></tr>
+  <tr><th>L</th><td>Liskov — subtypes must be substitutable for their base</td></tr>
+  <tr><th>I</th><td>Interface Segregation — many small interfaces &gt; one fat one</td></tr>
+  <tr><th>D</th><td>Dependency Inversion — depend on abstractions, not concretions</td></tr>
+</table>
+<p>Plus the basics: <strong>small functions</strong>, <strong>meaningful names</strong>, <strong>no duplication (DRY)</strong>, <strong>KISS</strong>.</p>
+
+<h2>8 · Unit Testing</h2>
+<pre><code>AAA:  Arrange → Act → Assert</code></pre>
+<p><strong>Mock</strong> the database, HTTP calls, and external APIs. <strong>Test</strong> the success path, the failure path, and the edge cases.</p>
+
+<h2>9 · Docker</h2>
+<pre><code>Dockerfile → Image → Container</code></pre>
+<p>Commands: <code>docker build</code> · <code>docker run</code> · <code>docker ps</code> · <code>docker logs</code> · <code>docker compose up</code>.</p>
+<p>Benefits: <strong>same environment everywhere</strong>, easy deployment, and process <strong>isolation</strong>.</p>
+
+<h2>10 · Microservices</h2>
+<table>
+  <tr><th>Pros</th><td>independent deployment · independent scalability · team autonomy</td></tr>
+  <tr><th>Cons</th><td>network latency · distributed transactions · monitoring complexity</td></tr>
+  <tr><th>Comms</th><td>REST (sync) · RabbitMQ / Kafka (async messaging)</td></tr>
+</table>
+
+<h2>11 · AWS (basics only)</h2>
+<table>
+  <tr><th>EC2</th><td>virtual machine</td></tr>
+  <tr><th>S3</th><td>object storage</td></tr>
+  <tr><th>RDS</th><td>managed PostgreSQL</td></tr>
+  <tr><th>CloudWatch</th><td>logs &amp; monitoring</td></tr>
+  <tr><th>IAM</th><td>permissions / identity</td></tr>
+  <tr><th>Load Balancer</th><td>distributes traffic across instances</td></tr>
+</table>
+
+<h2>12 · MongoDB vs PostgreSQL</h2>
+<table>
+  <tr><th>Use MongoDB</th><td>flexible schema · JSON documents · fast early development</td></tr>
+  <tr><th>Use PostgreSQL</th><td>transactions · joins · relational data · complex queries</td></tr>
+</table>
+<div class="callout tip"><strong>Default stance:</strong> "Relational unless proven otherwise." Reach for Mongo when the schema is genuinely document-shaped and evolving, not just to skip writing migrations.</div>
+
+<h2>13 · Monitoring &amp; Reliability</h2>
+<ul>
+  <li><strong>Logging:</strong> <code>Winston</code>, <code>Pino</code>.</li>
+  <li><strong>Metrics:</strong> CPU · memory · latency · requests/sec · error rate.</li>
+  <li><strong>Health endpoint:</strong> <code>/health</code> for liveness/readiness probes.</li>
+  <li><strong>Reliability patterns:</strong> retry · timeout · circuit breaker · graceful shutdown.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Questions they may ask — with the angle to take</h3>
+  <details><summary>Explain the Node.js event loop.</summary><p>Single thread runs your JS; libuv/OS handle I/O concurrently. Phases: timers → pending → poll → check → close. Microtasks (<code>process.nextTick</code>, resolved Promises) drain between phases, so they run before the next timer/I/O callback.</p></details>
+  <details><summary>How does Angular's dependency injection work?</summary><p>Hierarchical injectors. Providers register a token; classes marked <code>@Injectable</code> are requested via the constructor. Angular walks the injector tree (component → module → root) to resolve, which makes services swappable and testable.</p></details>
+  <details><summary>How did you optimize a slow SQL query?</summary><p>Ran <code>EXPLAIN ANALYZE</code>, spotted a Seq Scan on a large table, added the right index, removed <code>SELECT *</code>, added pagination/<code>LIMIT</code>, and rewrote the join. Verified the plan flipped to an Index Scan and latency dropped.</p></details>
+  <details><summary>What indexes have you created in PostgreSQL?</summary><p>B-tree indexes on foreign keys and frequent <code>WHERE</code> columns, composite indexes ordered <em>equality → range → sort</em> (ESR), and partial indexes for hot subsets. Avoided indexing low-cardinality or frequently-updated columns.</p></details>
+  <details><summary>Why PostgreSQL over MongoDB?</summary><p>The data was relational with strong consistency needs — joins, ACID transactions, and complex queries. Postgres gives that out of the box; forcing it into documents would have meant reinventing joins in application code.</p></details>
+  <details><summary>Explain your CI/CD pipeline.</summary><p>Push → build → lint → unit tests → build Docker image → deploy → health check. A failing lint or test blocks the merge; the health check gates the release so a bad deploy rolls back.</p></details>
+  <details><summary>Describe a challenging bug you fixed.</summary><p>Use STAR: the symptom, how you reproduced it, how you isolated the root cause (logs/metrics/bisect), the fix, and the regression test you added so it can't return. Pick a real one with a concrete root cause.</p></details>
+  <details><summary>How do you write unit tests in NestJS?</summary><p>Jest with <code>Test.createTestingModule</code>, mocking providers/repositories so nothing hits a real DB or network. Follow AAA and cover success, failure, and edge cases.</p></details>
+  <details><summary>How have you used Docker in development?</summary><p>A <code>Dockerfile</code> per service and <code>docker compose</code> for local dev (app + Postgres + Redis), giving the same environment across dev/CI/prod and clean isolation.</p></details>
+  <details><summary>Explain your microservice architecture.</summary><p>Services split by domain boundary, each independently deployable with its own data. Sync calls over REST, async events over Kafka/RabbitMQ. Be honest about the costs: network latency, distributed transactions, and monitoring overhead.</p></details>
+  <details><summary>Difference between PUT and PATCH?</summary><p><code>PUT</code> replaces the whole resource and is idempotent. <code>PATCH</code> applies a partial update. Sending only the changed fields → PATCH; sending the full object → PUT.</p></details>
+  <details><summary>How do you prevent SQL injection?</summary><p>Parameterized queries / prepared statements (or the ORM's bound parameters) — never string-concatenate user input into SQL. Add least-privilege DB users and input validation as defense in depth.</p></details>
+  <details><summary>JWT vs session authentication?</summary><p>Sessions store state server-side and hand the client a cookie id — easy to revoke, needs shared session storage to scale. JWTs are stateless signed tokens — scale horizontally with no lookup, but are hard to revoke before expiry (mitigate with short TTL + refresh tokens).</p></details>
+  <details><summary>How do you handle database transactions?</summary><p><code>BEGIN … COMMIT/ROLLBACK</code>, or the ORM's transaction wrapper so all writes commit or none do. Pick the isolation level for the consistency you need and keep transactions short to avoid lock contention.</p></details>
+  <details><summary>What happens when an API receives 10,000 concurrent requests?</summary><p>Node's event loop handles the I/O concurrency, but one process has limits. Scale horizontally behind a load balancer, use DB connection pooling, cache hot reads, push heavy work to a queue, and apply backpressure / rate limiting so you degrade gracefully instead of falling over.</p></details>
+</div>
+
+<div class="callout tip"><strong>Strengths to lean into:</strong> Node.js/NestJS backend · Angular + TypeScript enterprise frontend · PostgreSQL tuning &amp; TypeORM · Docker / Kubernetes / microservices · shipping scalable products (e.g. an IAM/OIDC server, a workflow platform).</div>
+<div class="callout warn"><strong>On AWS, be honest:</strong> say you've worked primarily with containerized deployments and know AWS fundamentals (EC2, RDS, IAM, S3) — rather than overstating production depth. Interviewers reward accuracy; getting caught exaggerating is a remarkably inefficient career strategy.</div>

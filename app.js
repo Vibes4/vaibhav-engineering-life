@@ -3,6 +3,12 @@
    Also handles the persisted dark-mode toggle. */
 
 const MODULES = {
+  "Quick Recap": {
+    folder: "recap",
+    items: [
+      ["interview-20min", "⚡ 20-Min Interview Recap", "Node, Angular, SQL, Docker, micro…"]
+    ]
+  },
   "JavaScript": {
     folder: "javascript",
     items: [
@@ -293,14 +299,13 @@ const MODULES = {
       ["fundamentals",         "SD fundamentals",      "scalability, CAP, load balancing"],
       ["caching",              "Caching & Redis",      "patterns, eviction, invalidation"],
       ["message-queues",       "Message queues",       "Kafka, RabbitMQ, async work"],
-      ["rate-limiter",         "Rate limiter",         "token bucket, sliding window"],
       ["url-shortener",        "URL shortener",        "base62, hashing, scale"],
       ["chat-system",          "Chat system",          "websockets, fan-out, presence"],
       ["notification-service", "Notification service", "push/email, queues, retries"],
       ["file-upload",          "File upload service",  "chunking, presigned URLs"]
     ]
   },
-  "System Design Case Studies": {
+  "How Products Work": {
     folder: "system-design/case-studies", collapsed: true, divider: "System Design · Case Studies",
     items: [
       ["reddit",              "How Reddit Works",              "hot ranking, votes, read-heavy"],
@@ -313,14 +318,53 @@ const MODULES = {
       ["payment-system",      "How a Payment System Works",    "idempotency, double-entry ledger"],
       ["spotify",             "How Spotify Works",             "CDN streaming, adaptive bitrate"],
       ["tinder",              "How Tinder Works",              "geo proximity, mutual match"],
-      ["lambda",              "How AWS Lambda Works",          "serverless, cold starts, scaling"],
-      ["chatgpt",             "How LLMs Like ChatGPT Work",    "tokens, autoregression, sampling"],
       ["uber-nearby-drivers", "How Uber Finds Drivers",        "geohash/quadtree proximity"],
-      ["kafka",               "How Apache Kafka Works",        "partitions, offsets, consumer groups"],
-      ["s3",                  "How AWS S3 Works",              "object storage, consistent hashing"],
       ["youtube",             "How YouTube Works",             "transcode ladder, CDN, ABR"],
       ["whatsapp",            "How WhatsApp Works",            "E2E encryption, delivery receipts"],
       ["airtag",              "How Apple AirTag Works",        "Find My network, rotating keys"]
+    ]
+  },
+  "How Technologies Work": {
+    folder: "system-design/case-studies",
+    items: [
+      ["s3",                  "How AWS S3 Works",              "object storage, consistent hashing"],
+      ["lambda",              "How AWS Lambda Works",          "serverless, cold starts, scaling"],
+      ["chatgpt",             "How LLMs Like ChatGPT Work",    "tokens, autoregression, sampling"]
+    ]
+  },
+  "Core Topics": {
+    folder: "mastery", divider: "Senior Backend Interview Mastery",
+    items: [
+      ["mongodb",                "MongoDB",                "replica sets, sharding, WiredTiger, oplog"],
+      ["networking",             "Networking",             "TCP/TLS/HTTP, DNS, load balancing"],
+      ["cloud",                  "Cloud",                  "compute, storage, networking, IAM"],
+      ["cloud-providers",        "Cloud: AWS vs Azure vs GCP","service equivalents + unique features"],
+      ["infrastructure",         "Infrastructure",         "containers, IaC, CI/CD, service mesh"],
+      ["kubernetes",             "Kubernetes",             "pods, controllers, scheduling, probes"],
+      ["redis",                  "Redis",                  "single-thread, persistence, cluster"],
+      ["rabbitmq",               "RabbitMQ",               "exchanges, acks, DLQ, backpressure"],
+      ["kafka",                  "Kafka",                  "partitions, ISR, consumer groups, lag"],
+      ["distributed-systems",    "Distributed Systems",    "CAP, consensus, consistency, clocks"],
+      ["performance-engineering","Performance Engineering","latency, throughput, profiling, p99"],
+      ["production-scenarios",   "Production Scenarios",   "incidents: RCA, debugging, prevention"]
+    ]
+  },
+  "Networking Deep-Dives": {
+    folder: "mastery",
+    items: [
+      ["tls",             "TLS / SSL",                "handshake, certs, mTLS, ciphers"],
+      ["dns",             "DNS",                      "resolution, records, anycast, DNSSEC"],
+      ["http",            "HTTP/1.1 · 2 · 3 · QUIC",  "multiplexing, HOL blocking, caching"],
+      ["load-balancing",  "Load Balancing & Proxies", "L4/L7, algorithms, health checks"]
+    ]
+  },
+  "Reliability & Security": {
+    folder: "mastery",
+    items: [
+      ["observability",   "Observability",                 "metrics, logs, traces, OTel, SLO"],
+      ["rate-limiting",   "Rate Limiting & Resiliency",    "token bucket, breakers, backoff"],
+      ["auth",            "Auth · OAuth2 / OIDC / JWT / mTLS","tokens, flows, sessions, RBAC"],
+      ["concurrency",     "Concurrency & Async",           "event loop, locks, races, CAS"]
     ]
   }
 };
@@ -470,9 +514,31 @@ function addAccordionToolbar(root) {
   root.insertBefore(bar, root.firstChild);
 }
 
+/* ---------- Mermaid diagrams ----------
+   Content is injected via innerHTML, so Mermaid can't use startOnLoad. After each
+   module loads we render any `<pre class="mermaid">` blocks in place. Concept panels
+   are open by default, so blocks are visible (non-zero width) at render time. */
+function mermaidTheme() {
+  return document.documentElement.classList.contains("dark") ? "dark" : "neutral";
+}
+async function renderMermaid() {
+  const m = window.mermaid;
+  if (!m) return;
+  const nodes = content.querySelectorAll(".mermaid:not([data-processed])");
+  if (!nodes.length) return;
+  try {
+    m.initialize({ startOnLoad: false, theme: mermaidTheme(), securityLevel: "loose",
+                   flowchart: { useMaxWidth: true }, sequence: { useMaxWidth: true } });
+    await m.run({ nodes });
+  } catch (e) { /* on parse error, leave the diagram source visible rather than blow up the page */ }
+}
+
+let currentKey = null;
+
 async function loadModule(key) {
   const meta = flat[key];
   if (!meta) return;
+  currentKey = key;
 
   document.querySelectorAll(".nav-item").forEach(el =>
     el.classList.toggle("active", el.dataset.key === key));
@@ -512,6 +578,7 @@ async function loadModule(key) {
     content.innerHTML = explanation + codeBlock;
     groupIntoAccordions(content);
     addAccordionToolbar(content);
+    renderMermaid();
     content.scrollTop = 0;
   } catch (e) {
     content.innerHTML = `<div class="callout warn"><strong>Could not load module.</strong>
@@ -538,6 +605,8 @@ themeToggle.addEventListener("click", () => {
   const isDark = document.documentElement.classList.toggle("dark");
   try { localStorage.setItem("theme", isDark ? "dark" : "light"); } catch (e) {}
   syncThemeIcon();
+  // Mermaid bakes the theme into the rendered SVG, so re-load the current page to re-theme diagrams.
+  if (currentKey && content.querySelector(".mermaid")) loadModule(currentKey);
 });
 syncThemeIcon();
 

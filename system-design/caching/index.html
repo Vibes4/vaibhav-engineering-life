@@ -41,15 +41,9 @@
   <li><strong>Jittered TTLs</strong> — randomize expiry so keys don't all die together.</li>
 </ul>
 
-<h2>Redis use cases</h2>
-<table>
-  <tr><th>Cache</th><td>Key-value with TTL; the default.</td></tr>
-  <tr><th>Session store</th><td>Externalized sessions for stateless app servers.</td></tr>
-  <tr><th>Rate limiting</th><td>Atomic <code>INCR</code> + <code>EXPIRE</code> counters.</td></tr>
-  <tr><th>Leaderboards</th><td>Sorted sets (<code>ZADD</code>/<code>ZRANGE</code>) give ranked queries for free.</td></tr>
-  <tr><th>Pub/Sub &amp; queues</th><td>Lightweight messaging, streams, job queues.</td></tr>
-</table>
-<div class="callout tip"><strong>Senior tip:</strong> Redis is single-threaded for commands, so multi-step operations are best done atomically with Lua scripts or <code>MULTI/EXEC</code> to avoid races (e.g. token-bucket rate limiting).</div>
+<h2>Redis as a cache</h2>
+<p>Redis is the default application-level cache: in-memory key-value with TTL and single-threaded command execution for predictable latency. This page covers caching <em>concepts</em>; the Redis internals (data structures, persistence, eviction, replication, Cluster) and Redis-based rate limiting live in their own deep-dives.</p>
+<div class="callout tip"><strong>Deeper dive:</strong> <a href="#mastery::redis">Redis (Mastery)</a> for persistence, eviction and clustering · <a href="#mastery::rate-limiting">Rate Limiting &amp; Resiliency</a> for the token-bucket Lua implementation.</div>
 
 <div class="interview">
   <h3>🎯 Interview questions</h3>

@@ -1,0 +1,336 @@
+<h1>Networking <span class="tag express">Mastery</span></h1>
+<p>The wire underneath every distributed system: how bytes cross the planet through TCP, TLS, HTTP, DNS and load balancers, and where the milliseconds and the outages actually come from.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Networking is the layered stack that moves a request from a client to a server and back. IP routes packets, TCP turns them into a reliable ordered byte stream with a 3-way handshake plus flow and congestion control, TLS encrypts that stream and proves server identity via certificates, and HTTP frames the actual request. DNS resolves the name to an IP first, and a load balancer picks the backend. My mental model when debugging is: name resolution → TCP connect → TLS handshake → HTTP round trip, and I know which metric and which tool to reach for at each layer."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The OSI model has seven layers but in practice you reason with the four-layer TCP/IP model: <strong>Link</strong> (Ethernet/Wi-Fi), <strong>Internet</strong> (IP, routing, BGP), <strong>Transport</strong> (TCP/UDP), and <strong>Application</strong> (HTTP, DNS, TLS as a shim between transport and app).</p>
+<ul>
+<li><strong>TCP</strong> gives a reliable, ordered, byte-stream connection. It opens with SYN → SYN-ACK → ACK (1 RTT before data), tracks bytes with 32-bit sequence numbers, does <em>flow control</em> with a receiver-advertised window, and <em>congestion control</em> with a sender-side congestion window that grows via slow start then AIMD (or CUBIC/BBR).</li>
+<li><strong>TLS</strong> layers on top: an asymmetric handshake (certificate + key exchange) establishes a symmetric session key, then all data is AES-GCM or ChaCha20. TLS 1.3 cut the handshake to 1 RTT and added 0-RTT resumption. The cert chain roots in a trusted CA; SNI tells the server which cert to present; ALPN negotiates HTTP/2 vs HTTP/1.1.</li>
+<li><strong>HTTP</strong> evolved to kill head-of-line blocking: 1.1 has one request in flight per connection (keep-alive reuses the socket), HTTP/2 multiplexes many streams over one TCP connection with HPACK header compression, HTTP/3 moves to QUIC over UDP to remove TCP-level HOL blocking entirely.</li>
+<li><strong>DNS</strong> resolves names via recursive resolvers hitting authoritative servers; records (A/AAAA/CNAME/SRV/TXT) are cached by TTL; anycast + GSLB give geographic routing and failover.</li>
+<li><strong>Load balancing</strong> is L4 (transport, fast, connection-level) or L7 (HTTP-aware, routing/retries/TLS termination), with algorithms like round-robin, least-connections, and consistent hashing, plus health checks and connection draining.</li>
+</ul>
+<p>The unifying constraint is the <strong>latency budget</strong>: one cross-continent RTT is ~80-150 ms, and every handshake round trip multiplies it, which is why we pool connections, resume TLS, and push content to CDN edges.</p>
+
+<h2>Internal Working</h2>
+<h3>TCP connection lifecycle</h3>
+<ol>
+<li><strong>Resolve</strong>: app calls <code>getaddrinfo()</code>; DNS returns an IP. </li>
+<li><strong>Connect (3-way handshake)</strong>: client sends <code>SYN</code> with initial sequence number (ISN, randomized to prevent spoofing) and its receive window + options (MSS, window scale, SACK-permitted, timestamps). Server replies <code>SYN-ACK</code> with its own ISN. Client sends <code>ACK</code>. Connection is ESTABLISHED after 1 RTT.</li>
+<li><strong>Data transfer</strong>: each segment carries a sequence number = byte offset; receiver ACKs the next expected byte (cumulative ACK), with SACK filling holes. The kernel maintains send and receive socket buffers.</li>
+<li><strong>Flow control</strong>: receiver advertises <code>rwnd</code> (bytes it can buffer). Sender never has more than <code>min(rwnd, cwnd)</code> unacked bytes in flight. A stalled reader shrinks rwnd to 0 (zero-window), sender probes with window updates.</li>
+<li><strong>Congestion control</strong>: sender keeps <code>cwnd</code>. <em>Slow start</em> doubles cwnd each RTT until <code>ssthresh</code>; then <em>congestion avoidance</em> (AIMD) grows by ~1 MSS/RTT. On loss (3 dup ACKs) it halves cwnd (fast recovery); on timeout (RTO) it drops to 1 and restarts slow start. CUBIC uses a cubic growth curve for high bandwidth-delay networks; BBR models bottleneck bandwidth + RTT instead of reacting to loss.</li>
+<li><strong>Teardown</strong>: FIN/ACK each direction. The active closer enters <code>TIME_WAIT</code> for 2×MSL (~60 s on Linux) to absorb stray retransmits — this is what causes port exhaustion under high connection churn.</li>
+</ol>
+<h3>TLS 1.3 handshake internals</h3>
+<ol>
+<li>Client sends <code>ClientHello</code> with supported cipher suites, a key share (X25519 ephemeral public key), SNI, and ALPN list.</li>
+<li>Server replies <code>ServerHello</code> with its key share, certificate, and a <code>Finished</code> — both sides now derive the shared secret via ECDHE and switch to symmetric encryption. Data flows after <strong>1 RTT</strong>.</li>
+<li>On resumption, a PSK ticket from a prior session enables <strong>0-RTT</strong>: client sends early data with the first flight (at the cost of replay risk for that data).</li>
+</ol>
+
+<h2>Why was this built?</h2>
+<p>Before packet switching, telecom used circuit switching — a dedicated physical path per call, wasteful and fragile. ARPANET introduced packet switching so links could be shared and routed around failures. TCP/IP (1974, Cerf &amp; Kahn) split concerns: IP does best-effort routing, TCP adds reliability on top, so the network core stays dumb and the endpoints stay smart (the end-to-end principle).</p>
+<ul>
+<li>Before <strong>DNS</strong> (1983): a single <code>HOSTS.TXT</code> file distributed by SRI — didn't scale past a few thousand hosts.</li>
+<li>Before <strong>TLS</strong>: plaintext HTTP; anyone on-path could read/modify. SSL (Netscape, 1994) → TLS 1.0 (1999) → 1.3 (2018).</li>
+<li>Before <strong>HTTP/2</strong>: HTTP/1.1 needed 6+ parallel TCP connections per origin to hide HOL blocking; SPDY/HTTP/2 fixed it with multiplexing.</li>
+</ul>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Choice</th><th>Alternative</th><th>When the alternative wins</th></tr>
+<tr><td>TCP</td><td>UDP</td><td>UDP wins for real-time (VoIP, games, DNS, QUIC) where retransmit latency hurts more than a lost packet; you rebuild only the reliability you need.</td></tr>
+<tr><td>TCP</td><td>QUIC</td><td>QUIC wins on lossy/mobile links (no head-of-line blocking across streams, 0-RTT, connection migration across IP changes).</td></tr>
+<tr><td>HTTP/2</td><td>HTTP/3</td><td>HTTP/3 wins on high-loss networks; HTTP/2 still fine on clean datacenter links where UDP is deprioritized.</td></tr>
+<tr><td>L7 LB</td><td>L4 LB</td><td>L4 wins for raw throughput, non-HTTP protocols, and when you don't want to terminate TLS at the LB (lower CPU, lower latency).</td></tr>
+<tr><td>DNS GSLB</td><td>Anycast IP</td><td>Anycast wins for instant failover and DDoS absorption (BGP routes to nearest healthy PoP) without waiting on DNS TTL.</td></tr>
+<tr><td>Round-robin</td><td>Consistent hashing</td><td>Consistent hashing wins when backends hold cache/state — minimizes remapping when a node joins/leaves.</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Layering</strong>: each layer is independently upgradable — you can swap CUBIC for BBR without touching apps.</li>
+<li><strong>Reliability without app effort</strong>: TCP hides loss, reordering, duplication.</li>
+<li><strong>Security is now default</strong>: TLS 1.3 + modern ciphers give forward secrecy; a stolen server key can't decrypt captured past traffic.</li>
+<li><strong>Multiplexing</strong>: HTTP/2/3 amortize one handshake across hundreds of streams.</li>
+<li><strong>Global scale</strong>: DNS + anycast + CDN move content within ~10-30 ms of most users.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>Handshake tax</strong>: TCP + TLS = 2-3 RTTs before first byte; brutal on high-latency links.</li>
+<li><strong>Head-of-line blocking</strong>: one lost TCP segment stalls all HTTP/2 streams on that connection.</li>
+<li><strong>TIME_WAIT / port exhaustion</strong>: ~64K ephemeral ports per source IP:dest tuple; connection churn starves them.</li>
+<li><strong>DNS caching lag</strong>: TTL means failover and config changes propagate slowly and unevenly.</li>
+<li><strong>Opaqueness</strong>: TLS encryption hides payloads from middleboxes, complicating debugging and DPI.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+<li><strong>Latency vs reliability</strong>: TCP retransmits guarantee delivery but add tail latency; UDP drops the guarantee for speed.</li>
+<li><strong>Throughput vs fairness</strong>: BBR grabs more bandwidth and can starve CUBIC flows sharing a bottleneck.</li>
+<li><strong>Security vs performance</strong>: mutual TLS adds a client-cert round trip and CPU; 0-RTT adds a replay-attack surface.</li>
+<li><strong>Nagle vs delayed ACK</strong>: Nagle coalesces small writes to save packets but combined with delayed ACK can add ~40 ms stalls — disable with <code>TCP_NODELAY</code> for request/response protocols.</li>
+<li><strong>DNS TTL</strong>: low TTL = fast failover but more query load and resolver cost; high TTL = cheap but slow to change.</li>
+<li><strong>TLS termination location</strong>: terminate at edge = simpler certs + cheaper backends but plaintext inside the mesh; end-to-end mTLS = zero-trust but more CPU and cert management.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out:</strong> Don't reach for TCP when microsecond tail latency matters and you can tolerate loss — real-time media, telemetry, and multiplayer games belong on UDP/QUIC. Don't put an L7 load balancer in front of a pure bulk-throughput or non-HTTP workload — you pay TLS-termination CPU and parsing latency for routing features you don't use; use L4/DSR. Don't rely on DNS TTL for fast failover (clients and resolvers ignore low TTLs) — use anycast/health-checked VIPs. Don't enable HTTP/2 for large uploads over lossy links where a single loss stalls every stream — HTTP/3 or parallel HTTP/1.1 connections can beat it.</div>
+
+<h2>Production Architecture</h2>
+<p>A typical global request path: the client resolves an anycast DNS name to the nearest edge PoP, TLS terminates at the CDN/edge, and requests fan into an L7 load balancer that routes to a health-checked backend pool, with an L4 layer for raw ingress.</p>
+<pre class="mermaid">
+flowchart LR
+  U["User"] --> DNS["Anycast DNS GSLB"]
+  DNS --> EDGE["CDN edge PoP TLS 1.3"]
+  EDGE -->|cache miss| L4["L4 LB ingress"]
+  L4 --> L7["L7 LB routing and retries"]
+  L7 --> B1["Backend pod A"]
+  L7 --> B2["Backend pod B"]
+  L7 --> B3["Backend pod C"]
+  B1 --> DB["Primary datastore"]
+</pre>
+<p>The edge absorbs TLS handshakes and caches static assets; the L4 layer gives fast, protocol-agnostic ingress and DDoS scrubbing; the L7 layer does path/host routing, per-route retries, circuit breaking, and connection draining on deploy. Health checks at both LB layers eject unhealthy pods within seconds.</p>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>Ephemeral port exhaustion</strong> on a service making many short-lived outbound calls — <code>TIME_WAIT</code> piles up; fix with connection pooling / keep-alive and <code>SO_REUSEADDR</code>.</li>
+<li><strong>Retry storms</strong>: an L7 LB retrying failed requests amplifies load during a partial outage (metastable failure).</li>
+<li><strong>TLS cert expiry</strong>: the classic 3 AM page — a leaf or intermediate expires and every client fails handshake.</li>
+<li><strong>MTU/PMTU black holes</strong>: an ICMP-filtering middlebox drops "fragmentation needed", so large packets vanish and connections hang after the handshake.</li>
+<li><strong>DNS TTL stampede</strong>: TTL expires simultaneously across many clients, spiking authoritative query load.</li>
+<li><strong>Nagle + delayed-ACK 40 ms stalls</strong> in chatty RPC over TCP.</li>
+<li><strong>Slow-start on new connections</strong>: cold connections underperform; connection reuse and pacing matter.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># Layered top-down: name → TCP → TLS → HTTP
+dig +trace example.com A            # full resolution path, TTLs
+dig @8.8.8.8 example.com            # test a specific resolver
+
+# TCP connectivity + RTT
+ping -c5 host ; mtr host            # loss + per-hop latency
+ss -tan state time-wait | wc -l     # count TIME_WAIT sockets
+ss -s                               # socket summary by state
+netstat -s | grep -i retrans        # retransmit counters
+
+# Capture the handshake
+tcpdump -ni eth0 'tcp port 443 and (tcp[tcpflags] &amp; tcp-syn != 0)'
+tcpdump -ni eth0 host X -w cap.pcap  # open in Wireshark
+
+# TLS inspection
+openssl s_client -connect host:443 -servername host -alpn h2
+openssl x509 -in cert.pem -noout -dates -issuer   # expiry + chain
+
+# HTTP timing breakdown (DNS/connect/TLS/TTFB)
+curl -w 'dns:%{time_namelookup} connect:%{time_connect} tls:%{time_appconnect} ttfb:%{time_starttransfer} total:%{time_total}\n' -o /dev/null -s https://host
+
+# Path MTU
+ping -M do -s 1472 host             # test without fragmentation
+tracepath host</code></pre>
+<div class="callout tip"><strong>Say this:</strong> "I debug networking top-down through the request path: is it DNS, TCP connect, TLS, or the app? <code>curl -w</code> gives me the exact stage that's slow in one command, then I go deeper with dig, ss, tcpdump, or openssl s_client."</div>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>What it means</th><th>Healthy / alert threshold</th></tr>
+<tr><td>TCP retransmit rate</td><td>Loss or congestion on the path</td><td>&lt;0.1% healthy; alert &gt;1%</td></tr>
+<tr><td>Connection RTT (SRTT)</td><td>Round-trip smoothed estimate</td><td>Region-dependent; alert on 2x baseline</td></tr>
+<tr><td>TIME_WAIT socket count</td><td>Port-exhaustion risk</td><td>Alert as it approaches ephemeral range (~28K)</td></tr>
+<tr><td>TLS handshake latency p99</td><td>Edge CPU / resumption health</td><td>&lt;50 ms with resumption; alert &gt;200 ms</td></tr>
+<tr><td>Cert days-to-expiry</td><td>Impending total outage</td><td>Alert &lt;14 days, page &lt;3 days</td></tr>
+<tr><td>LB 5xx rate / upstream errors</td><td>Backend health</td><td>&lt;0.1%; page &gt;1%</td></tr>
+<tr><td>Healthy backend count</td><td>Capacity headroom</td><td>Alert if &lt;N/2 or below quorum</td></tr>
+<tr><td>DNS query latency / NXDOMAIN rate</td><td>Resolver health</td><td>p99 &lt;50 ms; alert on NXDOMAIN spikes</td></tr>
+<tr><td>Connection accept queue overflow</td><td>SYN backlog / listen queue full</td><td><code>ListenOverflows</code> should be 0</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>Networking scales horizontally: add PoPs (anycast pulls users to the nearest), shard traffic across LB pools, and use consistent hashing so stateful backends remap minimally when the fleet changes.</p>
+<pre class="mermaid">
+flowchart TD
+  C["Clients worldwide"] --> A["Anycast VIP"]
+  A --> P1["PoP US East"]
+  A --> P2["PoP EU West"]
+  A --> P3["PoP AP South"]
+  P1 --> H1["Consistent hash ring"]
+  H1 --> N1["Node 1"]
+  H1 --> N2["Node 2"]
+  H1 --> N3["Node 3"]
+</pre>
+<ul>
+<li><strong>Vertical limits</strong>: a single L7 proxy saturates on TLS handshakes (CPU) or connection count (memory/fds) — tune <code>somaxconn</code>, file descriptor limits, and offload TLS to hardware/NIC.</li>
+<li><strong>Horizontal</strong>: DSR (direct server return) and Maglev-style consistent hashing let L4 LBs scale to millions of connections; ECMP spreads flows across LB instances at the router.</li>
+<li><strong>Bandwidth-delay product</strong>: to fill a 1 Gbps link at 100 ms RTT you need ~12.5 MB of in-flight data — enable window scaling and large socket buffers or throughput caps at the window size.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+<li><strong>Encryption in transit</strong>: TLS 1.3 only, disable TLS 1.0/1.1, prefer AEAD ciphers (AES-GCM, ChaCha20-Poly1305) with ECDHE for forward secrecy.</li>
+<li><strong>Identity</strong>: server certs chain to a trusted CA; validate hostname (SNI), expiry, revocation (OCSP stapling). <strong>mTLS</strong> for service-to-service zero-trust — both sides present certs.</li>
+<li><strong>Network isolation</strong>: private subnets, security groups/NACLs, no public IPs on backends; egress via NAT gateway only.</li>
+<li><strong>Common attacks</strong>: SYN flood (mitigate with SYN cookies), amplification/reflection (UDP DNS/NTP — rate-limit, BCP38 anti-spoofing), MITM/downgrade (HSTS, disable renegotiation), DNS cache poisoning (DNSSEC, random source ports/query IDs), 0-RTT replay (only for idempotent requests).</li>
+<li><strong>DDoS</strong>: anycast disperses volumetric attacks across PoPs; scrubbing centers filter L3/L4; WAF handles L7.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>Latency floor</strong>: ~1 ms per 100 km one-way (speed of light in fiber ~200,000 km/s). US↔EU ≈ 70-90 ms RTT; can't beat physics — put compute near users.</li>
+<li><strong>Handshake cost</strong>: TCP=1 RTT, TLS 1.2=2 RTT, TLS 1.3=1 RTT, 0-RTT=0. Every avoided round trip saves one RTT of first-byte latency.</li>
+<li><strong>Bottlenecks</strong>: TLS handshakes (CPU-bound, ~thousands/core/s), connection setup (pool it), slow start (reuse connections), congestion window (BBR beats CUBIC on lossy long-fat networks).</li>
+<li><strong>Tuning</strong>: <code>TCP_NODELAY</code> for RPC, keep-alive + connection pools, HTTP/2 to multiplex, <code>net.ipv4.tcp_tw_reuse</code>, increase <code>net.core.somaxconn</code> and <code>tcp_max_syn_backlog</code>, enable window scaling, tune <code>tcp_rmem/wmem</code>, enable TLS session resumption + OCSP stapling.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+<li><strong>New TCP connection per request</strong> → handshake + slow start every time. <em>Fix:</em> keep-alive and connection pooling.</li>
+<li><strong>Ignoring TIME_WAIT</strong> on the client side → port exhaustion. <em>Fix:</em> pool connections; the server (passive close) shouldn't be the one accumulating TIME_WAIT.</li>
+<li><strong>Leaving Nagle on for small request/response</strong> → 40 ms delayed-ACK stalls. <em>Fix:</em> <code>TCP_NODELAY</code>.</li>
+<li><strong>Relying on low DNS TTL for failover</strong> → clients cache anyway. <em>Fix:</em> anycast / health-checked VIP.</li>
+<li><strong>Terminating TLS but not re-encrypting internally</strong> in a "zero-trust" claim → plaintext east-west traffic. <em>Fix:</em> mTLS in the mesh.</li>
+<li><strong>Unbounded retries at the LB</strong> → retry storm. <em>Fix:</em> retry budgets, jittered backoff, circuit breakers.</li>
+<li><strong>Forgetting cert-chain intermediates</strong> → works in browser (which caches intermediates) but fails for API clients. <em>Fix:</em> serve the full chain.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they use it (specific / likely)</th></tr>
+<tr><td>Google</td><td>Invented QUIC/HTTP/3 and BBR congestion control; Maglev L4 load balancer with consistent hashing + ECMP; global anycast frontends terminating TLS 1.3 at the edge.</td></tr>
+<tr><td>Amazon</td><td>Route 53 (anycast DNS + latency/geo/health-check routing), NLB (L4) and ALB (L7), Global Accelerator (anycast onto AWS backbone), s2n TLS library.</td></tr>
+<tr><td>Netflix</td><td>Open Connect CDN appliances inside ISPs to serve video near users; heavy TCP tuning (BBR, large buffers) for high-throughput streaming; likely FreeBSD kernel TLS offload.</td></tr>
+<tr><td>Uber</td><td>Ringpop/consistent hashing for stateful request routing; regional failover via DNS/anycast; gRPC over HTTP/2 for service mesh; likely mTLS between services.</td></tr>
+<tr><td>Swiggy</td><td>Likely CDN edge for app assets, geo-DNS to route users to the nearest region, L7 LB for API routing and canary; connection pooling to downstream services for low-latency order flow.</td></tr>
+<tr><td>PhonePe</td><td>Likely mTLS for payment-service isolation, strict TLS 1.3, private-subnet backends, and multi-AZ L4/L7 LBs; DNS-based DR failover for the UPI switch integration.</td></tr>
+<tr><td>Razorpay</td><td>PCI-DSS driven: TLS everywhere, mTLS between internal services, WAF + L7 LB at edge; idempotency + bounded retries on payment APIs to avoid double charges during network blips.</td></tr>
+<tr><td>Atlassian</td><td>Multi-tenant traffic over CDN + anycast; L7 routing per-tenant/shard; likely HTTP/2 for the SPA APIs and connection pooling to Postgres/DynamoDB behind private networking.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>Walk me through what happens when I type a URL and hit enter.
+  <ol><li><em>Pointer:</em> DNS resolve → TCP handshake → TLS handshake → HTTP request → response render; name each RTT.</li></ol></li>
+<li>Why does TCP use a 3-way handshake and not 2?
+  <ol><li><em>Pointer:</em> both sides must exchange and ACK ISNs to sync sequence numbers and confirm bidirectional reachability.</li></ol></li>
+<li>What's in the SYN options and why do they matter?
+  <ol><li><em>Pointer:</em> MSS, window scale, SACK-permitted, timestamps — set at connect and fixed for the connection's life.</li></ol></li>
+<li>Explain flow control vs congestion control — different problems?
+  <ol><li><em>Pointer:</em> flow control protects the receiver (rwnd); congestion control protects the network (cwnd).</li></ol></li>
+<li>Slow start vs congestion avoidance — how does cwnd evolve on loss?
+  <ol><li><em>Pointer:</em> exponential to ssthresh, then linear AIMD; 3 dup-ACKs halve cwnd, timeout resets to 1.</li></ol></li>
+<li>CUBIC vs BBR — when does BBR hurt?
+  <ol><li><em>Pointer:</em> BBR probes bandwidth+RTT, ignores loss, can starve loss-based CUBIC flows at a shared bottleneck.</li></ol></li>
+<li>What is TIME_WAIT and why 2×MSL?
+  <ol><li><em>Pointer:</em> ensures stray retransmits die and the last ACK can be resent; prevents old-connection segment confusion.</li></ol></li>
+<li>How do you fix ephemeral port exhaustion?
+  <ol><li><em>Pointer:</em> connection pooling, keep-alive, tcp_tw_reuse, more source IPs; make server the passive closer.</li></ol></li>
+<li>Nagle + delayed ACK — how does the 40 ms stall arise?
+  <ol><li><em>Pointer:</em> sender holds small data waiting for ACK, receiver holds ACK waiting for data; deadlock until delayed-ACK timer fires.</li></ol></li>
+<li>Walk the TLS 1.3 handshake and how it's 1-RTT.
+  <ol><li><em>Pointer:</em> ClientHello carries key share; server responds with key share + cert + Finished; ECDHE derives session key.</li></ol></li>
+<li>What's the risk of 0-RTT and how do you mitigate it?
+  <ol><li><em>Pointer:</em> replay attacks on early data; only allow for idempotent requests, use single-use tickets/anti-replay windows.</li></ol></li>
+<li>How does the chain of trust actually validate a cert?
+  <ol><li><em>Pointer:</em> verify signature up the chain to a root in the trust store, check hostname/SAN, validity dates, revocation.</li></ol></li>
+<li>What is SNI and why did it break virtual hosting before?
+  <ol><li><em>Pointer:</em> server needs the hostname before it can pick a cert; SNI sends it in ClientHello (plaintext, hence ECH).</li></ol></li>
+<li>HTTP/2 solved HOL blocking — but not fully. Why HTTP/3?
+  <ol><li><em>Pointer:</em> H2 multiplexes over one TCP stream, so TCP-level loss still stalls all streams; QUIC has independent streams over UDP.</li></ol></li>
+<li>L4 vs L7 load balancing — cost and capability trade-offs?
+  <ol><li><em>Pointer:</em> L4 fast/protocol-agnostic/DSR; L7 HTTP-aware routing/retries/TLS term but more CPU + latency.</li></ol></li>
+<li>Why consistent hashing over round-robin for a cache tier?
+  <ol><li><em>Pointer:</em> minimizes key remapping when nodes change; only K/N keys move.</li></ol></li>
+<li>How does anycast give failover without DNS changes?
+  <ol><li><em>Pointer:</em> same IP announced from many PoPs via BGP; routers pick nearest healthy; withdraw route to failover.</li></ol></li>
+<li>How do you debug "connection hangs after handshake"?
+  <ol><li><em>Pointer:</em> classic PMTU black hole — ICMP filtered; test with ping -M do, clamp MSS.</li></ol></li>
+<li>What limits single-connection throughput on a long-fat network?
+  <ol><li><em>Pointer:</em> bandwidth-delay product vs window size; enable window scaling and bigger buffers.</li></ol></li>
+<li>How do you prevent retry storms during a partial outage?
+  <ol><li><em>Pointer:</em> retry budgets, jittered exponential backoff, circuit breakers, load shedding.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>After TCP → congestion &amp; reliability:</strong> "How does QUIC reimplement TCP features in userspace?", "What is SACK?", "How does BBR estimate the bottleneck?" — angle: reliability is an endpoint concern, QUIC moves it above UDP for faster iteration.</li>
+<li><strong>After TLS → crypto &amp; PKI:</strong> "Symmetric vs asymmetric — why both?", "What is forward secrecy?", "How does OCSP stapling work?", "What's certificate pinning and its risk?" — angle: asymmetric bootstraps a cheap symmetric session key.</li>
+<li><strong>After HTTP → API/protocol design:</strong> "gRPC over HTTP/2 benefits?", "REST vs gRPC vs GraphQL over the wire?", "WebSockets vs SSE vs long-poll?" — angle: multiplexing + binary framing enable streaming RPC.</li>
+<li><strong>After DNS → distributed systems:</strong> "How does GSLB do health-based routing?", "TTL vs consistency trade-off?", "How does DNS interact with service discovery (Consul/K8s CoreDNS)?" — angle: DNS is eventually consistent by design.</li>
+<li><strong>After load balancing → resilience:</strong> "How does connection draining work on deploy?", "Health-check flapping?", "How do you do zero-downtime deploys?" — angle: LBs are the control point for graceful rollout.</li>
+<li><strong>After latency → performance:</strong> "How does a CDN reduce latency?", "Edge compute?", "How do you measure p99 tail latency and where does it come from?" — angle: geography + queuing dominate the tail.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Scenario 1: Sudden spike in 502s after a deploy</h3>
+<table>
+<tr><th>Symptoms</th><td>L7 LB returns 502 for ~30 s after each rollout; error rate correlates with pod restarts.</td></tr>
+<tr><th>Investigation</th><td>Check LB upstream logs for "connection refused"/"reset"; compare pod readiness timing vs LB adding it to the pool; capture with tcpdump on a backend.</td></tr>
+<tr><th>Root Cause</th><td>Pods added to the LB pool before the app finished binding, and old pods killed without connection draining — in-flight requests reset.</td></tr>
+<tr><th>Solution</th><td>Add a readiness probe gating pool membership; enable connection draining / graceful shutdown with a preStop hook and SIGTERM grace period.</td></tr>
+<tr><th>Prevention</th><td>Rolling deploy with maxSurge, health-check based membership, drain timeout &gt; longest request.</td></tr>
+<tr><th>Interview Answer</th><td>"502s clustered around deploys pointed to lifecycle, not code — pods were routed to before ready and terminated without draining. I gated membership on a readiness probe and added graceful shutdown, eliminating the reset window."</td></tr>
+</table>
+
+<h3>Scenario 2: Intermittent 40 ms latency on internal RPC</h3>
+<table>
+<tr><th>Symptoms</th><td>p50 fine, but a bimodal p99 with a sharp cluster around 40 ms on small-payload RPCs.</td></tr>
+<tr><th>Investigation</th><td>tcpdump shows sender delaying a small segment; ACKs arriving ~40 ms late; the exact 40 ms is the tell.</td></tr>
+<tr><th>Root Cause</th><td>Nagle's algorithm on the sender interacting with delayed ACK on the receiver.</td></tr>
+<tr><th>Solution</th><td>Set <code>TCP_NODELAY</code> on the RPC sockets (or send full-sized writes).</td></tr>
+<tr><th>Prevention</th><td>Default TCP_NODELAY in the RPC framework; add a lint/config check.</td></tr>
+<tr><th>Interview Answer</th><td>"A quantized 40 ms tail is almost always Nagle plus delayed ACK. tcpdump confirmed the sender was coalescing tiny writes. TCP_NODELAY flattened p99."</td></tr>
+</table>
+
+<h3>Scenario 3: Total outage at midnight UTC</h3>
+<table>
+<tr><th>Symptoms</th><td>All clients fail simultaneously with TLS errors; no code deploy.</td></tr>
+<tr><th>Investigation</th><td><code>openssl s_client</code> shows "certificate has expired"; check leaf and intermediate <code>notAfter</code>.</td></tr>
+<tr><th>Root Cause</th><td>TLS certificate expired; auto-renewal job had silently failed weeks earlier.</td></tr>
+<tr><th>Solution</th><td>Rotate the cert immediately, reload the LB/edge.</td></tr>
+<tr><th>Prevention</th><td>Cert-expiry monitoring with paging &lt;14 days, ACME auto-renew with alerting on renewal failure, staggered expiries.</td></tr>
+<tr><th>Interview Answer</th><td>"A midnight-sharp global failure with no deploy screams cert expiry. openssl confirmed it. I rotated and reloaded, then added expiry alerting and fixed the silent renewal failure."</td></tr>
+</table>
+
+<h3>Scenario 4: Large responses hang on some clients only</h3>
+<table>
+<tr><th>Symptoms</th><td>Handshake and small responses work; large payloads hang and eventually time out, only for certain networks (often VPN/tunnel users).</td></tr>
+<tr><th>Investigation</th><td><code>ping -M do -s &lt;size&gt;</code> fails past a threshold; tcpdump shows retransmits of large packets, no ICMP "frag needed" returned.</td></tr>
+<tr><th>Root Cause</th><td>PMTU black hole — a middlebox has a smaller MTU and drops ICMP, so PMTU discovery fails.</td></tr>
+<tr><th>Solution</th><td>MSS clamping at the gateway (<code>iptables ... --clamp-mss-to-pmtu</code>) or lower the interface MTU.</td></tr>
+<tr><th>Prevention</th><td>Enable MSS clamping on tunnels by default; monitor for large-packet retransmits.</td></tr>
+<tr><th>Interview Answer</th><td>"Works small, hangs large, only on tunneled clients is a textbook PMTU black hole. I confirmed with DF-bit pings and fixed it by clamping MSS to the path MTU."</td></tr>
+</table>
+
+<h3>Scenario 5: Cascading failure amplified by retries</h3>
+<table>
+<tr><th>Symptoms</th><td>A downstream dependency slows slightly, then the whole tier collapses and won't recover even after the dependency heals.</td></tr>
+<tr><th>Investigation</th><td>LB/client metrics show request volume to the dependency multiplied 3-5x during the incident; connection counts pinned.</td></tr>
+<tr><th>Root Cause</th><td>Unbounded, unjittered retries turned a brownout into a metastable retry storm.</td></tr>
+<tr><th>Solution</th><td>Shed load, drain queues, restart to break the metastable state.</td></tr>
+<tr><th>Prevention</th><td>Retry budgets (cap retries as % of traffic), jittered exponential backoff, circuit breakers, deadline propagation.</td></tr>
+<tr><th>Interview Answer</th><td>"The tell was recovery lag — it stayed down after the trigger cleared, the signature of a metastable retry storm. I added retry budgets and circuit breakers so retries can't self-amplify."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Why are TCP initial sequence numbers randomized?</summary><p>If ISNs were predictable, an off-path attacker could forge segments with valid sequence numbers to inject data or reset connections (blind spoofing/RST attacks). RFC 6528 specifies deriving the ISN from a per-connection hash of the 4-tuple plus a secret and a clock, so ISNs are unpredictable to outsiders but still monotonically increasing enough to avoid wrapping ambiguity with old segments (PAWS uses timestamps for that).</p></details>
+  <details><summary>Explain exactly how cwnd, ssthresh, and rwnd interact to bound in-flight data.</summary><p>The sender may have at most <code>min(cwnd, rwnd)</code> unacknowledged bytes outstanding. <code>rwnd</code> is set by the receiver's advertised window (flow control). <code>cwnd</code> is the sender's estimate of network capacity. In slow start cwnd grows exponentially (≈ doubling per RTT) until it reaches <code>ssthresh</code>, then congestion avoidance grows it ~1 MSS per RTT (AIMD additive increase). On 3 duplicate ACKs, ssthresh = cwnd/2 and cwnd = ssthresh (fast recovery, multiplicative decrease). On RTO timeout, ssthresh = cwnd/2 but cwnd resets to 1 MSS and slow start restarts. The receiver never overflows because rwnd caps everything.</p></details>
+  <details><summary>How does BBR differ fundamentally from loss-based congestion control?</summary><p>Loss-based algorithms (Reno, CUBIC) treat packet loss as the congestion signal and back off on it — but on modern networks loss often comes from bufferbloat or wireless noise, not true congestion, so they either underutilize or fill buffers. BBR instead continuously estimates the bottleneck bandwidth (max delivery rate) and the minimum RTT (propagation delay), and paces sending at bandwidth×RTT — the actual bandwidth-delay product — keeping buffers nearly empty. This gives high throughput with low latency on long-fat and lossy links. The downside is unfairness: BBR can crowd out CUBIC flows at a shared bottleneck because it doesn't yield on loss.</p></details>
+  <details><summary>Walk through why TLS 1.3 is 1-RTT while 1.2 was 2-RTT.</summary><p>In TLS 1.2 the client sends ClientHello, the server responds with ServerHello + certificate + ServerKeyExchange + ServerHelloDone (RTT 1), then the client sends ClientKeyExchange + ChangeCipherSpec + Finished, and only after the server's Finished (RTT 2) can application data flow. TLS 1.3 removes the negotiation round trip by having the client speculatively include its ECDHE key share in the ClientHello for the groups it supports. The server picks one, sends its key share + encrypted cert + Finished in the ServerHello flight, and both sides can derive the handshake secret — so application data flows after 1 RTT. Resumption via PSK enables 0-RTT early data.</p></details>
+  <details><summary>Why is symmetric encryption used for the bulk of a TLS session if asymmetric is "more secure"?</summary><p>Asymmetric (public-key) crypto like RSA/ECDHE is ~100-1000x slower than symmetric AES and unsuitable for encrypting megabytes of data. So TLS uses asymmetric operations only during the handshake to authenticate the server and securely agree on a shared secret (via ECDHE), then derives a symmetric session key (AES-GCM/ChaCha20) for all bulk data. This is the hybrid cryptosystem: asymmetric for key establishment and authentication, symmetric for throughput. Forward secrecy comes from using ephemeral DH keys that are discarded after the session.</p></details>
+  <details><summary>Precisely, what causes HTTP/2 head-of-line blocking and how does HTTP/3 fix it?</summary><p>HTTP/2 multiplexes many logical streams over a single TCP connection. TCP delivers a strictly ordered byte stream, so if one segment is lost, the kernel holds back all subsequently received bytes — including those belonging to other HTTP/2 streams — until the retransmit arrives. So HTTP/2 solved application-layer HOL blocking but not transport-layer. HTTP/3 runs over QUIC (on UDP), which implements independent streams: loss on one stream only stalls that stream, others deliver immediately. QUIC also integrates TLS 1.3 into the transport handshake (1-RTT or 0-RTT) and supports connection migration across IP changes via connection IDs.</p></details>
+  <details><summary>Explain the full chain-of-trust validation a client performs on a server cert.</summary><p>The server presents its leaf cert plus intermediates. The client: (1) builds a chain from the leaf up to a root in its local trust store, verifying each cert's signature was made by the next cert's private key; (2) checks each cert's validity period (notBefore/notAfter); (3) checks the leaf's Subject Alternative Name matches the hostname (SNI); (4) checks key usage/extended key usage (serverAuth); (5) checks revocation via CRL or OCSP (ideally stapled). If any link fails — expired intermediate, missing chain, hostname mismatch, untrusted root — the handshake aborts. Browsers cache intermediates so they can succeed where a bare API client fails, which is why you must serve the full chain.</p></details>
+  <details><summary>How does anycast actually route a user to the nearest PoP, and how is failover instant?</summary><p>The same IP prefix is announced from multiple physical locations via BGP. Internet routers select the best path to that prefix using BGP attributes (AS-path length, local pref), which usually maps to the topologically nearest PoP. Packets to that IP land at whichever PoP the routing fabric prefers. For failover, a PoP simply withdraws its BGP announcement (or health-check automation does), and routers reconverge to the next-best PoP within seconds — no DNS change and no client TTL involved. It also disperses DDoS: attack traffic is absorbed across all PoPs rather than concentrated.</p></details>
+  <details><summary>Consistent hashing: why K/N keys move and how do virtual nodes help?</summary><p>Nodes and keys are hashed onto a ring; a key is served by the next node clockwise. When a node is added or removed, only the keys between it and its predecessor remap — approximately K/N keys for N nodes — versus a plain modulo hash where changing N remaps nearly everything. The problem is uneven distribution and load imbalance when a node leaves (its whole range dumps onto one neighbor). Virtual nodes fix this: each physical node is placed at many points on the ring, so its key range is spread across the ring and remapping is smooth. Used in Dynamo, Cassandra, Maglev, and memcached clients.</p></details>
+  <details><summary>What is the bandwidth-delay product and why does it cap single-flow throughput?</summary><p>BDP = bandwidth × RTT = the amount of data that can be "in flight" on the link at once. To fully utilize a link, the sender must have at least BDP bytes unacknowledged, which is bounded by the TCP window (min of cwnd and rwnd). If the window is smaller than BDP, the sender stalls waiting for ACKs and can't fill the pipe. Example: 1 Gbps × 100 ms = 12.5 MB — you need a 12.5 MB window. The classic 64 KB window (without scaling) caps you at ~5 Mbps on that path. Fix: TCP window scaling (RFC 1323) and large socket buffers (tcp_rmem/tcp_wmem).</p></details>
+  <details><summary>Why does TIME_WAIT live on the active closer, and how does it cause port exhaustion?</summary><p>The endpoint that sends the first FIN (active close) enters TIME_WAIT for 2×MSL (~60 s on Linux) after the connection closes. This ensures (a) delayed/duplicate segments from this connection expire before the same 4-tuple could be reused, and (b) if the final ACK is lost, the peer's retransmitted FIN can still be answered. Each TIME_WAIT socket holds its 4-tuple. A client opening many short-lived connections to the same server IP:port burns through the ~28K default ephemeral port range quickly, causing "cannot assign requested address". Fixes: connection pooling/keep-alive (best), tcp_tw_reuse (safe with timestamps for outbound), widen ip_local_port_range, or make the server the active closer.</p></details>
+  <details><summary>L4 vs L7 load balancer — what can each see and do?</summary><p>An L4 LB operates on IP:port and TCP/UDP — it forwards or NATs connections without looking at payload, so it's fast, protocol-agnostic, and can do Direct Server Return (response bypasses the LB). It can't route by URL or terminate TLS. An L7 LB terminates the connection, parses HTTP (and usually TLS), so it can route by host/path/header, do retries, rewrites, sticky sessions, rate limiting, and observability — at the cost of TLS-termination CPU and added latency, and it must handle both client-side and backend-side connections. Common pattern: L4 for ingress/DDoS/throughput, L7 behind it for smart routing.</p></details>
+  <details><summary>How do SYN cookies defend against SYN floods without breaking legitimate connections?</summary><p>Normally a SYN allocates a half-open connection entry in the SYN backlog; a flood of spoofed SYNs fills it and drops real clients. With SYN cookies, when the backlog is full the server does not allocate state — it encodes the connection parameters (MSS, timestamp, a hash of the 4-tuple + secret) into the ISN it puts in the SYN-ACK. If a real client responds with the ACK, that ACK carries seq = cookie+1, so the server reconstructs and validates the state from the cookie alone and builds the connection then. Spoofed SYNs never complete, so they cost nothing. The trade-off is that some TCP options can't be preserved, so it's used only under attack.</p></details>
+  <details><summary>How does OCSP stapling improve on plain OCSP?</summary><p>Plain OCSP requires the client to contact the CA's OCSP responder to check whether a cert is revoked, which adds latency, leaks browsing to the CA, and fails open if the responder is down (soft-fail = weak security). OCSP stapling has the server periodically fetch a signed, time-stamped OCSP response from the CA and "staple" it into the TLS handshake. The client gets revocation proof without a separate round trip, the CA doesn't see the client, and it scales because thousands of clients reuse one stapled response. OCSP Must-Staple in the cert forces the server to staple, closing the soft-fail gap.</p></details>
+  <details><summary>How does connection draining work during a zero-downtime deploy?</summary><p>When a backend is marked for removal, the LB stops sending it new connections but lets in-flight requests complete up to a drain timeout. In Kubernetes: the pod gets marked NotReady (removed from Service endpoints), receives SIGTERM, and a preStop hook plus terminationGracePeriodSeconds gives it time to finish active requests before SIGKILL. The app should stop accepting new work, finish outstanding requests, and close keep-alive connections with a Connection: close. Combined with a readiness probe gating pool entry on the new pods, you get overlap with no dropped requests. The drain timeout must exceed the longest expected request.</p></details>
+  <details><summary>Why can 0-RTT data be replayed, and what's the correct mitigation?</summary><p>0-RTT early data is sent with the first flight using a pre-shared key from a prior session, before the server has proven liveness for this specific handshake. An attacker who captures that encrypted early-data packet can resend it, and the server may process it again — because there's no fresh server nonce in the exchange yet to bind it to a single handshake. Mitigation: only allow 0-RTT for idempotent, safe requests (GET without side effects); implement anti-replay windows / single-use session tickets at the server; and never expose non-idempotent operations (payments, writes) to early data. Many stacks disable 0-RTT for anything but idempotent GETs by default.</p></details>
+</div>

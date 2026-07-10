@@ -1,0 +1,354 @@
+<h1>DNS <span class="tag express">Mastery</span></h1>
+<p>DNS is a globally distributed, hierarchical, eventually-consistent key-value store that maps names to records — but under interview pressure the real material is the resolution walk (stub → recursive → root → TLD → authoritative), the caching layers keyed by TTL, anycast, GSLB routing policies, DNSSEC's chain of trust, and why "it's always DNS" is empirically true. This page pushes past "DNS turns names into IPs" into RRSIG chains, negative caching via SOA minimum, Kaminsky poisoning, and CoreDNS in Kubernetes.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "DNS is a hierarchical, cached, UDP-first (port 53) lookup system that resolves a name to records. Your stub resolver asks a recursive resolver; on a cache miss the recursive does the iterative walk — root servers hand back the TLD nameservers, the TLD hands back the domain's authoritative nameservers, and the authoritative returns the actual answer. Every record carries a TTL, so answers are cached at the OS, browser, and resolver, which is why changes propagate slowly and unevenly. It's eventually consistent by design, favouring availability and read scale over freshness."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>The fuller answer names the pieces an interviewer fishes for:</p>
+<ul>
+  <li><strong>Actors:</strong> the <em>stub resolver</em> (in libc / the OS, does no recursion), the <em>recursive resolver</em> (8.8.8.8, 1.1.1.1, your ISP — does the work and caches), the <em>root</em> (13 named servers a–m.root-servers.net, anycast to 1500+ instances), the <em>TLD</em> servers (.com run by Verisign), and the <em>authoritative</em> nameservers for the zone.</li>
+  <li><strong>Query types:</strong> the stub sends a <em>recursive</em> query (RD bit set — "get me the final answer"); the recursive resolver performs <em>iterative</em> queries (RD ignored, servers return referrals, not answers).</li>
+  <li><strong>Caching:</strong> positive answers cached for their TTL; negative answers (NXDOMAIN) cached per the SOA <code>minimum</code> field (RFC 2308). Layered at browser (~60s Chrome), OS stub, and resolver — which is why low TTLs are honoured by resolvers but often ignored by clients.</li>
+  <li><strong>Records:</strong> A/AAAA (IPv4/IPv6), CNAME (alias, illegal at the zone apex → vendors offer ALIAS/ANAME), MX, TXT (SPF/DKIM/DMARC), SRV, NS, SOA, PTR (reverse via in-addr.arpa), CAA (which CAs may issue certs).</li>
+  <li><strong>Availability tricks:</strong> anycast puts the same IP in many locations and BGP routes you to the nearest; GSLB uses DNS to steer traffic with latency/geo/weighted/failover policies.</li>
+  <li><strong>Security:</strong> DNSSEC signs records (RRSIG/DNSKEY/DS, chain to the root KSK) to stop cache poisoning — it <em>authenticates</em>, it does not <em>encrypt</em>. DoT/DoH add the privacy/encryption on the wire.</li>
+  <li><strong>Transport:</strong> UDP/53 by default; falls back to TCP/53 when the response is truncated (TC bit) or too big, and for zone transfers (AXFR/IXFR). EDNS0 (OPT record) negotiates larger UDP payloads (typically 1232 bytes post-DNS-flag-day to avoid fragmentation).</li>
+</ul>
+
+<h2>Internal Working</h2>
+<ol>
+  <li><strong>Application call:</strong> the app calls <code>getaddrinfo()</code>; glibc's <em>stub resolver</em> checks <code>nsswitch.conf</code> order (files → dns), reads <code>/etc/hosts</code>, then <code>/etc/resolv.conf</code> for <code>nameserver</code> and <code>search</code>/<code>ndots</code> options.</li>
+  <li><strong>Query construction:</strong> the stub builds a DNS message: a 12-byte header (16-bit <code>ID</code>/txid, flags incl. <code>RD</code>=1, QDCOUNT/ANCOUNT/NSCOUNT/ARCOUNT) plus a Question section (QNAME, QTYPE, QCLASS=IN). It picks a random source UDP port and random txid (both anti-spoofing).</li>
+  <li><strong>Recursive resolver receives it:</strong> checks its cache. On a hit within TTL it answers immediately. On a miss it starts the iterative walk.</li>
+  <li><strong>Root query:</strong> resolver asks a root server (from its hardcoded root hints / priming query) for <code>www.example.com A</code>. Root returns a <em>referral</em>: the NS records for <code>com.</code> plus glue A/AAAA records in the Additional section.</li>
+  <li><strong>TLD query:</strong> resolver asks a <code>.com</code> TLD server; it returns a referral to <code>example.com</code>'s authoritative nameservers (again with glue).</li>
+  <li><strong>Authoritative query:</strong> resolver asks the zone's authoritative server, which returns the <em>answer</em> with the AA (authoritative answer) bit set and a TTL.</li>
+  <li><strong>Cache &amp; return:</strong> resolver caches each RRset by (name, type) for its TTL, then returns the final answer to the stub. The stub caches per the OS, and hands the IP to the app.</li>
+  <li><strong>Negative path:</strong> if the name doesn't exist, an authoritative server returns RCODE 3 (NXDOMAIN) with an SOA in the Authority section; the resolver caches the negative answer for min(SOA minimum, SOA TTL).</li>
+</ol>
+<div class="callout warn"><strong>Watch out:</strong> the header <code>ID</code> is only 16 bits (65 536 values). Before source-port randomization, that was the entire spoofing entropy — the root cause of the Kaminsky attack. Modern resolvers add ~16 bits of random source port for ~2^32 combined entropy, and DNS-0x20 (random case in QNAME) on top.</div>
+
+<h2>Why was this built?</h2>
+<ul>
+  <li>Pre-DNS, name→address mapping was a single file, <code>HOSTS.TXT</code>, maintained by SRI-NIC and downloaded by every host on ARPANET. It didn't scale: one authority, one file, growing collisions, and every change needed a central edit and a re-fetch.</li>
+  <li>Paul Mockapetris designed DNS in 1983 (RFC 882/883, later 1034/1035) to be <em>hierarchical</em> (delegated authority per zone), <em>distributed</em> (no single server holds everything), and <em>cached</em> (TTL-driven) so it could scale to the whole internet with local read performance.</li>
+  <li>The key insight: delegation. The root delegates <code>.com</code> to Verisign; Verisign delegates <code>example.com</code> to its owner. Each zone is administered independently, and caching means most lookups never touch the root at all.</li>
+</ul>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>Approach</th><th>How it maps names</th><th>When it wins over DNS</th></tr>
+  <tr><td><code>/etc/hosts</code> / HOSTS.TXT</td><td>Static local file</td><td>Tiny fixed set, local overrides, air-gapped hosts, test pinning</td></tr>
+  <tr><td>Service registry (Consul, Eureka, etcd)</td><td>API + health checks, push updates</td><td>Fast-changing internal microservices where you need sub-second convergence and health-aware routing (DNS TTL is too coarse)</td></tr>
+  <tr><td>Client-side LB with a control plane (Envoy/xDS)</td><td>Endpoints pushed to sidecars</td><td>You want per-request LB, circuit breaking, and instant endpoint changes without TTL lag</td></tr>
+  <tr><td>Anycast IP only (no name step)</td><td>BGP routes a fixed IP</td><td>You control routing at L3 and want zero resolution latency; but you lose per-client policy and human-readable names</td></tr>
+  <tr><td>Hardcoded IPs</td><td>None</td><td>Never in production — breaks failover, scaling, and cert rotation</td></tr>
+</table>
+<p>DNS wins because it's universal, cacheable, human-readable, and vendor-neutral. Most real systems use DNS <em>plus</em> a registry: DNS for the coarse public/edge layer, a registry or service mesh for fast-moving internal endpoints.</p>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Massive read scale via caching:</strong> a popular record served from millions of caches; origin authoritative load is a rounding error.</li>
+  <li><strong>Decentralised authority:</strong> each zone owner controls their records; no central bottleneck for edits.</li>
+  <li><strong>Availability-first:</strong> anycast + many authoritative servers + caching means DNS keeps answering even during partial outages (stale-but-serving).</li>
+  <li><strong>Universal indirection layer:</strong> change an IP without touching clients; enables blue/green, failover, and GSLB.</li>
+  <li><strong>Cheap and ubiquitous:</strong> every OS, language, and network device speaks it.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+  <li><strong>Eventual consistency:</strong> TTL + layered caches make propagation slow and uneven; you cannot reliably "instantly" move traffic.</li>
+  <li><strong>Coarse load balancing:</strong> DNS resolves to an IP per query, not per request; clients cache and stick, so weights are approximate.</li>
+  <li><strong>Client TTL disobedience:</strong> browsers, JVMs (<code>networkaddress.cache.ttl</code> historically ∞), and OS caches ignore low TTLs, breaking failover assumptions.</li>
+  <li><strong>Plaintext by default:</strong> UDP/53 is unencrypted and unauthenticated — enables surveillance and (without DNSSEC) poisoning.</li>
+  <li><strong>Blast radius:</strong> a bad zone push or a resolver outage takes down everything by name — the reason for the meme.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><strong>Low TTL vs cache efficiency:</strong> 30–60s TTL enables faster failover but multiplies resolver/authoritative query volume and raises latency on misses. High TTL (hours/days) is efficient but pins you to stale answers.</li>
+  <li><strong>Availability vs consistency (CAP):</strong> DNS deliberately picks AP — it serves cached/stale answers rather than fail, which is great for uptime and bad for correctness during changes.</li>
+  <li><strong>DNSSEC integrity vs complexity/fragility:</strong> signing prevents poisoning but adds key management, larger responses (fragmentation risk), and a whole class of validation-failure (SERVFAIL) outages.</li>
+  <li><strong>DoH privacy vs operator visibility:</strong> encrypting to a third-party resolver hides queries from the ISP but centralises them and breaks split-horizon/enterprise filtering.</li>
+  <li><strong>Anycast simplicity vs debugging:</strong> one IP everywhere is elegant but "which POP answered?" becomes a routing question.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out — anti-use-cases:</strong>
+<ul>
+  <li><strong>Per-request load balancing / instant failover.</strong> Client caches and non-compliant TTL handling make DNS LB approximate. Use an L4/L7 LB or service mesh for real balancing; keep DNS pointing at the LB's stable VIP/anycast IP.</li>
+  <li><strong>Fast-changing internal service endpoints</strong> (pods churning every few seconds). Use a service registry / mesh with push updates; DNS convergence is bounded below by TTL.</li>
+  <li><strong>Session stickiness or stateful routing.</strong> DNS has no notion of a session; it answers per lookup.</li>
+  <li><strong>Storing large or secret data in TXT records.</strong> TXT is abused as a config channel — but responses balloon, fragment, and are world-readable.</li>
+  <li><strong>Relying on DNS as your only health check.</strong> Basic DNS returns records regardless of backend health; you need GSLB with active health probes or a real LB.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A typical global topology: clients hit a recursive resolver, which walks the hierarchy to an anycast authoritative provider (Route 53 / NS1 / Cloudflare) that runs GSLB with health checks and routing policies, returning the IP of the closest healthy edge/LB.</p>
+<pre class="mermaid">
+flowchart TD
+  App["App getaddrinfo"] --> Stub["Stub resolver libc"]
+  Stub --> Rec["Recursive resolver cache"]
+  Rec -->|miss| Root["Root anycast a-m"]
+  Root -->|referral com| TLD["TLD servers Verisign"]
+  TLD -->|referral zone| Auth["Authoritative GSLB provider"]
+  Auth -->|A record healthy edge| Rec
+  Rec -->|answer TTL| Stub
+  Auth --> HC["Health checks probes"]
+  HC --> Edge["Edge LB nearest POP"]
+</pre>
+<p>The authoritative layer is where the intelligence lives: it holds health-check state and routing policy. On each query it decides which A record to return based on the client's resolver IP (or EDNS Client Subnet), latency maps, and endpoint health. The recursive resolver's cache is the enemy of fast failover here — which is why GSLB TTLs are typically 30–60s.</p>
+
+<h3>GSLB routing policies</h3>
+<table>
+  <tr><th>Policy</th><th>What it does</th><th>Typical use</th></tr>
+  <tr><td>Simple / weighted</td><td>Returns records by static weight (e.g. 90/10)</td><td>Canary, gradual migration</td></tr>
+  <tr><td>Latency-based</td><td>Returns the region with lowest measured latency to the resolver</td><td>Global apps minimising RTT</td></tr>
+  <tr><td>Geolocation</td><td>Routes by client country/continent</td><td>Data residency, localisation, licensing</td></tr>
+  <tr><td>Geoproximity</td><td>Routes by distance with an adjustable bias</td><td>Shifting load between regions</td></tr>
+  <tr><td>Failover</td><td>Primary until health check fails, then secondary</td><td>Active-passive DR</td></tr>
+  <tr><td>Multivalue</td><td>Returns several healthy records, client picks</td><td>Cheap health-aware round-robin</td></tr>
+</table>
+
+<h2>Production Problems</h2>
+<ul>
+  <li><strong>Stale records after a cutover:</strong> you lowered TTL too late; old caches still send traffic to the dead IP for hours. Fix: lower TTL <em>days</em> before the change.</li>
+  <li><strong>Negative-cache lockout:</strong> a record was queried before it existed; NXDOMAIN got cached for the SOA minimum (e.g. 3600s), so new records don't appear for an hour.</li>
+  <li><strong>Resolver overload / TTL stampede:</strong> a hot record's TTL expires and thousands of clients miss simultaneously, hammering the authoritative server (thundering herd).</li>
+  <li><strong>SERVFAIL from DNSSEC:</strong> an expired RRSIG or a KSK rollover gone wrong makes validating resolvers reject the whole zone.</li>
+  <li><strong>CNAME chains &amp; apex breakage:</strong> someone put a CNAME at the apex, or built a 6-deep CNAME chain adding lookups and latency.</li>
+  <li><strong>EDNS/fragmentation black holes:</strong> large signed responses fragment; a middlebox drops fragments; resolution intermittently fails until TCP fallback (which some firewalls also block on 53).</li>
+  <li><strong>ndots=5 in Kubernetes:</strong> every external lookup tries 4 cluster search-domain permutations first, quadrupling DNS QPS and adding latency.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code>dig +trace www.example.com          # walk root -&gt; TLD -&gt; authoritative yourself
+dig @8.8.8.8 example.com A          # ask a specific resolver, bypass local cache
+dig @1.1.1.1 example.com A +short   # just the answer
+dig example.com SOA                 # read the SOA minimum (negative TTL) and serial
+dig example.com NS                  # who is authoritative
+dig +dnssec example.com             # show RRSIG/AD flag (DNSSEC validated)
+dig -x 93.184.216.34                # reverse PTR lookup
+dig example.com A +tcp              # force TCP to test truncation/firewall
+dig example.com A +noedns           # test EDNS/fragmentation issues
+drill -TD example.com               # ldns: full DNSSEC chain-of-trust trace
+nslookup -type=MX example.com       # quick record check
+kdig +tls @1.1.1.1 example.com      # DoT (port 853) test
+dig +short CHAOS TXT id.server @ns   # which anycast instance answered</code></pre>
+<ul>
+  <li><strong>Read the flags:</strong> <code>aa</code> = authoritative answer, <code>ad</code> = DNSSEC-authenticated, <code>tc</code> = truncated (retry TCP), <code>ra</code> = recursion available.</li>
+  <li><strong>Read the RCODE:</strong> NOERROR, NXDOMAIN (name doesn't exist), SERVFAIL (resolver/validation failure — often DNSSEC or upstream), REFUSED (server won't answer you).</li>
+  <li><strong>Compare resolvers:</strong> if <code>@8.8.8.8</code> works but your resolver doesn't, it's a local cache/resolver problem, not the zone.</li>
+  <li><strong>Check propagation:</strong> query multiple authoritative NS directly (<code>dig @ns1... @ns2...</code>) to confirm they agree; mismatched serials mean a stalled zone transfer.</li>
+  <li><strong>Capture the wire:</strong> <code>tcpdump -ni any port 53 or port 853</code> to see actual queries, retries, and TCP fallback.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<table>
+  <tr><th>Metric</th><th>What it means</th><th>Healthy / alert</th></tr>
+  <tr><td>Resolution latency p50/p99</td><td>Time to answer a query</td><td>Cache hit &lt;1ms; miss p99 &lt;100ms; alert &gt;250ms</td></tr>
+  <tr><td>Cache hit ratio</td><td>Answered from cache vs walked</td><td>&gt;85% healthy; drop = TTL too low or churn</td></tr>
+  <tr><td>SERVFAIL rate</td><td>Failed resolutions</td><td>&lt;0.1%; spike = DNSSEC/upstream/overload</td></tr>
+  <tr><td>NXDOMAIN rate</td><td>Non-existent name queries</td><td>Baseline-relative; spike = typos, misconfig, or DGA malware</td></tr>
+  <tr><td>QPS per authoritative NS</td><td>Query load</td><td>Alert on sudden 5–10x (stampede / DDoS)</td></tr>
+  <tr><td>Zone serial lag</td><td>Secondary vs primary SOA serial</td><td>All NS equal; alert if lag &gt; 1 transfer interval</td></tr>
+  <tr><td>RRSIG expiry headroom</td><td>Days until signatures expire</td><td>Alert &lt; 7 days (re-sign well before)</td></tr>
+  <tr><td>TCP fallback ratio</td><td>Truncated responses forcing TCP</td><td>Low; rising = oversized responses / EDNS issues</td></tr>
+  <tr><td>UDP truncation / EDNS failures</td><td>Fragmentation black holes</td><td>Near zero</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>DNS scales on two axes: <em>read scale</em> via caching (TTL) and <em>availability/proximity</em> via anycast + many authoritative servers. The authoritative provider fronts the same IP from dozens of POPs; BGP steers each resolver to the nearest, absorbing volumetric DDoS by spreading it geographically.</p>
+<pre class="mermaid">
+flowchart LR
+  R1["Resolver EU"] --> A["Anycast IP one address"]
+  R2["Resolver US"] --> A
+  R3["Resolver APAC"] --> A
+  A --> P1["POP Frankfurt"]
+  A --> P2["POP Virginia"]
+  A --> P3["POP Singapore"]
+  P1 --> Z["Zone data replicated"]
+  P2 --> Z
+  P3 --> Z
+</pre>
+<ul>
+  <li><strong>Caching is the primary scaler:</strong> a 1-hour TTL means the authoritative sees ~1 query/hour/resolver for that record regardless of downstream volume.</li>
+  <li><strong>Anycast</strong> gives near-linear capacity by adding POPs and near-zero added latency; it's also the main volumetric-DDoS defence.</li>
+  <li><strong>Serve-stale (RFC 8767):</strong> resolvers keep answering with expired data if the authoritative is unreachable — trades freshness for availability.</li>
+  <li><strong>Prefetch / async refresh:</strong> resolvers refresh popular records before TTL expiry to avoid the stampede on a hot miss.</li>
+  <li><strong>Multiple authoritative providers</strong> (e.g. Route 53 + NS1) removes the single-provider blast radius exposed by the 2016 Dyn outage.</li>
+</ul>
+
+<h2>Security</h2>
+<ul>
+  <li><strong>Cache poisoning (Kaminsky, 2008):</strong> attacker races the real answer with spoofed responses guessing txid. Mitigations: 16-bit txid <em>plus</em> source-port randomization (~2^32 entropy), DNS-0x20 case randomization, and ultimately DNSSEC.</li>
+  <li><strong>DNSSEC (chain of trust):</strong> each RRset is signed → RRSIG; the public key is a DNSKEY; the parent zone holds a DS record (hash of the child's key-signing key); the chain climbs to the root KSK, whose trust anchor is shipped with resolvers. Validating resolvers set the AD bit. It authenticates and guarantees integrity — it does <em>not</em> encrypt, and it enables zone-walking unless NSEC3 is used.</li>
+  <li><strong>DoT (853) / DoH (443):</strong> encrypt the stub↔resolver hop against eavesdropping and tampering. DoH hides inside HTTPS so it can't be blocked by port; both centralise trust in the chosen resolver.</li>
+  <li><strong>Amplification DDoS:</strong> small spoofed query → large response (ANY, DNSSEC) reflected at a victim. Mitigations: disable open recursion, Response Rate Limiting (RRL), refuse ANY, BCP38 anti-spoofing.</li>
+  <li><strong>Domain/registrar hijack &amp; NS takeover:</strong> registrar-lock, DNSSEC, and CAA records (limit which CAs issue certs) reduce hijack impact.</li>
+  <li><strong>Dangling records / subdomain takeover:</strong> a CNAME pointing at a deprovisioned cloud bucket/app lets an attacker claim it. Audit and remove stale records.</li>
+  <li><strong>Data exfiltration via DNS tunnelling:</strong> encode payloads in QNAMEs to a controlled authoritative server; detect via entropy/volume of TXT/long-label queries.</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+  <li><strong>Latencies:</strong> cache hit tens of microseconds to a low ms; cold full walk 4 round trips (root→TLD→auth→answer) often 50–200ms depending on geography. This is why the first request to a new host is slow.</li>
+  <li><strong>UDP payload limit:</strong> classic 512 bytes; EDNS0 negotiates larger, but post-2020 DNS flag day the safe default is 1232 bytes to avoid IP fragmentation. Bigger → truncation → TCP fallback (extra RTT + handshake).</li>
+  <li><strong>Connection reuse:</strong> DoT/DoH keep TCP/TLS sessions open (TFO, 0-RTT) to amortise handshake cost across many queries.</li>
+  <li><strong>Tuning knobs:</strong> TTL (freshness vs QPS), <code>ndots</code> in Kubernetes (drop from 5 to 1–2 for external-heavy pods), resolver cache size and prefetch, EDNS buffer size, and negative-cache TTL via SOA minimum.</li>
+  <li><strong>NodeLocal DNSCache</strong> in Kubernetes runs a per-node cache (169.254.20.10) to cut CoreDNS QPS, avoid conntrack races, and drop tail latency; force TCP upstream to sidestep UDP conntrack bugs.</li>
+  <li><strong>Throughput:</strong> a tuned CoreDNS/BIND/Unbound instance handles tens to hundreds of thousands of QPS per core; the bottleneck is usually cache misses hitting upstream, not local CPU.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<ul>
+  <li><strong>Lowering TTL at cutover time.</strong> Fix: lower it days ahead — the old high TTL is still cached everywhere.</li>
+  <li><strong>Expecting instant failover from DNS.</strong> Fix: use a load balancer / anycast VIP for real failover; DNS moves traffic in TTL-scale time.</li>
+  <li><strong>CNAME at the zone apex.</strong> Fix: use the provider's ALIAS/ANAME (or A record); a CNAME at apex conflicts with the mandatory SOA/NS records.</li>
+  <li><strong>Trusting client TTL compliance.</strong> Fix: assume JVM/browser/OS pin longer than your TTL; design failover to tolerate it.</li>
+  <li><strong>Forgetting to re-sign / rotate DNSSEC keys.</strong> Fix: automate RRSIG resigning and KSK/ZSK rollover; alert on expiry headroom.</li>
+  <li><strong>Wildcards masking NXDOMAIN.</strong> Fix: understand a <code>*.example.com</code> wildcard answers everything, hiding typos and takeover risk.</li>
+  <li><strong>Single authoritative provider.</strong> Fix: multi-provider NS delegation to survive a provider outage.</li>
+  <li><strong>Debugging via the OS cache.</strong> Fix: query authoritative NS directly with <code>dig @ns</code> to see truth, not a stale cache.</li>
+</ul>
+
+<h2>Real-world Examples</h2>
+<table>
+  <tr><th>Company</th><th>How they likely use DNS</th></tr>
+  <tr><td>Google</td><td>Runs 8.8.8.8 public recursive resolver on global anycast; authoritative for google.com; heavy EDNS Client Subnet use to steer users to the nearest Google front-end.</td></tr>
+  <tr><td>Amazon</td><td>Route 53 is a managed authoritative + GSLB service with health checks and latency/geo/weighted/failover routing; internally uses private hosted zones and split-horizon DNS across VPCs.</td></tr>
+  <tr><td>Netflix</td><td>Likely uses multi-provider authoritative DNS (post-Dyn) with latency-based routing to Open Connect edge appliances embedded in ISPs; low TTLs for fast regional shifts.</td></tr>
+  <tr><td>Uber</td><td>Likely uses DNS-based GSLB across regions for API endpoints plus internal service discovery (Consul/mesh) for microservices where DNS TTL is too coarse.</td></tr>
+  <tr><td>Swiggy</td><td>Likely CDN + GSLB DNS to route users to the nearest edge/region during peak dinner load, with geo routing for city-level backends.</td></tr>
+  <tr><td>PhonePe</td><td>Likely split-horizon/private DNS inside their data centres for internal services, with strict CAA and DNSSEC on public payment domains for anti-hijack.</td></tr>
+  <tr><td>Razorpay</td><td>Likely uses CAA to lock cert issuance, DMARC/DKIM/SPF TXT records for email deliverability, and failover routing for payment API availability.</td></tr>
+  <tr><td>Atlassian</td><td>Likely uses geo/latency routing for Jira/Confluence Cloud tenants across regions, data-residency-driven geolocation policies, and CNAME chains to CDN.</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+  <li>What actually happens when you type a URL and press enter (DNS part)?
+    <ol><li>Stub → recursive → root → TLD → authoritative; cache checked at each layer.</li></ol></li>
+  <li>Recursive vs iterative query — who does which?
+    <ol><li>Stub sends recursive (RD=1); recursive resolver does iterative walks receiving referrals.</li></ol></li>
+  <li>Where is DNS cached and for how long?
+    <ol><li>Browser, OS stub, recursive resolver — each up to the record TTL; negative answers per SOA minimum.</li></ol></li>
+  <li>Why is DNS propagation slow and uneven?
+    <ol><li>Independent caches expire on their own TTL clocks; clients ignore low TTLs — no global invalidation.</li></ol></li>
+  <li>Why can't you put a CNAME at the zone apex?
+    <ol><li>Apex must hold SOA/NS; CNAME must be the only record for a name — conflict. Use ALIAS/ANAME.</li></ol></li>
+  <li>How is negative caching implemented?
+    <ol><li>NXDOMAIN + SOA in Authority section; cached for min(SOA minimum, SOA TTL) per RFC 2308.</li></ol></li>
+  <li>What is the SOA minimum field really for?
+    <ol><li>Since RFC 2308 it's the negative-cache TTL, not the zone-wide default TTL.</li></ol></li>
+  <li>How does DNS-based load balancing work and where does it fail?
+    <ol><li>Multiple A records / GSLB policy; fails because clients cache and ignore TTL — not per-request.</li></ol></li>
+  <li>What is anycast and how does it help DNS?
+    <ol><li>Same IP announced from many POPs via BGP; nearest answers — proximity + DDoS absorption.</li></ol></li>
+  <li>Explain DNSSEC's chain of trust.
+    <ol><li>RRSIG signs RRsets, DNSKEY holds keys, parent DS hashes child KSK, chain to root trust anchor.</li></ol></li>
+  <li>Does DNSSEC encrypt? What does?
+    <ol><li>No — it authenticates/integrity only. DoT (853) and DoH (443) encrypt.</li></ol></li>
+  <li>Walk me through the Kaminsky attack and its mitigation.
+    <ol><li>Race spoofed answers guessing txid; mitigated by source-port + txid + 0x20 randomization, and DNSSEC.</li></ol></li>
+  <li>What causes SERVFAIL?
+    <ol><li>Upstream failure, resolver overload, or DNSSEC validation failure (expired RRSIG / broken chain).</li></ol></li>
+  <li>How does CoreDNS resolve <code>svc.namespace.svc.cluster.local</code>?
+    <ol><li>Plugin reads the kubernetes API; A for ClusterIP, headless returns pod IPs, SRV for ports.</li></ol></li>
+  <li>Why does ndots=5 hurt Kubernetes DNS performance?
+    <ol><li>External names try 4 cluster search domains first → 4x wasted queries and added latency.</li></ol></li>
+  <li>How do you do a zero-downtime DNS migration?
+    <ol><li>Lower TTL days ahead, dual-run, flip records, watch traffic drain, restore TTL after.</li></ol></li>
+  <li>How would you debug "the site is down but the server is fine"?
+    <ol><li><code>dig +trace</code>, compare resolvers, query authoritative directly, check RCODE/flags, tcpdump 53.</li></ol></li>
+  <li>What is a TTL stampede and how do you prevent it?
+    <ol><li>Synchronised misses on a hot record; prevent with prefetch, jitter, serve-stale, higher TTL.</li></ol></li>
+  <li>Why run multiple authoritative DNS providers?
+    <ol><li>Single-provider outage (Dyn 2016) takes down everything by name; multi-provider removes that SPOF.</li></ol></li>
+  <li>What are DoH's downsides despite privacy gains?
+    <ol><li>Centralises queries to one resolver, breaks enterprise/split-horizon filtering, hides from network ops.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+  <li><strong>TCP/UDP &amp; transport:</strong> "Why UDP for DNS, when TCP?" — expect UDP/53 default, TCP on truncation (TC bit), AXFR, and large/DNSSEC responses; EDNS0 buffer sizing.</li>
+  <li><strong>TLS/certificates:</strong> "How does CAA relate to certs?" — CAA restricts which CAs may issue; ACME/Let's Encrypt uses DNS-01 challenge (TXT record) to prove domain control.</li>
+  <li><strong>CDN &amp; edge:</strong> "How does a CDN pick the edge?" — CNAME to the CDN, then GSLB/anycast + EDNS Client Subnet resolves to the nearest POP.</li>
+  <li><strong>Load balancing:</strong> "DNS LB vs L4/L7 LB vs service mesh" — coarse/cached vs per-connection vs per-request with health and policy.</li>
+  <li><strong>Kubernetes:</strong> "How does service discovery work?" — CoreDNS, ClusterIP vs headless, SRV records, ndots, NodeLocal DNSCache.</li>
+  <li><strong>Email:</strong> "How does email auth use DNS?" — MX for routing, SPF (allowed senders), DKIM (public key), DMARC (policy) all as TXT/records.</li>
+  <li><strong>Consistency models:</strong> "Is DNS strongly consistent?" — no, eventually consistent, AP in CAP terms; ties to caching and TTL.</li>
+  <li><strong>Security:</strong> "How do you prevent hijack/poisoning?" — DNSSEC, registrar lock, CAA, port randomization, DoT/DoH.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Incident 1 — DNS cutover left half the traffic on the old server for hours</h3>
+<table>
+  <tr><th>Symptoms</th><td>After flipping the A record, ~40% of requests still hit the decommissioned host; errors climbing.</td></tr>
+  <tr><td>Investigation</td><td>Old record's TTL was 86400; <code>dig @variousresolvers</code> showed many still serving the old IP; JVM clients cached indefinitely.</td></tr>
+  <tr><td>Root cause</td><td>TTL was lowered the same day as the change, so the old long-TTL answer was still cached everywhere.</td></tr>
+  <tr><td>Solution</td><td>Kept the old host up as a proxy to the new one until caches drained; forced JVM <code>networkaddress.cache.ttl=60</code>.</td></tr>
+  <tr><td>Prevention</td><td>Lower TTL to 60s at least 2× the old TTL before any planned change; verify TTL propagation before cutover.</td></tr>
+  <tr><td>Interview answer</td><td>"DNS changes are gated by the <em>previously cached</em> TTL. You must lower it well in advance, and design failover to tolerate clients that ignore TTL entirely."</td></tr>
+</table>
+
+<h3>Incident 2 — New subdomain returns NXDOMAIN for an hour after creation</h3>
+<table>
+  <tr><th>Symptoms</th><td>Just-created <code>api2.example.com</code> is unreachable for ~60 min despite the record existing at the authoritative.</td></tr>
+  <tr><td>Investigation</td><td><code>dig @auth</code> returns the record, but <code>dig @8.8.8.8</code> returns NXDOMAIN; SOA minimum was 3600.</td></tr>
+  <tr><td>Root cause</td><td>A health check queried the name before it existed; the NXDOMAIN got negatively cached for the SOA minimum.</td></tr>
+  <tr><td>Solution</td><td>Waited out / flushed resolver negative cache; created records before any component probes them.</td></tr>
+  <tr><td>Prevention</td><td>Set a modest SOA minimum (e.g. 300s); provision DNS records before deploying dependents.</td></tr>
+  <tr><td>Interview answer</td><td>"Negative answers are cached too, keyed by the SOA minimum. Query a name before it exists and you've poisoned the cache with NXDOMAIN for that duration."</td></tr>
+</table>
+
+<h3>Incident 3 — Zone-wide SERVFAIL after a DNSSEC key rollover</h3>
+<table>
+  <tr><th>Symptoms</th><td>Validating resolvers (8.8.8.8, 1.1.1.1) return SERVFAIL for the whole zone; non-validating resolvers work.</td></tr>
+  <tr><td>Investigation</td><td><code>dig +dnssec</code> shows RRSIG present; <code>drill -TD</code> shows the DS at the parent no longer matches the current DNSKEY.</td></tr>
+  <tr><td>Root cause</td><td>KSK was rolled without updating the DS record at the registrar/parent — chain of trust broken.</td></tr>
+  <tr><td>Solution</td><td>Published the correct DS at the parent (or rolled back to the old KSK) and waited for the parent TTL.</td></tr>
+  <tr><td>Prevention</td><td>Use double-signing / RFC 5011 automated rollovers; alert on DS/DNSKEY mismatch and RRSIG expiry headroom.</td></tr>
+  <tr><td>Interview answer</td><td>"DNSSEC failures are all-or-nothing: a broken chain makes validating resolvers reject the entire zone with SERVFAIL, while non-validating ones still work — a classic 'works for me' trap."</td></tr>
+</table>
+
+<h3>Incident 4 — Kubernetes latency spike traced to DNS</h3>
+<table>
+  <tr><th>Symptoms</th><td>Service-to-external-API calls show +150ms p99; CoreDNS pods CPU-bound and QPS 5× baseline.</td></tr>
+  <tr><td>Investigation</td><td><code>tcpdump</code> in a pod shows 4 failed lookups (<code>.svc.cluster.local</code>, <code>.cluster.local</code>, etc.) before the real one; ndots=5.</td></tr>
+  <tr><td>Root cause</td><td>Default ndots=5 forces the resolver to try every search domain before treating the FQDN as absolute.</td></tr>
+  <tr><td>Solution</td><td>Appended a trailing dot to external names / set <code>dnsConfig</code> ndots=2; deployed NodeLocal DNSCache.</td></tr>
+  <tr><td>Prevention</td><td>Use FQDNs for external calls, tune ndots per workload, cache locally on each node, force TCP upstream.</td></tr>
+  <tr><td>Interview answer</td><td>"In Kubernetes, ndots=5 means an external name generates several wasted cluster-domain queries first; the fix is FQDNs, lower ndots, and a node-local cache."</td></tr>
+</table>
+
+<h3>Incident 5 — Third-party authoritative provider DDoS takes the whole product down</h3>
+<table>
+  <tr><th>Symptoms</th><td>Every service unreachable by name simultaneously; servers healthy; "it's always DNS."</td></tr>
+  <tr><td>Investigation</td><td>Authoritative provider status page reports a volumetric attack; queries to their NS time out globally.</td></tr>
+  <tr><td>Root cause</td><td>Single authoritative DNS provider was a single point of failure (the Dyn 2016 pattern).</td></tr>
+  <tr><td>Solution</td><td>Added a second authoritative provider and split NS delegation across both; raised TTLs to ride out future blips.</td></tr>
+  <tr><td>Prevention</td><td>Multi-provider authoritative DNS, anycast, higher TTLs for stable records, serve-stale on resolvers.</td></tr>
+  <tr><td>Interview answer</td><td>"Names are the ultimate SPOF — if resolution fails, everything fails. Run at least two independent authoritative providers and keep TTLs high enough to survive a provider outage."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>Trace a full cold resolution of www.shop.example.com A, naming every message.</summary><p>The stub builds a query (txid, RD=1, QNAME=www.shop.example.com, QTYPE=A) and sends it to the recursive resolver. Cache miss. The resolver sends an iterative query to a root server (chosen from root hints); the root returns a referral: NS records for <code>com.</code> plus glue A records in Additional (no answer, AA unset). The resolver queries a <code>.com</code> TLD server, which refers it to <code>example.com</code>'s authoritative NS with glue. The resolver queries those; the zone may have <code>shop.example.com</code> delegated (another referral) or answer directly. The authoritative returns the A record with AA=1 and a TTL. The resolver caches each RRset by (name,type) for its TTL and returns the answer. Four RTTs worst case, but every step is independently cacheable so subsequent lookups skip most of it.</p></details>
+  <details><summary>Why exactly can't a CNAME live at the zone apex, and what do ALIAS/ANAME do differently?</summary><p>RFC 1034 says a CNAME must be the <em>only</em> record for a name — no other RRsets may coexist. The apex (example.com) is required to carry SOA and NS records, so a CNAME there is illegal. ALIAS/ANAME are a provider-side trick: the authoritative server resolves the target internally and synthesizes A/AAAA answers at query time, so from the wire it looks like normal A records at the apex while behaving like a CNAME operationally. The cost is the provider does the extra lookup and you rely on their resolution/health.</p></details>
+  <details><summary>Explain the DNSSEC chain of trust record by record.</summary><p>Each RRset (say the A records) is signed with the Zone Signing Key producing an RRSIG covering that RRset with an inception/expiry. The ZSK and KSK public keys are published as DNSKEY records; the KSK signs the DNSKEY RRset. The parent zone publishes a DS record — a hash of the child's KSK. To validate, a resolver fetches the A + RRSIG, the DNSKEY + its RRSIG, verifies the RRSIG with the DNSKEY, then verifies the DNSKEY against the parent's DS, and repeats up to the root, whose KSK is a pre-installed trust anchor. Success sets the AD bit. Any broken link → SERVFAIL. Note it authenticates only; the data is still plaintext, and NSEC records can enable zone-walking (NSEC3 hashes names to mitigate).</p></details>
+  <details><summary>Walk through the Kaminsky attack and precisely why the mitigations work.</summary><p>Pre-2008, a resolver's only spoofing entropy was the 16-bit txid. Kaminsky's insight: instead of poisoning one record and waiting for its TTL, trigger lookups for many non-existent subdomains (a1, a2, ...) and, for each, race spoofed referrals that inject a malicious NS/glue for the parent — no TTL to wait out, near-unlimited attempts. With only 65k txids, an attacker wins quickly. Mitigation adds ~16 bits of random source port (the attacker must guess port <em>and</em> txid ≈ 2^32) and DNS-0x20 (randomising QNAME case adds bits). This makes brute-forcing infeasible in the response window. DNSSEC removes the attack entirely because forged records fail signature validation. This is why source-port randomization was an emergency patch across all resolvers in 2008.</p></details>
+  <details><summary>How does DNS-based GSLB actually decide what to return, and what's its blind spot?</summary><p>The authoritative GSLB server holds live health-check state and a routing policy. On each query it inspects the source (the recursive resolver's IP, or the client subnet via EDNS Client Subnet), consults latency maps / geo databases / weights, filters to healthy endpoints, and returns the chosen A record(s) with a short TTL. The blind spot: it sees the <em>resolver's</em> location, not the client's — a user on 8.8.8.8 may be routed by Google's anycast egress, not their home. ECS partially fixes this by passing a truncated client subnet. And because clients cache the answer, GSLB decisions are sticky for the TTL regardless of changing conditions.</p></details>
+  <details><summary>Design a zero-downtime migration of a high-traffic domain to a new IP.</summary><p>Weeks ahead: confirm current TTL and lower it in stages down to 30–60s, waiting each time for at least the old TTL to elapse so caches pick up the shorter value. Stand up the new target and dual-run: keep the old IP serving (ideally proxying to new) so both work. Flip the A record; monitor traffic draining from old to new over ~2× the low TTL. Because some clients (JVM, browsers) ignore TTL, keep the old endpoint alive for a long tail — hours to days — as a proxy. Once traffic on old is negligible, decommission and restore a sane TTL. Never rely on DNS alone for the instant part; if you need instant, front both with an anycast VIP/LB and flip at that layer.</p></details>
+  <details><summary>What's the difference between recursive and iterative, and why do stub resolvers not recurse?</summary><p>A recursive query (RD=1) means "do all the work and give me the final answer" — the recursive resolver accepts responsibility for the whole walk. An iterative query means "give me your best answer or a referral" — servers return NS referrals rather than chasing them. Stub resolvers are intentionally minimal: they live in libc on every device, have no cache hierarchy, root hints, or DNSSEC validation machinery, and offloading recursion to a shared resolver maximises cache hit ratio across all clients. Making every stub recurse would hammer root/TLD servers and destroy caching benefits.</p></details>
+  <details><summary>Why is DNS eventually consistent, and how would you reason about it in CAP terms?</summary><p>There is no global invalidation — each cache independently expires entries on its own TTL clock, and clients may ignore TTLs. So after a change, different observers see different answers for a window bounded by the largest cached TTL. In CAP terms DNS chooses AP: during partitions or origin unavailability, resolvers keep serving cached/stale answers (serve-stale, RFC 8767) rather than failing. You get high availability and read scalability at the cost of freshness/consistency — which is the correct trade for a naming layer the whole internet depends on.</p></details>
+  <details><summary>Explain EDNS0, the DNS flag day, and fragmentation black holes.</summary><p>Classic DNS caps UDP responses at 512 bytes. EDNS0 adds a pseudo-OPT record letting client and server advertise a larger UDP buffer (e.g. 4096). But large UDP responses get IP-fragmented, and many middleboxes/firewalls drop fragments, causing intermittent, hard-to-debug failures — worsened by DNSSEC's big signed responses. The 2020 DNS flag day standardised a conservative default buffer of 1232 bytes (fits within typical MTU minus headers, avoiding fragmentation); anything larger sets the TC bit forcing TCP fallback. Debug with <code>dig +noedns</code>, <code>+bufsize=1232</code>, and forcing <code>+tcp</code>.</p></details>
+  <details><summary>How does CoreDNS resolve services in Kubernetes, including headless and SRV?</summary><p>CoreDNS runs with the <code>kubernetes</code> plugin watching the API for Services/Endpoints. A normal (ClusterIP) service <code>svc.ns.svc.cluster.local</code> resolves via an A record to the stable virtual ClusterIP (kube-proxy then load-balances). A <em>headless</em> service (clusterIP: None) returns one A record per ready pod, so clients see the actual pod IPs — used for stateful sets / client-side LB. SRV records <code>_port._proto.svc.ns.svc.cluster.local</code> expose named ports with priority/weight/port/target, letting clients discover both host and port. Pods get a resolv.conf with search domains and ndots=5, which is why external names need care.</p></details>
+  <details><summary>What is a TTL stampede / thundering herd on DNS, and how do you prevent it?</summary><p>When a very popular record's TTL expires, every downstream client/resolver misses at nearly the same instant and floods the authoritative server with simultaneous queries — a self-inflicted DDoS. Prevention: resolver-side prefetch (refresh hot records asynchronously just before expiry), TTL jitter so entries don't all expire together, serve-stale to answer with expired data while refreshing, request coalescing (dedupe concurrent identical queries into one upstream), and simply higher TTLs for stable records. Same pattern as cache stampede in application caches.</p></details>
+  <details><summary>Why do people say "it's always DNS," and what makes DNS failures so pernicious?</summary><p>Because DNS sits under everything: every service call, TLS handshake, and API request starts with a name lookup, so a DNS fault manifests as a total, cross-service outage while the servers themselves look healthy — the misleading part. It's also full of silent, delayed failure modes: cached stale/negative answers, TTLs you can't retroactively shorten, DNSSEC chains that fail all-or-nothing, ndots amplification, resolver overload, and single-provider blast radius (Dyn 2016). The failures are distributed, time-delayed, and cache-dependent, so 'works for me' is common and root-causing requires querying authoritative servers directly rather than trusting caches.</p></details>
+  <details><summary>Compare DoT and DoH — when would you pick each?</summary><p>Both encrypt the stub↔resolver hop with TLS. DoT runs on a dedicated port 853, so network operators can see (and choose to allow/block) DNS-over-TLS as a distinct protocol — cleaner for enterprise policy and observability. DoH tunnels DNS inside normal HTTPS on 443, indistinguishable from web traffic, so it's censorship-resistant and browser-native but harder for operators to manage and it can bypass local resolvers/split-horizon. Pick DoT for managed/enterprise networks that still want visibility; pick DoH for user-privacy against on-path ISPs. Both centralise trust in the chosen resolver and neither replaces DNSSEC (encryption ≠ authentication of the data's origin).</p></details>
+  <details><summary>How would you architect DNS to survive the loss of an entire authoritative provider?</summary><p>Delegate the zone to nameservers from two independent providers (e.g. Route 53 + NS1), each on its own anycast network, and keep both zones in sync via automation or a common source of truth. Resolvers will try the other provider's NS if one set times out. Keep TTLs high enough for stable records that resolvers ride through a multi-minute provider blip on cache. Enable serve-stale on your own resolvers. Add anycast and RRL for DDoS resilience, and monitor per-provider query success so you detect a degraded provider before it fails fully. This directly addresses the Dyn 2016 lesson: a single authoritative provider is a single point of failure for your entire product.</p></details>
+  <details><summary>A record change 'isn't propagating.' Walk me through your diagnosis.</summary><p>First, confirm the source of truth: <code>dig @authoritative-ns record</code> — is the new value actually published, and do all authoritative NS agree (compare SOA serials)? If they disagree, it's a zone-transfer/sync issue at the authoritative layer. If they agree, the delay is caching: check the record's TTL and how long ago it changed — the old value lives until the previously-cached TTL expires. Query public resolvers (<code>@8.8.8.8</code>, <code>@1.1.1.1</code>) to see cached state; check for a negatively cached NXDOMAIN (SOA minimum) if the name is new. Rule out client-side caching (browser, OS, JVM). Conclusion is almost always: it <em>is</em> propagating, bounded by TTL — not broken.</p></details>
+</div>

@@ -1,0 +1,425 @@
+<h1>Kubernetes <span class="tag express">Mastery</span></h1>
+<p>Kubernetes is a declarative container orchestrator: you write the <em>desired state</em> into etcd via the API server, and an army of controllers runs level-triggered reconciliation loops to drive the cluster's <em>actual state</em> toward it — rescheduling Pods, programming iptables/IPVS, attaching volumes, and scaling replicas without you touching a node.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Kubernetes is a control loop over a distributed key-value store. You POST desired state (Deployments, Services) to the kube-apiserver, which persists it to etcd — the single source of truth backed by Raft. Controllers watch etcd and reconcile: the Deployment controller creates a ReplicaSet, the ReplicaSet controller creates Pods, the scheduler binds each Pod to a node, and the kubelet on that node tells the container runtime to start it. Everything is level-triggered, so if a node dies the controllers just re-reconcile and reschedule. Networking is handled by CNI for pod IPs and kube-proxy programming iptables/IPVS for Services."</div>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<p>At the SDE3/Staff level I frame Kubernetes around four ideas:</p>
+<ol>
+<li><strong>Declarative + reconciliation.</strong> You never issue imperative "start 3 containers" commands. You declare "I want 3 replicas" in a spec. Controllers continuously diff desired vs actual (<code>.spec</code> vs <code>.status</code>) and act. This is <em>level-triggered</em>, not edge-triggered — a missed event is self-healing on the next resync (default informer resync is periodic; the watch stream is the fast path).</li>
+<li><strong>The control plane.</strong> <code>kube-apiserver</code> is the only component that talks to <code>etcd</code>; everything else talks to the apiserver. etcd holds all cluster state and uses Raft for consensus (leader + majority quorum). The <code>scheduler</code> assigns Pods to nodes; the <code>controller-manager</code> runs ~30 built-in controllers (Deployment, ReplicaSet, Node, Endpoint, Job...); the <code>cloud-controller-manager</code> talks to the cloud provider for LoadBalancers, routes and node lifecycle.</li>
+<li><strong>The node plane.</strong> <code>kubelet</code> is the node agent — it watches for Pods bound to its node, calls the container runtime over CRI (containerd/CRI-O), runs probes, and reports status. <code>kube-proxy</code> programs iptables/IPVS so a ClusterIP virtual IP load-balances to healthy pod IPs. The <strong>CNI</strong> plugin (Calico, Cilium, flannel) gives each Pod a routable IP.</li>
+<li><strong>The workload API.</strong> Pods are the atom; ReplicaSets keep N copies alive; Deployments manage rolling updates over ReplicaSets; StatefulSets give stable identity + ordered rollout; DaemonSets run one pod per node; Jobs/CronJobs run to completion. Services + EndpointSlices provide stable virtual IPs and DNS in front of ephemeral pods.</li>
+</ol>
+<div class="callout tip"><strong>Say this:</strong> "The mental model that impresses interviewers is: <em>desired state in etcd, actual state on nodes, controllers close the gap forever.</em> Self-healing is just reconciliation you never turned off."</div>
+
+<h2>Internal Working</h2>
+<p>Walk through what happens when you run <code>kubectl apply -f deployment.yaml</code> with 3 replicas:</p>
+<ol>
+<li><strong>Client → apiserver.</strong> kubectl does a TLS mutual-auth POST to <code>kube-apiserver</code>. The request passes through the chain: <em>authentication</em> (client cert / OIDC / SA token) → <em>authorization</em> (RBAC) → <em>mutating admission webhooks</em> → <em>schema validation</em> → <em>validating admission webhooks</em>.</li>
+<li><strong>Persist to etcd.</strong> The Deployment object is serialized (protobuf internally) and written to etcd under a key like <code>/registry/deployments/&lt;ns&gt;/&lt;name&gt;</code>. etcd replicates via Raft — the write only returns after a quorum of members has it in their log (fsync to WAL).</li>
+<li><strong>Deployment controller reconciles.</strong> It watches Deployments via a long-lived <code>watch</code> (HTTP/2 stream backed by etcd's watch). Seeing a new Deployment, it creates a <strong>ReplicaSet</strong> with a pod-template hash label.</li>
+<li><strong>ReplicaSet controller reconciles.</strong> It sees a ReplicaSet wanting 3 replicas but 0 existing, so it creates 3 <strong>Pod</strong> objects with <code>nodeName</code> empty (unscheduled).</li>
+<li><strong>Scheduler binds.</strong> The scheduler watches for Pods with empty <code>.spec.nodeName</code>. For each it runs the <em>filter</em> phase (predicates: resource fit, node selectors, taints/tolerations, affinity) then the <em>score</em> phase (spread, least/most-allocated) and issues a <strong>Binding</strong> (a write of <code>.spec.nodeName</code> back to the apiserver).</li>
+<li><strong>kubelet starts the pod.</strong> The kubelet on the chosen node watches Pods bound to it. It calls the CRI runtime: pull image → create the pod sandbox (pause container holding the network namespace) → invoke the <strong>CNI</strong> plugin to allocate an IP and wire veth/routes → start init containers → start app containers. Volumes are attached/mounted first via CSI.</li>
+<li><strong>Probes & status.</strong> kubelet runs startup → readiness → liveness probes and PATCHes Pod <code>.status</code> back to the apiserver.</li>
+<li><strong>Endpoints wire up.</strong> The EndpointSlice controller sees a Ready pod matching a Service selector and adds its IP to an EndpointSlice. <code>kube-proxy</code> on every node watches EndpointSlices and rewrites iptables/IPVS rules so the Service ClusterIP now DNATs to the new pod IP.</li>
+</ol>
+<div class="callout warn"><strong>Watch out:</strong> Only the apiserver writes to etcd. If someone tells you "the scheduler writes the binding to etcd," correct it — the scheduler POSTs a Binding to the apiserver, which persists it. This single-writer design is why the apiserver is the scaling bottleneck, not etcd directly.</div>
+
+<h3>The reconciliation loop, concretely</h3>
+<pre><code>for {
+  desired := informer.Get(key)        // from watch cache, not etcd directly
+  actual  := listActualChildren(key)
+  diff    := desired - actual
+  if diff &amp;gt; 0 { create(diff) }         // level-triggered: act on state, not events
+  if diff &amp;lt; 0 { delete(-diff) }
+  // errors -&amp;gt; requeue with rate-limited exponential backoff
+}</code></pre>
+
+<h2>Why was this built?</h2>
+<p>Before Kubernetes (2014, from Google's internal <em>Borg</em>), operators ran containers/VMs with hand-rolled tooling:</p>
+<ul>
+<li><strong>Manual placement:</strong> "server-27 runs the payment service" in a spreadsheet. A node dying meant a pager and a human re-placing workloads.</li>
+<li><strong>Config management sprawl:</strong> Puppet/Chef/Ansible describing <em>how</em> to converge each box imperatively, fragile and order-dependent.</li>
+<li><strong>Bespoke autoscaling and LB:</strong> custom scripts poking HAProxy configs and cloud APIs.</li>
+<li><strong>Docker alone had no orchestration:</strong> <code>docker run</code> on one host; no rescheduling, no service discovery, no rollout strategy.</li>
+</ul>
+<p>Kubernetes generalized Borg's lesson: express intent declaratively, let control loops maintain it, and treat machines as fungible cattle. It made self-healing, rolling updates, and horizontal scaling first-class primitives instead of runbooks.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+<tr><th>Alternative</th><th>What it is</th><th>When it wins over K8s</th><th>Why K8s usually wins</th></tr>
+<tr><td>Docker Swarm</td><td>Docker's built-in orchestrator</td><td>Tiny teams, one-command setup, simple stacks</td><td>Weak ecosystem, limited scheduling/RBAC, effectively abandoned</td></tr>
+<tr><td>HashiCorp Nomad</td><td>General scheduler (containers + VMs + binaries)</td><td>Mixed non-container workloads, simpler ops, single binary</td><td>Smaller ecosystem; you bolt on Consul/Vault for what K8s bundles</td></tr>
+<tr><td>AWS ECS / Fargate</td><td>Managed AWS-native orchestrator</td><td>All-in on AWS, want zero control-plane ops</td><td>Vendor lock-in; no portable API; weaker for complex stateful/custom controllers</td></tr>
+<tr><td>Plain VMs + ASG</td><td>Autoscaling groups + LB + AMIs</td><td>A few monolith services, ops team small</td><td>No bin-packing, slow rollouts, no self-healing at container granularity</td></tr>
+<tr><td>Serverless (Lambda/Cloud Run)</td><td>Function/container-as-a-service</td><td>Spiky/event-driven, no infra ownership desired</td><td>Cold starts, execution limits, hard for stateful/long-running/low-latency at scale</td></tr>
+</table>
+<div class="callout tip"><strong>Say this:</strong> "K8s wins when you have many services, need portability across clouds, and want a common API for autoscaling, rollouts, secrets and networking. If you have three services on one cloud, K8s is often over-engineering — I'd reach for ECS/Fargate or Cloud Run."</div>
+
+<h2>Advantages</h2>
+<ul>
+<li><strong>Self-healing:</strong> crashed pods restart, dead-node pods reschedule, all via reconciliation — no human in the loop.</li>
+<li><strong>Declarative + GitOps-friendly:</strong> the entire cluster is data; Argo CD/Flux diff Git against live state.</li>
+<li><strong>Portable API:</strong> the same manifests run on EKS, GKE, AKS, on-prem.</li>
+<li><strong>Bin-packing:</strong> the scheduler packs pods by requests, raising node utilization vs one-service-per-VM.</li>
+<li><strong>Extensible:</strong> CRDs + custom controllers/operators extend the API without forking core.</li>
+<li><strong>Batteries included:</strong> service discovery, rollouts, secrets, RBAC, autoscaling, storage abstraction all in one API.</li>
+</ul>
+
+<h2>Drawbacks</h2>
+<ul>
+<li><strong>Operational complexity:</strong> etcd tuning, upgrades, CNI/CSI choices, cert rotation — a real ops burden (managed control planes mitigate but don't erase it).</li>
+<li><strong>Steep learning curve:</strong> hundreds of API objects; failure modes (CrashLoopBackOff, Pending, Evicted) require deep knowledge.</li>
+<li><strong>Networking is hard:</strong> overlay vs native routing, MTU issues, DNS latency, NetworkPolicy debugging.</li>
+<li><strong>etcd is a hard scaling ceiling:</strong> ~8GB practical DB size, watch/write pressure, and it must stay low-latency.</li>
+<li><strong>Not for stateful-heavy from day one:</strong> databases need careful StatefulSet + storage + backup design; many teams keep DBs off-cluster.</li>
+<li><strong>Cost:</strong> control plane + idle headroom + observability overhead.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<ul>
+<li><strong>Consistency vs availability (etcd):</strong> etcd is CP (Raft). If it loses quorum, writes stop — the control plane freezes, but <em>running pods keep serving</em> (kubelet/kube-proxy run off local state). K8s deliberately chooses consistency of desired state over control-plane availability.</li>
+<li><strong>Requests vs limits:</strong> setting <code>limits==requests</code> gives Guaranteed QoS and predictable latency but wastes headroom; overcommitting (limits &gt; requests) raises density but risks OOMKills and CPU throttling.</li>
+<li><strong>Rollout speed vs safety:</strong> high <code>maxSurge</code>/<code>maxUnavailable</code> deploys fast but risks capacity dips; low values are safe but slow.</li>
+<li><strong>Level-triggered latency:</strong> reconciliation is robust to lost events but adds latency vs edge-triggered; resync periods trade freshness for apiserver load.</li>
+<li><strong>Pod density vs blast radius:</strong> big nodes bin-pack better but a node failure/drain hits more pods; PodDisruptionBudgets + topology spread bound this.</li>
+</ul>
+
+<h2>When NOT to use it</h2>
+<div class="callout warn"><strong>Watch out — anti-use-cases:</strong>
+<ul>
+<li><strong>1–3 simple services, one cloud, small team:</strong> Cloud Run / ECS Fargate / a couple of VMs is cheaper and far less ops.</li>
+<li><strong>Pure event-driven spiky workloads:</strong> Lambda/serverless beats an always-on cluster.</li>
+<li><strong>A single big stateful DB:</strong> use the managed offering (RDS/Cloud SQL); don't run your primary OLTP DB in K8s unless you have a strong operator + SRE team.</li>
+<li><strong>Hard real-time / ultra-low-latency kernel-bypass workloads:</strong> the network/scheduling overhead fights you; bare metal + tuning wins.</li>
+<li><strong>No platform/ops capacity:</strong> without someone owning upgrades, etcd, and CNI, a self-managed cluster becomes an incident generator.</li>
+</ul></div>
+
+<h2>Production Architecture</h2>
+<p>A realistic HA topology: 3 (or 5) control-plane nodes for etcd quorum, worker node pools spread across AZs, a cloud load balancer fronting the apiservers, an Ingress controller for L7, and CNI/CSI plugins on every node.</p>
+<pre class="mermaid">
+flowchart TD
+  U["Users"] --> LB["Cloud L4 LB"]
+  LB --> ING["Ingress controller pods"]
+  ING --> SVC["ClusterIP Services"]
+  SVC --> P["App Pods"]
+  subgraph CP["Control plane x3 across AZs"]
+    API["kube-apiserver"] --> ETCD["etcd Raft quorum"]
+    SCHED["scheduler"] --> API
+    CM["controller-manager"] --> API
+    CCM["cloud-controller-manager"] --> API
+  end
+  subgraph NODE["Worker node"]
+    KUBELET["kubelet"] --> CRI["containerd"]
+    KPROXY["kube-proxy"]
+    CNIagent["CNI agent"]
+    P
+  end
+  KUBELET --> API
+  KPROXY --> API
+</pre>
+<p>Key points to narrate:</p>
+<ul>
+<li><strong>etcd quorum:</strong> 3 members tolerate 1 failure, 5 tolerate 2. Never run 2 or 4 (even numbers give no extra fault tolerance and worsen write latency). Put etcd on fast disks (NVMe); <code>wal_fsync</code> latency is the killer metric.</li>
+<li><strong>apiserver is stateless</strong> and sits behind the LB — scale horizontally; all state lives in etcd.</li>
+<li><strong>Node pools by AZ</strong> + topology spread constraints so a zone loss doesn't take a whole service down.</li>
+<li><strong>Ingress</strong> (nginx/Contour/Gateway API) terminates TLS and does host/path routing to Services.</li>
+</ul>
+
+<h2>Production Problems</h2>
+<ul>
+<li><strong>etcd disk latency / fragmentation:</strong> slow <code>fsync</code> spikes apiserver p99, causes leader elections and cascading timeouts. Needs regular <code>etcdctl defrag</code> and compaction.</li>
+<li><strong>CrashLoopBackOff storms:</strong> a bad deploy where the app exits on start; exponential backoff (10s→20s→...→300s cap) makes recovery slow even after a fix.</li>
+<li><strong>OOMKilled pods:</strong> memory limit too low or a leak; kernel OOM killer (cgroup) kills the container, exit code 137.</li>
+<li><strong>PVC stuck Pending:</strong> <code>WaitForFirstConsumer</code> means the PV binds only after scheduling; a StorageClass mismatch or zone constraint leaves it hung.</li>
+<li><strong>DNS latency/failures:</strong> CoreDNS overloaded or the old <code>musl</code>/ndots:5 5-lookup problem inflates latency; NodeLocal DNSCache fixes it.</li>
+<li><strong>IP exhaustion:</strong> pod CIDR too small for the node count; new pods stuck ContainerCreating with CNI "no IP available".</li>
+<li><strong>Node NotReady / disk pressure evictions:</strong> kubelet evicts pods under memory/disk pressure; batch evictions cause request drops if PDBs are missing.</li>
+<li><strong>Rollout deadlock:</strong> new ReplicaSet pods never go Ready (bad readiness probe/config), Deployment stuck <code>progressDeadlineExceeded</code>.</li>
+</ul>
+
+<h2>Debugging Guide</h2>
+<pre><code># What's wrong and why (events at the bottom are gold)
+kubectl describe pod &amp;lt;pod&amp;gt; -n &amp;lt;ns&amp;gt;
+kubectl get events -n &amp;lt;ns&amp;gt; --sort-by=.lastTimestamp
+
+# Logs incl. previous crashed container
+kubectl logs &amp;lt;pod&amp;gt; -c &amp;lt;container&amp;gt; --previous
+
+# CrashLoopBackOff: check exit code + reason
+kubectl get pod &amp;lt;pod&amp;gt; -o jsonpath='{.status.containerStatuses[0].lastState.terminated}'
+
+# OOMKilled shows reason=OOMKilled, exitCode 137; check limits vs usage
+kubectl top pod &amp;lt;pod&amp;gt; -n &amp;lt;ns&amp;gt;
+
+# Pending: why can't it schedule?  (Events: FailedScheduling ...)
+kubectl describe pod &amp;lt;pod&amp;gt; | grep -A5 Events
+
+# ImagePullBackOff: registry/auth/tag
+kubectl describe pod &amp;lt;pod&amp;gt; | grep -i -E 'pull|image'
+
+# PVC stuck Pending
+kubectl get pvc,pv,storageclass
+kubectl describe pvc &amp;lt;pvc&amp;gt;
+
+# Service has no endpoints? selector mismatch or no Ready pods
+kubectl get endpointslices -l kubernetes.io/service-name=&amp;lt;svc&amp;gt;
+
+# Control-plane / etcd health
+kubectl get --raw='/readyz?verbose'
+ETCDCTL_API=3 etcdctl endpoint status --write-out=table
+
+# Live debug into a distroless pod
+kubectl debug -it &amp;lt;pod&amp;gt; --image=busybox --target=&amp;lt;container&amp;gt;</code></pre>
+<div class="callout tip"><strong>Say this:</strong> "My first move is always <code>kubectl describe pod</code> — the <em>Events</em> section names the exact failure: FailedScheduling, Back-off pulling image, OOMKilled, FailedMount. Then <code>logs --previous</code> for the app's own last words."</div>
+
+<h3>Failure-signature cheat sheet</h3>
+<table>
+<tr><th>Symptom</th><th>Likely cause</th><th>First check</th></tr>
+<tr><td>CrashLoopBackOff</td><td>App exits on startup (bad config/migration/panic)</td><td><code>logs --previous</code>, exit code</td></tr>
+<tr><td>OOMKilled (137)</td><td>Memory limit too low / leak</td><td><code>kubectl top</code>, limit vs RSS</td></tr>
+<tr><td>ImagePullBackOff</td><td>Wrong tag, private registry, no imagePullSecret</td><td>describe Events, registry auth</td></tr>
+<tr><td>Pending</td><td>No node fits (resources/taints/affinity), no PV</td><td>FailedScheduling event</td></tr>
+<tr><td>ContainerCreating (stuck)</td><td>CNI no-IP, volume mount failing, secret missing</td><td>describe, kubelet logs</td></tr>
+<tr><td>Evicted</td><td>Node memory/disk pressure</td><td>node conditions, <code>describe node</code></td></tr>
+</table>
+
+<h2>Monitoring</h2>
+<table>
+<tr><th>Metric</th><th>Meaning</th><th>Healthy / alert threshold</th></tr>
+<tr><td><code>etcd_disk_wal_fsync_duration_seconds</code> p99</td><td>etcd write-ahead-log fsync latency</td><td>&lt;10ms healthy; alert &gt;25ms (disk too slow)</td></tr>
+<tr><td><code>etcd_server_leader_changes_seen_total</code></td><td>Raft leader flaps</td><td>~0; any spike = instability</td></tr>
+<tr><td><code>apiserver_request_duration_seconds</code> p99</td><td>API latency by verb/resource</td><td>&lt;1s reads; alert sustained &gt;1s</td></tr>
+<tr><td><code>apiserver_current_inflight_requests</code></td><td>Concurrency vs max-requests-inflight</td><td>Alert near the limit (throttling/429s)</td></tr>
+<tr><td><code>kube_pod_container_status_restarts_total</code></td><td>Container restart count</td><td>Alert on rate &gt;0 sustained (CrashLoop)</td></tr>
+<tr><td><code>kube_pod_status_phase{phase="Pending"}</code></td><td>Unschedulable pods</td><td>Alert if Pending &gt;5m</td></tr>
+<tr><td><code>node_memory_working_set / node_allocatable</code></td><td>Node memory pressure</td><td>Alert &gt;85% (eviction risk)</td></tr>
+<tr><td><code>container_cpu_cfs_throttled_periods_total</code></td><td>CPU throttling from limits</td><td>Alert if throttled ratio &gt;25%</td></tr>
+<tr><td><code>coredns_dns_request_duration_seconds</code> p99</td><td>DNS resolution latency</td><td>&lt;20ms; alert &gt;100ms</td></tr>
+<tr><td><code>kubelet_volume_stats_available_bytes</code></td><td>PV free space</td><td>Alert &lt;10%</td></tr>
+</table>
+
+<h2>Scaling</h2>
+<p>Three orthogonal autoscalers plus manual sharding of the control plane:</p>
+<ul>
+<li><strong>HPA (Horizontal Pod Autoscaler):</strong> scales replica count on CPU/memory or custom/external metrics. Formula: <code>desired = ceil(current * (currentMetric / targetMetric))</code>. Has a stabilization window (default 300s scale-down) to avoid flapping.</li>
+<li><strong>VPA (Vertical Pod Autoscaler):</strong> right-sizes requests/limits; recreates pods to apply. Don't run VPA and HPA on the same CPU metric — they fight.</li>
+<li><strong>Cluster Autoscaler / Karpenter:</strong> adds/removes <em>nodes</em> when pods are Pending for lack of capacity, or consolidates underused nodes. Karpenter provisions right-sized nodes directly from the cloud API, much faster than ASG-based CA.</li>
+<li><strong>Control-plane scaling:</strong> apiserver scales horizontally (stateless); etcd does NOT scale writes by adding members (more members = slower Raft). Scale etcd vertically (CPU/NVMe) and by keeping the DB small (compaction/defrag).</li>
+</ul>
+<pre class="mermaid">
+flowchart LR
+  M["Metrics server"] --> HPA["HPA"]
+  HPA --> RS["More replicas"]
+  RS --> PEND["Pods Pending no capacity"]
+  PEND --> CA["Cluster Autoscaler"]
+  CA --> N["New node from cloud"]
+  N --> SCHED["Scheduler binds pods"]
+</pre>
+<div class="callout warn"><strong>Watch out:</strong> HPA can't help if pods can't schedule — you need Cluster Autoscaler/Karpenter behind it, and it can't help if the bottleneck is a downstream DB. Also HPA needs <code>resources.requests</code> set or CPU-target HPA does nothing.</div>
+
+<h3>Practical ceilings</h3>
+<table>
+<tr><th>Dimension</th><th>Ballpark limit</th></tr>
+<tr><td>Nodes per cluster</td><td>~5,000 (official supported), most run &lt;1,000</td></tr>
+<tr><td>Pods per node</td><td>110 default (kubelet <code>--max-pods</code>)</td></tr>
+<tr><td>Total pods</td><td>~150,000</td></tr>
+<tr><td>etcd DB size</td><td>~8GB practical ceiling</td></tr>
+</table>
+
+<h2>Security</h2>
+<ul>
+<li><strong>AuthN:</strong> client certs, OIDC (SSO), or ServiceAccount JWT tokens (now bound, audience-scoped, short-lived projected tokens). No static passwords.</li>
+<li><strong>AuthZ:</strong> RBAC — <code>Role</code>/<code>ClusterRole</code> + <code>RoleBinding</code>/<code>ClusterRoleBinding</code>. Least privilege; never bind ServiceAccounts to <code>cluster-admin</code>.</li>
+<li><strong>Admission control:</strong> Pod Security Admission (restricted/baseline/privileged), OPA Gatekeeper/Kyverno for policy (no privileged, no hostPath, required labels).</li>
+<li><strong>Secrets:</strong> base64 in etcd is NOT encryption — enable <code>EncryptionConfiguration</code> (KMS-backed) so etcd stores ciphertext; use external secret stores (Vault, cloud KMS) for real rotation.</li>
+<li><strong>Network:</strong> default-deny NetworkPolicies (Calico/Cilium) — pods are flat/open by default. Encrypt in transit with mTLS (service mesh: Istio/Linkerd) and TLS at Ingress.</li>
+<li><strong>Node/workload hardening:</strong> drop capabilities, <code>runAsNonRoot</code>, read-only root FS, seccomp profiles, no host network/PID unless required.</li>
+<li><strong>Common CVE classes:</strong> over-privileged ServiceAccount tokens auto-mounted into every pod (set <code>automountServiceAccountToken: false</code>); container escapes via privileged pods/hostPath; exposed kubelet/etcd ports; supply-chain (unsigned images — use Sigstore/cosign + admission verification).</li>
+</ul>
+
+<h2>Performance</h2>
+<ul>
+<li><strong>etcd is the latency floor.</strong> Every write blocks on Raft quorum + WAL fsync. NVMe (&lt;10ms fsync) vs spinning disk is the difference between a healthy and a flapping control plane.</li>
+<li><strong>apiserver throughput:</strong> tune <code>--max-requests-inflight</code> / <code>--max-mutating-requests-inflight</code> and enable API Priority and Fairness (APF) so a chatty controller can't starve kubelets. Watch cache serves reads without hitting etcd.</li>
+<li><strong>kube-proxy iptables vs IPVS:</strong> iptables rule evaluation is O(n) in Services — a few thousand Services makes rule reload and packet matching slow. IPVS uses hash tables (O(1) lookup) and scales to tens of thousands of Services; Cilium eBPF bypasses kube-proxy entirely.</li>
+<li><strong>CPU limits cause throttling:</strong> CFS quota throttles even when the node has spare CPU, adding tail latency. Many teams drop CPU limits (keep requests) for latency-sensitive services.</li>
+<li><strong>DNS:</strong> <code>ndots:5</code> triggers up to 5 lookups for external names; use fully-qualified names or NodeLocal DNSCache to cut p99.</li>
+<li><strong>Scheduler throughput:</strong> ~100s of pods/sec; percentage-of-nodes-to-score tuning trades placement quality for speed on big clusters.</li>
+<li><strong>Image pulls:</strong> the slowest part of pod start; use small images, layer caching, and pre-pulled images / <code>imagePullPolicy: IfNotPresent</code>.</li>
+</ul>
+
+<h2>Common Mistakes</h2>
+<table>
+<tr><th>Mistake</th><th>Fix</th></tr>
+<tr><td>No resource <code>requests</code> set</td><td>Scheduler can't bin-pack, HPA CPU-target breaks; always set requests</td></tr>
+<tr><td>liveness probe == readiness probe</td><td>Liveness restarts the container on transient slowness → CrashLoop; keep liveness lenient, readiness strict</td></tr>
+<tr><td>Liveness probe with no <code>initialDelaySeconds</code>/startupProbe</td><td>Slow-starting app gets killed mid-boot; use a startupProbe</td></tr>
+<tr><td>Memory <code>limit</code> too tight</td><td>OOMKilled 137; set limit above real peak RSS with headroom</td></tr>
+<tr><td>No PodDisruptionBudget</td><td>Node drain during upgrade takes all replicas down; set <code>minAvailable</code></td></tr>
+<tr><td>Storing secrets in ConfigMaps / images</td><td>Use Secrets + KMS encryption / external store</td></tr>
+<tr><td><code>latest</code> image tag</td><td>Non-reproducible rollouts/rollbacks; pin digests</td></tr>
+<tr><td>Service selector doesn't match pod labels</td><td>Empty EndpointSlice → connection refused; verify labels</td></tr>
+<tr><td>Running DBs as Deployment not StatefulSet</td><td>No stable identity/ordered storage; use StatefulSet + PVC templates</td></tr>
+<tr><td>One giant node pool, no topology spread</td><td>AZ loss kills a service; use topologySpreadConstraints</td></tr>
+</table>
+
+<h2>Real-world Examples</h2>
+<table>
+<tr><th>Company</th><th>How they (plausibly) use Kubernetes</th></tr>
+<tr><td>Google</td><td>GKE is managed K8s; internally Borg (K8s' ancestor) runs everything. Likely uses K8s for customer-facing GKE and some newer internal platforms; Borg still runs core.</td></tr>
+<tr><td>Amazon</td><td>Runs EKS as a product; internally heavy on ECS/Fargate and bespoke systems, but EKS powers many AWS-hosted customer and internal container workloads.</td></tr>
+<tr><td>Netflix</td><td>Historically VM/ASG-based with Titus (their own container orchestrator on Mesos, later K8s-influenced); increasingly uses K8s for platform teams and data/ML workloads (likely).</td></tr>
+<tr><td>Uber</td><td>Migrated large fleets to K8s for stateless services and moved batch/ML onto it; uses custom schedulers and topology-aware placement across zones (likely for microservices at scale).</td></tr>
+<tr><td>Swiggy</td><td>Runs microservices (order, delivery, search) on K8s/EKS with HPA for meal-time traffic spikes and Cluster Autoscaler to scale nodes for lunch/dinner peaks (likely).</td></tr>
+<tr><td>PhonePe</td><td>High-scale UPI payments; likely runs on-prem/hybrid K8s for regulatory data locality, with StatefulSets for stateful components and strict NetworkPolicies/RBAC for PCI-style isolation.</td></tr>
+<tr><td>Razorpay</td><td>Payment APIs on K8s (likely EKS) with autoscaling for transaction spikes, canary rollouts via Argo, and secrets via Vault + KMS-encrypted etcd.</td></tr>
+<tr><td>Atlassian</td><td>Runs Jira/Confluence Cloud on K8s across many clusters with per-tenant isolation and shard-per-cluster patterns; uses their own platform tooling atop EKS (likely).</td></tr>
+</table>
+
+<h2>Interview Follow-up Questions</h2>
+<ol>
+<li>What is a Pod and why not schedule containers directly?
+<ol><li><em>Answer pointer:</em> Pod is the scheduling atom — shared network namespace + volumes; sidecars co-locate.</li></ol></li>
+<li>Difference between a Deployment and a ReplicaSet?
+<ol><li><em>Pointer:</em> Deployment manages ReplicaSets to enable rolling updates/rollback; you rarely touch RS directly.</li></ol></li>
+<li>How does a rolling update actually work — what do maxSurge/maxUnavailable control?
+<ol><li><em>Pointer:</em> New RS scales up by maxSurge, old scales down respecting maxUnavailable; gated on readiness.</li></ol></li>
+<li>What guarantees does a StatefulSet give that a Deployment doesn't?
+<ol><li><em>Pointer:</em> Stable network identity (pod-0..n via headless svc), ordered create/delete, per-pod PVC.</li></ol></li>
+<li>Walk me through what happens from <code>kubectl apply</code> to a running container.
+<ol><li><em>Pointer:</em> apiserver→etcd→Deployment ctrl→RS ctrl→scheduler bind→kubelet→CRI→CNI→probes→endpoints.</li></ol></li>
+<li>Why is etcd the source of truth and what consistency model does it use?
+<ol><li><em>Pointer:</em> Raft, quorum writes, linearizable reads; CP system; only apiserver writes to it.</li></ol></li>
+<li>What happens to running workloads if the entire control plane goes down?
+<ol><li><em>Pointer:</em> Existing pods keep running (kubelet/kube-proxy off local state); no new scheduling/healing until it recovers.</li></ol></li>
+<li>How does a Service get traffic to a pod — what does kube-proxy do?
+<ol><li><em>Pointer:</em> ClusterIP virtual IP; kube-proxy programs iptables/IPVS DNAT to EndpointSlice pod IPs.</li></ol></li>
+<li>iptables vs IPVS mode — when does it matter?
+<ol><li><em>Pointer:</em> iptables O(n) rules; IPVS hash O(1) — matters at thousands of Services; eBPF (Cilium) bypasses proxy.</li></ol></li>
+<li>Difference between liveness, readiness, and startup probes?
+<ol><li><em>Pointer:</em> Liveness→restart; readiness→remove from endpoints; startup→gate the other two during boot.</li></ol></li>
+<li>Explain QoS classes and how they affect eviction.
+<ol><li><em>Pointer:</em> Guaranteed (limits==requests) evicted last; Burstable next; BestEffort (no requests) first.</li></ol></li>
+<li>Why would a PVC be stuck Pending?
+<ol><li><em>Pointer:</em> WaitForFirstConsumer + no scheduled pod, no matching StorageClass, zone/access-mode mismatch, no provisioner.</li></ol></li>
+<li>How does the HPA decide replica count, and what breaks it?
+<ol><li><em>Pointer:</em> ratio formula on metric; breaks without requests set, without metrics-server, or when downstream is the bottleneck.</li></ol></li>
+<li>A pod is OOMKilled repeatedly — how do you root-cause vs just raising the limit?
+<ol><li><em>Pointer:</em> Check RSS trend (leak?), heap profile, working set vs limit; raise limit only if legitimately sized.</li></ol></li>
+<li>How do you guarantee availability during a node upgrade/drain?
+<ol><li><em>Pointer:</em> PodDisruptionBudget minAvailable + topology spread + surge; drain respects PDB.</li></ol></li>
+<li>How does the scheduler choose a node — filter vs score?
+<ol><li><em>Pointer:</em> Filter (predicates: fit, taints, affinity), then score (spread, allocation), pick highest, Binding.</li></ol></li>
+<li>How would you debug 5% of requests to a Service failing intermittently?
+<ol><li><em>Pointer:</em> Stale endpoints, one bad pod passing readiness, kube-proxy sync lag, conntrack table full.</li></ol></li>
+<li>etcd is at 7.5GB and apiserver p99 is climbing — what do you do?
+<ol><li><em>Pointer:</em> Compact + defrag, find high-churn resources (events!), raise quota carefully, check disk fsync.</li></ol></li>
+<li>How do you stop a noisy controller from starving kubelet heartbeats on the apiserver?
+<ol><li><em>Pointer:</em> API Priority and Fairness — flow schemas/priority levels isolate and rate-limit.</li></ol></li>
+<li>Design multi-region K8s — what's hard?
+<ol><li><em>Pointer:</em> etcd can't span high-latency regions; use cluster-per-region + global LB + GitOps + data replication.</li></ol></li>
+</ol>
+
+<h2>Common Cross Questions</h2>
+<ul>
+<li><strong>After Services → networking:</strong> "How does DNS work (CoreDNS)?", "What's a NetworkPolicy and default behavior?", "Explain CNI and pod-to-pod routing across nodes." Angle: flat pod network, CoreDNS service records, default-allow until you add policies.</li>
+<li><strong>After etcd → distributed systems:</strong> "Explain Raft leader election", "quorum math for 3 vs 5 nodes", "linearizable vs serializable reads." Angle: consensus, majority, CP trade-off.</li>
+<li><strong>After Deployments → CI/CD:</strong> "How do canary/blue-green work?", "GitOps with Argo/Flux", "how do you roll back?" Angle: progressive delivery, declarative reconciliation of Git.</li>
+<li><strong>After probes/QoS → reliability:</strong> "How do you set SLOs?", "graceful shutdown / preStop / terminationGracePeriod", "PDBs and disruption budgets." Angle: connection draining, SIGTERM handling.</li>
+<li><strong>After storage → stateful:</strong> "How do you back up a DB on K8s?", "CSI internals", "why StatefulSet over Deployment for Kafka?" Angle: stable identity + per-replica volumes + operators.</li>
+<li><strong>After RBAC → security:</strong> "Pod Security Standards", "how do you prevent container escape?", "secret encryption at rest / rotation." Angle: least privilege, admission control, KMS.</li>
+<li><strong>After autoscaling → cost:</strong> "How do you right-size?", "spot instances + interruption handling", "bin-packing vs blast radius." Angle: VPA recommendations, Karpenter consolidation, PDBs on spot.</li>
+</ul>
+
+<h2>Production Scenarios</h2>
+
+<h3>Incident 1 — Deploy causes cluster-wide CrashLoopBackOff</h3>
+<table>
+<tr><th>Symptoms</th><td>New version pods restart every ~30s→300s; error rate spikes; old pods gone.</td></tr>
+<tr><td>Investigation</td><td><code>kubectl logs --previous</code> shows a DB migration failing on boot; <code>describe</code> shows exit code 1, Back-off restarting.</td></tr>
+<tr><td>Root Cause</td><td>App runs migration at startup; migration incompatible with running old replicas; container exits.</td></tr>
+<tr><td>Solution</td><td><code>kubectl rollout undo deployment/x</code> to previous ReplicaSet; move migrations to a pre-deploy Job/init container with proper gating.</td></tr>
+<tr><td>Prevention</td><td>Readiness-gated rollout, low maxUnavailable, progressDeadlineSeconds, canary + smoke tests, backward-compatible migrations.</td></tr>
+<tr><td>Interview Answer</td><td>"App crashed on boot from a bad migration; backoff made it look stuck. I rolled back to the prior ReplicaSet instantly since K8s keeps it, then decoupled migrations from app start behind a Job."</td></tr>
+</table>
+
+<h3>Incident 2 — Pods stuck Pending after a traffic spike</h3>
+<table>
+<tr><th>Symptoms</th><td>HPA scaled replicas to 40 but half are Pending; latency high, users see 503s.</td></tr>
+<tr><td>Investigation</td><td><code>describe pod</code> → <code>FailedScheduling: 0/12 nodes available: insufficient cpu</code>; Cluster Autoscaler logs show scale-up blocked by quota.</td></tr>
+<tr><td>Root Cause</td><td>Cloud account CPU quota / no spare node capacity; CA couldn't add nodes fast enough.</td></tr>
+<tr><td>Solution</td><td>Raise cloud quota, pre-provision warm nodes (over-provisioning pause pods / Karpenter), lower per-pod requests to fit.</td></tr>
+<tr><td>Prevention</td><td>Headroom via low-priority placeholder pods, Karpenter for fast provisioning, capacity alerts, load-test peaks.</td></tr>
+<tr><td>Interview Answer</td><td>"HPA did its job but there were no nodes — autoscaling is only as fast as node provisioning. I added warm capacity via low-priority pause pods and switched to Karpenter for sub-minute node launches."</td></tr>
+</table>
+
+<h3>Incident 3 — Service intermittently returns connection refused</h3>
+<table>
+<tr><th>Symptoms</th><td>~10% of requests fail with connection refused, seemingly random.</td></tr>
+<tr><td>Investigation</td><td><code>get endpointslices</code> shows a pod IP that's actually terminated; kube-proxy sync lag; one pod passing readiness but not serving.</td></tr>
+<tr><td>Root Cause</td><td>Missing <code>preStop</code>/graceful shutdown — pod removed from endpoints after it stopped accepting connections (SIGTERM race), plus stale conntrack entries.</td></tr>
+<tr><td>Solution</td><td>Add <code>preStop: sleep 5</code> + proper SIGTERM draining, correct terminationGracePeriodSeconds, ensure readiness flips false before shutdown.</td></tr>
+<tr><td>Prevention</td><td>Graceful shutdown pattern, readiness gate on shutdown, connection draining at Ingress, conntrack tuning.</td></tr>
+<tr><td>Interview Answer</td><td>"Classic endpoint-removal race: the pod died before kube-proxy removed it. I added a preStop sleep so the pod keeps serving while it's being deregistered, and made the app fail readiness first on SIGTERM."</td></tr>
+</table>
+
+<h3>Incident 4 — etcd latency spikes freeze the control plane</h3>
+<table>
+<tr><th>Symptoms</th><td>kubectl slow/timing out, controllers lagging, leader elections in logs, but running pods fine.</td></tr>
+<tr><td>Investigation</td><td><code>etcd_disk_wal_fsync_duration</code> p99 &gt;100ms; DB size 7.8GB; huge churn of Event objects; frequent leader changes.</td></tr>
+<tr><td>Root Cause</td><td>etcd disk saturated + DB bloat from un-compacted history and high-churn resources; fsync too slow for Raft.</td></tr>
+<tr><td>Solution</td><td>Compact + <code>etcdctl defrag</code>, move etcd to NVMe, reduce event TTL, throttle chatty controllers via APF.</td></tr>
+<tr><td>Prevention</td><td>Dedicated fast disks for etcd, auto-compaction, DB-size alerts at 6GB, APF, separate etcd for events.</td></tr>
+<tr><td>Interview Answer</td><td>"etcd is a Raft store — slow fsync stalls every write, so the whole control plane wedges while pods keep serving off local state. I defragged, moved to NVMe, and cut Event churn; long-term I alert on DB size and fsync p99."</td></tr>
+</table>
+
+<h3>Incident 5 — Nodes flapping NotReady, mass pod evictions</h3>
+<table>
+<tr><th>Symptoms</th><td>Nodes cycle Ready/NotReady; pods evicted in batches; service capacity dips.</td></tr>
+<tr><td>Investigation</td><td><code>describe node</code> shows MemoryPressure/DiskPressure True; kubelet logs show image GC and eviction; a log-heavy pod filled the disk.</td></tr>
+<tr><td>Root Cause</td><td>A pod with no log rotation / ephemeral-storage limit filled node disk, triggering kubelet eviction thresholds; missing PDBs let all replicas go at once.</td></tr>
+<tr><td>Solution</td><td>Set ephemeral-storage requests/limits, log rotation, evict the offender; add PDBs and topology spread.</td></tr>
+<tr><td>Prevention</td><td>ResourceQuotas, ephemeral-storage limits, node disk alerts, PDBs, spread across nodes/AZs.</td></tr>
+<tr><td>Interview Answer</td><td>"A noisy pod filled node disk and kubelet started evicting under DiskPressure; without PDBs it took whole services down. I capped ephemeral storage, added log rotation, and enforced PDBs + topology spread to bound blast radius."</td></tr>
+</table>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+
+  <details><summary>Why is Kubernetes reconciliation "level-triggered" and not "edge-triggered", and why does it matter?</summary><p>Edge-triggered systems act on <em>events</em> ("pod deleted"): if you miss the event, you're permanently out of sync. Kubernetes controllers are level-triggered — each loop reads the current desired state and current actual state and computes the diff, regardless of what events fired. Watches are just an optimization to wake the loop quickly; periodic informer resyncs (and the ability to relist) guarantee correctness even if events are lost or the controller restarts. This is why K8s self-heals: a controller that was down for 10 minutes just relists on startup and reconciles reality to spec. The cost is latency and extra apiserver load from relists, which is why resync periods and watch caches are tuned carefully.</p></details>
+
+  <details><summary>Only the apiserver talks to etcd. Why that design, and what's the consequence?</summary><p>Centralizing etcd access behind the apiserver gives one place for authN/authZ, admission control, validation, versioning/conversion between API versions, and the watch cache. Components never need etcd credentials or to understand storage encoding. The consequence: the apiserver is the scaling chokepoint and single logical writer. It scales horizontally (stateless, all identical), but every mutating write ultimately serializes through etcd's Raft. This also means you protect etcd by protecting the apiserver — API Priority and Fairness, rate limits, and watch caches (reads served from memory) are how you keep a runaway controller from taking etcd down.</p></details>
+
+  <details><summary>Explain QoS classes precisely and how they interact with the OOM killer and eviction.</summary><p>Three classes derived from requests/limits: <strong>Guaranteed</strong> (every container has memory and CPU limit == request), <strong>Burstable</strong> (at least one request set but not equal to limits), <strong>BestEffort</strong> (no requests/limits). Under node memory pressure the kubelet evicts BestEffort first, then Burstable exceeding requests, and Guaranteed last. Separately, the Linux OOM killer uses oom_score_adj values that K8s sets by QoS: BestEffort pods get the most kill-favorable score, Guaranteed the least. Note the OOM killer is per-cgroup for limit-exceeding containers (exit 137) and can fire even when the node has free memory if a container hits its own memory limit. This is why latency-critical services should be Guaranteed for memory and why "no requests set" is dangerous.</p></details>
+
+  <details><summary>Why can a PVC be stuck Pending with a healthy StorageClass?</summary><p>The most common reason is <code>volumeBindingMode: WaitForFirstConsumer</code>: the PV is intentionally not provisioned until a pod using the PVC is scheduled, so the volume lands in the same zone as the pod. If the pod itself can't schedule (no capacity, taints, affinity), the PVC stays Pending forever — you must fix scheduling first. Other causes: no CSI provisioner running for that StorageClass, requested access mode unsupported (e.g. RWX on a block device that only does RWO), a zone constraint where no node in the required zone has capacity, or exceeding a storage quota. Debug with <code>kubectl describe pvc</code> (events name the provisioner error) and check the pod's FailedScheduling events in tandem.</p></details>
+
+  <details><summary>Liveness vs readiness vs startup — give a failure mode caused by conflating them.</summary><p>Readiness controls endpoint membership (fail = removed from Service, no restart). Liveness controls restarts (fail = kill+restart container). Startup gates both during boot. Classic incident: a team sets liveness to hit <code>/health</code> which also checks the database. The DB has a transient blip; every pod fails liveness simultaneously and gets killed, turning a 10-second DB hiccup into a cluster-wide CrashLoopBackOff and a full outage. The fix: liveness should only check "is this process wedged/deadlocked" (cheap, local), readiness checks dependencies (so a DB blip removes pods from rotation but doesn't kill them), and a startupProbe covers slow boot so liveness doesn't fire mid-initialization.</p></details>
+
+  <details><summary>Walk through exactly how kube-proxy in iptables mode routes a ClusterIP request, and why IPVS scales better.</summary><p>For each Service, kube-proxy writes a chain that matches the ClusterIP:port and uses iptables <code>statistic</code> (random probability) modules to DNAT to one of the backend pod IPs from the EndpointSlices, then conntrack tracks the connection. The problem: iptables is a linear ruleset — adding thousands of Services and endpoints means huge rule tables, O(n) matching per packet, and multi-second rule reloads on every endpoint change, which spikes CPU and delays convergence. IPVS mode uses the kernel's in-kernel hash-table load balancer: O(1) lookup, incremental updates, and multiple LB algorithms (rr, lc, etc.). At thousands of Services IPVS is dramatically faster; eBPF-based dataplanes (Cilium) go further by replacing kube-proxy entirely with eBPF maps and doing DNAT at the socket/XDP layer.</p></details>
+
+  <details><summary>How does a Deployment rolling update actually sequence, and how do maxSurge/maxUnavailable bound it?</summary><p>The Deployment controller creates a new ReplicaSet (identified by a pod-template hash). It then scales the new RS up and the old RS down in a loop, respecting two constraints computed against desired replicas: <code>maxSurge</code> caps how many pods above desired can exist (extra capacity created first), and <code>maxUnavailable</code> caps how many below desired can be unready at once. With defaults (25%/25%) on 4 replicas it can run up to 5 pods and keep at least 3 available. Crucially, a new pod only counts toward progress when its <em>readiness</em> probe passes, so a bad readiness config stalls the rollout until <code>progressDeadlineSeconds</code> marks it failed. maxSurge=0 means truly zero extra capacity (needs spare headroom pattern), maxUnavailable=0 means never dip below desired (needs surge). You tune these for capacity vs speed vs safety.</p></details>
+
+  <details><summary>What actually differs in a StatefulSet, and when is it wrong to use one?</summary><p>StatefulSet gives: stable, ordinal pod names (<code>web-0..web-n</code>) backed by a headless Service for stable DNS per pod; ordered, sequential creation and reverse-order deletion (0 before 1, with readiness gating each step by default); and per-pod PersistentVolumeClaims via <code>volumeClaimTemplates</code> that survive rescheduling and reattach to the same pod ordinal. This is essential for clustered stateful systems (Kafka, ZooKeeper, Cassandra, primary/replica DBs) that need stable identity and their own durable disk. It's wrong for stateless web apps — the ordered rollout is slower and the stable-identity machinery buys you nothing. It's also not a magic DB operator: it won't handle backups, failover promotion, or reconfiguration — that's what a dedicated operator (e.g. a Postgres operator) adds on top.</p></details>
+
+  <details><summary>The whole control plane is down for 20 minutes. What still works and what doesn't?</summary><p>Data plane keeps running: existing pods keep serving because kubelet runs them from its local pod cache and kube-proxy already programmed iptables/IPVS, and CoreDNS pods keep resolving. What stops: no new scheduling, no self-healing (a pod that crashes won't be recreated by controllers, though kubelet still restarts containers within an existing pod per restartPolicy), no rollouts, no scaling, no Service endpoint updates (so if pods churn, stale endpoints linger), and <code>kubectl</code> is dead. This is the CP-over-availability trade-off: K8s would rather stop changing state than risk making inconsistent decisions without etcd quorum. It's why you run 3–5 etcd members across failure domains and treat control-plane HA seriously.</p></details>
+
+  <details><summary>Design autoscaling for a service with sharp 10x meal-time spikes. What are the failure modes?</summary><p>Layer three things: HPA on a leading metric (CPU or, better, requests-per-second/queue-depth via custom metrics) with a short scale-up stabilization and longer scale-down to avoid flapping; Cluster Autoscaler or Karpenter behind it so Pending pods trigger fast node provisioning; and warm headroom via low-priority "pause" pods that get preempted when real pods need the space, hiding node-launch latency. Failure modes: (1) HPA scales pods but no nodes exist and CA is slow → Pending → 503s (fix with warm capacity/Karpenter); (2) requests not set → CPU-target HPA is a no-op; (3) scaling the app but the DB/connection pool is the real bottleneck → you just move the queue; (4) scale-down too aggressive → thrashing and dropped connections. Always load-test the actual peak and pre-scale on a schedule if spikes are predictable (cron-based HPA).</p></details>
+
+  <details><summary>etcd DB hit 7.8GB and the control plane is degrading. Precise remediation?</summary><p>etcd keeps a multi-version history; without compaction the DB grows and every write's B-tree/fsync gets slower, and there's a ~8GB hard-ish quota after which etcd goes read-only (NOSPACE alarm). Steps: (1) trigger compaction to drop old revisions (<code>etcdctl compact &lt;rev&gt;</code> or auto-compaction), (2) <code>etcdctl defrag</code> each member to reclaim freed space on disk (do it one member at a time — defrag blocks that member), (3) disarm the NOSPACE alarm after, (4) find the churn source — usually Events (give them a short TTL or a separate etcd), or a controller hot-looping writes, (5) verify disk is NVMe and fsync p99 &lt;10ms. Long term: alert on DB size at ~6GB, enable auto-compaction (e.g. periodic/revision), run a dedicated etcd for events, and use APF to throttle chatty clients.</p></details>
+
+  <details><summary>How do taints/tolerations, node affinity, and topology spread differ — and when do you use each?</summary><p><strong>Taints/tolerations</strong> are repulsion from the node side: a tainted node repels all pods except those that tolerate it (e.g. dedicate GPU nodes, or the control-plane taint). <strong>Node affinity/nodeSelector</strong> is attraction from the pod side: "schedule me on nodes with label disktype=ssd" (required or preferred). <strong>Pod affinity/anti-affinity</strong> place pods relative to <em>other pods</em> (co-locate with cache, or spread away from same-app pods). <strong>topologySpreadConstraints</strong> evenly distribute pods across a topology domain (zones/nodes) with a maxSkew, which is the modern, cheaper way to get AZ balance than anti-affinity. Rule of thumb: taints to reserve nodes, affinity to require capabilities, topology spread for availability distribution. They compose in the scheduler's filter/score phases.</p></details>
+
+  <details><summary>Base64 Secrets aren't encryption. How do you actually secure secrets at rest and in use?</summary><p>By default Secrets are stored in etcd base64-encoded (trivially reversible) and mounted into pods. To secure at rest: enable an <code>EncryptionConfiguration</code> on the apiserver with a KMS provider so etcd stores AEAD-encrypted values, keyed by a cloud KMS/HSM (envelope encryption), and rotate the KEK. For rotation and least exposure, use an external secret manager (Vault, AWS/GCP secret manager) via the CSI Secrets Store driver or External Secrets Operator so secrets are pulled just-in-time and rotated centrally rather than living statically in etcd. In use: set <code>automountServiceAccountToken: false</code> where not needed, restrict who can <code>get secrets</code> via RBAC (reading a Secret is often equivalent to owning the credential), avoid dumping secrets into env vars/logs, and use short-lived bound ServiceAccount tokens instead of long-lived ones.</p></details>
+
+  <details><summary>Explain the endpoint-removal race during pod shutdown and the correct graceful-shutdown pattern.</summary><p>When a pod is deleted, two things happen concurrently and asynchronously: (1) the endpoint controllers remove its IP from EndpointSlices and kube-proxy reprograms iptables — but this propagates across all nodes with some delay; (2) the kubelet sends SIGTERM to the container. If the app exits immediately on SIGTERM, it stops accepting connections while some nodes still route to it → connection refused/resets. The fix: add a <code>preStop</code> hook (e.g. <code>sleep 5–10</code>) so the container keeps serving during the deregistration window, handle SIGTERM by first flipping readiness to false and draining in-flight requests before exiting, and set <code>terminationGracePeriodSeconds</code> longer than your max request time. Order matters: fail readiness → wait for deregistration → stop accepting new → drain → exit.</p></details>
+
+  <details><summary>How does CNI actually give a pod an IP, and what causes "no IP available" ContainerCreating hangs?</summary><p>When kubelet creates the pod sandbox (the pause container that owns the network namespace), it invokes the CNI plugin binary with ADD. The plugin (Calico, Cilium, flannel, or a cloud CNI like AWS VPC CNI) allocates an IP from the pod CIDR/IPAM pool, creates a veth pair linking the pod netns to the host, and programs routes so the IP is reachable cluster-wide (overlay via VXLAN/IPIP, or native routing/BGP). "No IP available" happens when the IPAM pool is exhausted: e.g. AWS VPC CNI assigns real VPC IPs limited by ENI/instance type, or a per-node pod CIDR (/24 = 254 IPs) is too small for <code>--max-pods</code>. Symptoms are pods stuck ContainerCreating with CNI errors in kubelet logs. Fixes: larger CIDRs, prefix delegation (AWS), fewer pods per node, or a different IPAM mode.</p></details>
+
+  <details><summary>Multi-region Kubernetes: why can't one cluster span regions, and what's the right pattern?</summary><p>etcd is the blocker: Raft requires a quorum write on every mutation, and cross-region RTT (tens of ms) added to every write cripples control-plane latency and destabilizes leader elections. etcd is designed for LAN/single-region (or multi-AZ within a region, ~1-2ms). So you don't stretch a cluster across regions. The pattern is <strong>cluster-per-region</strong> (or per-AZ-group): each region has its own independent control plane and etcd, workloads deployed identically via GitOps (Argo/Flux) from one repo, a global load balancer (GeoDNS/anycast) routing users to the nearest healthy region, and data replicated at the datastore layer (not by K8s) — e.g. multi-region DB, async replication, or CRDTs. Tools like Cluster API, Fleet, or Karmada help manage many clusters. The trade-off is you now own cross-cluster consistency yourself, which is exactly where the real distributed-systems work lives.</p></details>
+
+</div>
