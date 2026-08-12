@@ -1,0 +1,39 @@
+<h1>Payment Gateway — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a service that lets merchants accept payments from customers and settles funds through payment providers.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Merchants can initiate a payment charge for a specified amount, currency, and customer.</li>
+  <li>The system must support multiple payment methods (cards, bank transfers, digital wallets).</li>
+  <li>The system must route each transaction to an appropriate downstream payment processor or acquiring bank.</li>
+  <li>Customers can complete a payment and receive a clear success or failure outcome.</li>
+  <li>The system must support refunds, both full and partial, against a completed payment.</li>
+  <li>The system must guarantee that a retried payment request is not charged more than once (idempotency).</li>
+  <li>Merchants can query the status and history of their transactions.</li>
+  <li>The system must notify merchants of payment outcomes via webhooks or callbacks.</li>
+  <li>The system must support authorization and later capture as separate steps.</li>
+  <li>The system must handle chargebacks and disputes initiated by customers or banks.</li>
+  <li>The system must produce reconciliation records matching internal transactions with provider settlements.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>The system must process 10,000 transactions per second at peak.</li>
+  <li>Payment authorization latency should be under 2 seconds end to end (p99).</li>
+  <li>Availability target of 99.99% for the payment-processing path.</li>
+  <li>Financial records must be strongly consistent and durable, with no double-charging or lost transactions.</li>
+  <li>The system must comply with PCI-DSS and protect sensitive cardholder data in transit and at rest.</li>
+  <li>Every transaction must produce a complete, immutable audit trail for regulatory and dispute purposes.</li>
+  <li>The system must remain correct under retries, partial failures, and provider timeouts.</li>
+  <li>Fraud-relevant signals must be captured for each transaction to support risk evaluation.</li>
+  <li>The system must support multiple currencies and regional regulatory requirements.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume merchants are already onboarded and KYC-verified; merchant onboarding flows are out of scope.</li>
+  <li>The internal fraud-scoring model itself is out of scope; only capturing signals is in scope.</li>
+  <li>Assume downstream processors and banks expose APIs for authorization and settlement.</li>
+  <li>Consumer-facing checkout UI design is excluded; focus is on the gateway service.</li>
+  <li>Tax calculation and invoicing are out of scope.</li>
+</ul>

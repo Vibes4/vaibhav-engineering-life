@@ -1,0 +1,39 @@
+<h1>Ticket Booking — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a service that lets users browse events and book seats or tickets that have limited availability.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can browse and search events by name, category, venue, date, and location.</li>
+  <li>Users can view real-time seat or ticket availability for a selected event.</li>
+  <li>Users can select specific seats or a quantity of general-admission tickets.</li>
+  <li>The system must temporarily hold selected seats for a user while they complete checkout.</li>
+  <li>The system must prevent two users from booking the same seat (no double-booking).</li>
+  <li>Users can complete a booking by paying, and receive a confirmation with ticket details.</li>
+  <li>The system must release held seats automatically if a user does not complete payment within the hold window.</li>
+  <li>Users can cancel a booking and, where eligible, receive a refund.</li>
+  <li>Users can view their booking history and upcoming tickets.</li>
+  <li>Organizers can create events and configure seating layouts, capacity, and pricing tiers.</li>
+  <li>The system must issue verifiable tickets that can be validated at venue entry.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>The system must handle sudden spikes of 100,000 concurrent users during high-demand on-sale events.</li>
+  <li>Seat availability reads should return in under 300 ms (p99).</li>
+  <li>Availability target of 99.95% for browsing and booking paths.</li>
+  <li>Seat allocation must be strongly consistent so that a seat is sold to exactly one buyer.</li>
+  <li>Booking and payment records must be durable and must survive component failures.</li>
+  <li>The system must sustain high booking throughput without overselling capacity.</li>
+  <li>Held-seat expiry and inventory release must be reliable and timely.</li>
+  <li>Payment and personal data must be protected in transit and at rest.</li>
+  <li>The system must scale to support many concurrent events across regions.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume payment processing is handled by an external gateway integrated by the system.</li>
+  <li>Assume users are authenticated; account registration flows are out of scope.</li>
+  <li>Dynamic surge pricing and resale marketplaces are excluded for this exercise.</li>
+  <li>Venue physical access hardware integration is assumed available and out of scope.</li>
+  <li>Marketing, promotions, and discount-code engines are out of scope.</li>
+</ul>

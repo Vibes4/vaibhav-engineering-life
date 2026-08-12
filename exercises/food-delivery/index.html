@@ -1,0 +1,41 @@
+<h1>Food Delivery — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design an on-demand food delivery service that connects customers, restaurants, and delivery couriers.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Customers can search and browse nearby restaurants filtered by cuisine, price, rating, and estimated delivery time.</li>
+  <li>Customers can view a restaurant's menu, add items to a cart, customize items, and place an order with payment.</li>
+  <li>The system must show a live estimated delivery time before and after checkout.</li>
+  <li>Restaurants can accept, reject, or update the preparation status of incoming orders.</li>
+  <li>The system must assign each accepted order to an available courier based on proximity and current load.</li>
+  <li>Customers can track their order and the courier's location on a map in real time until delivery.</li>
+  <li>Couriers can view assigned pickups, mark items as picked up, and mark orders as delivered.</li>
+  <li>The system must send order lifecycle notifications (confirmed, preparing, out for delivery, delivered) to customers.</li>
+  <li>Customers can rate and review restaurants and couriers after an order completes.</li>
+  <li>The system must support promotions, discount codes, and surge pricing during peak demand.</li>
+  <li>Customers can view order history and re-order a previous order.</li>
+  <li>The system must handle cancellations and refunds subject to order state and policy.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support 50M registered users with peaks of ~500K concurrent active orders during lunch and dinner windows.</li>
+  <li>Restaurant search and menu load must return within 200 ms at p95.</li>
+  <li>Courier location updates must propagate to the tracking customer within 3 seconds.</li>
+  <li>Order placement and payment flow must be highly available at 99.95% uptime.</li>
+  <li>Payment and order-state transitions must be strongly consistent; no double charges or lost orders.</li>
+  <li>Location and browse data may be eventually consistent within a few seconds.</li>
+  <li>Payment details and personal data (addresses, phone numbers) must be encrypted and PCI-compliant.</li>
+  <li>The system must scale geographically across multiple cities and regions with low regional latency.</li>
+  <li>Delivery-time estimates should be accurate within a ±5 minute band for most orders.</li>
+  <li>Operational cost per order must remain within a fixed budget as volume grows.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume restaurant onboarding, menu ingestion, and courier recruitment are handled by separate internal tooling.</li>
+  <li>Assume a third-party mapping and routing provider supplies geocoding and travel-time data.</li>
+  <li>Grocery, pharmacy, and non-food logistics are out of scope for this exercise.</li>
+  <li>Courier payroll, tax reporting, and dispatcher back-office tools are excluded.</li>
+  <li>Assume a single supported currency per region and existing payment gateways.</li>
+</ul>

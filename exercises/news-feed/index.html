@@ -1,0 +1,39 @@
+<h1>News Feed — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a social news feed that shows each user a personalized, continuously updated stream of posts from accounts they follow.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can create posts containing text, images, and video, and edit or delete their own posts.</li>
+  <li>Users can follow and unfollow other users and pages.</li>
+  <li>The system must generate a feed of posts from followed accounts for each user.</li>
+  <li>Users can scroll the feed with pagination and load older entries on demand.</li>
+  <li>Users can like, comment on, and share posts, with counts reflected in the feed.</li>
+  <li>The system must rank feed entries by relevance rather than strict reverse-chronological order.</li>
+  <li>New posts from followed accounts must appear in the feed shortly after publication.</li>
+  <li>Users can mute, hide, or report individual posts or accounts.</li>
+  <li>The system must deduplicate reshared content and avoid showing the same post repeatedly.</li>
+  <li>The system must support notifications for interactions on a user's own posts.</li>
+  <li>Users can view any account's profile and its list of posts.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support 300M daily active users with an aggregate feed-read rate of ~1M requests per second at peak.</li>
+  <li>Feed load must return the first screen within 200 ms at p95.</li>
+  <li>A newly published post should become eligible for followers' feeds within 5 seconds.</li>
+  <li>The system must tolerate celebrity accounts with tens of millions of followers without degrading fan-out.</li>
+  <li>Read availability must be 99.99%; a brief posting outage is more tolerable than a feed-read outage.</li>
+  <li>Feed content may be eventually consistent; slightly stale counts are acceptable.</li>
+  <li>Media and post data must be durable with no permanent loss of published content.</li>
+  <li>User privacy settings (private accounts, blocked users) must always be enforced on reads.</li>
+  <li>Read-heavy workload assumes roughly a 100:1 read-to-write ratio; cost must scale sub-linearly with reads.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume authentication, user registration, and the social graph store already exist.</li>
+  <li>Assume media upload, transcoding, and CDN delivery are provided by a separate media service.</li>
+  <li>Direct messaging, stories, and live video are out of scope.</li>
+  <li>Ad insertion and monetization ranking are excluded from this exercise.</li>
+  <li>Assume content moderation of illegal material is handled by a dedicated trust-and-safety pipeline.</li>
+</ul>

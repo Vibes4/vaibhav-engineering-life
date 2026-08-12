@@ -1,0 +1,38 @@
+<h1>WhatsApp — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a mobile messaging service that lets users exchange one-to-one and group messages in real time.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can send and receive one-to-one text messages in real time.</li>
+  <li>Users can create and participate in group chats with many members.</li>
+  <li>The system must show per-message delivery states: sent, delivered, and read.</li>
+  <li>Users can see the online/last-seen and typing status of their contacts (subject to privacy settings).</li>
+  <li>Users can send media attachments such as images, video, audio, and documents.</li>
+  <li>Messages sent while a recipient is offline must be delivered once they reconnect.</li>
+  <li>The system must preserve message ordering within a conversation as perceived by participants.</li>
+  <li>Users can register and be discoverable by phone number, syncing existing device contacts.</li>
+  <li>Users can make voice and video calls.</li>
+  <li>Message history must sync across a user's linked devices.</li>
+  <li>Users can receive push notifications for new messages when the app is backgrounded.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Scale target: ~2B users and on the order of 100B messages exchanged per day.</li>
+  <li>Message delivery should feel instantaneous, with end-to-end delivery p99 under ~1 second when both parties are online.</li>
+  <li>Availability target of 99.99%; the service must remain usable during regional outages.</li>
+  <li>Messages must be end-to-end encrypted so that the platform cannot read message contents.</li>
+  <li>Undelivered messages must be durably retained until delivered (with a defined retention window).</li>
+  <li>Once delivered to all recipients, message payloads should not be retained server-side longer than necessary.</li>
+  <li>The system must operate reliably on low-bandwidth and intermittent mobile connections.</li>
+  <li>Group message fan-out must scale to large groups without degrading delivery latency.</li>
+  <li>The system must resist spam and abuse at the account and message-rate level.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume each user is identified by a verified phone number; identity/KYC design is out of scope.</li>
+  <li>Broadcast channels, payments, and business/API messaging are excluded unless stated.</li>
+  <li>Assume clients handle local encryption key storage; key-exchange protocol internals are out of scope.</li>
+  <li>Long-term server-side archival of chat history beyond sync needs is excluded.</li>
+</ul>

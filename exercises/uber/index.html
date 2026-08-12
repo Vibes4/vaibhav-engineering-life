@@ -1,0 +1,40 @@
+<h1>Uber — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a ride-hailing service that matches riders requesting trips with nearby available drivers.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Riders can request a ride from a pickup location to a destination.</li>
+  <li>The system must match a rider's request to a suitable nearby available driver.</li>
+  <li>Drivers can go online/offline and accept or decline incoming ride requests.</li>
+  <li>The system must continuously track and update driver locations while they are online.</li>
+  <li>Riders can see nearby drivers and an estimated time of arrival before requesting.</li>
+  <li>The system must provide an upfront fare estimate and compute the final fare at trip end.</li>
+  <li>Riders and drivers can track each other's live location during pickup and the trip.</li>
+  <li>The system must support surge/dynamic pricing during high demand.</li>
+  <li>Payment must be collected from the rider and settled to the driver after each trip.</li>
+  <li>Riders and drivers can rate each other after a completed trip.</li>
+  <li>The system must maintain trip history for both riders and drivers.</li>
+  <li>The system must handle cancellations by either party, with applicable policies.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Scale target: millions of active drivers and tens of millions of trips per day globally.</li>
+  <li>Driver location updates arrive at high frequency (every few seconds per active driver).</li>
+  <li>Matching latency should be low, with a rider seeing a matched driver within a few seconds (p99).</li>
+  <li>Availability target of 99.99%; the platform is real-time and revenue-critical.</li>
+  <li>Location and matching must be strongly geo-consistent enough to avoid double-booking a driver.</li>
+  <li>Financial transactions (fares, payouts) must be accurate and auditable with no lost or duplicated charges.</li>
+  <li>The system must operate across many cities/regions and time zones with low regional latency.</li>
+  <li>Rider and driver location/PII must be protected and access-controlled.</li>
+  <li>The system must degrade gracefully under demand spikes (e.g., events, weather).</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume map, routing, and ETA data are available from an external maps provider.</li>
+  <li>Food delivery, freight, and other business lines are out of scope.</li>
+  <li>Assume driver onboarding/background checks exist; designing that pipeline is excluded.</li>
+  <li>Assume a payment gateway exists; card network integration internals are out of scope.</li>
+  <li>Multi-stop and scheduled/future rides are excluded unless stated.</li>
+</ul>

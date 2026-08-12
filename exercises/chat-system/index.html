@@ -1,0 +1,40 @@
+<h1>Chat System — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a real-time messaging service that supports one-to-one and group conversations across web and mobile clients.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can send and receive one-to-one text messages in real time.</li>
+  <li>Users can create group conversations and exchange messages with up to 500 members per group.</li>
+  <li>The system must deliver messages to online recipients immediately and queue them for offline recipients until they reconnect.</li>
+  <li>Users can see per-message delivery states: sent, delivered, and read.</li>
+  <li>Users can see presence indicators (online, offline, last-seen) and typing indicators for their contacts.</li>
+  <li>Users can send media attachments (images, video, files) alongside text messages.</li>
+  <li>The system must preserve and display full conversation history in chronological order.</li>
+  <li>Users can search their message history by keyword and by contact.</li>
+  <li>Users can edit or delete their own sent messages, with the change reflected for all participants.</li>
+  <li>The system must support push notifications to mobile devices for new messages when the app is backgrounded.</li>
+  <li>Users can be authenticated and can maintain multiple concurrent sessions across devices.</li>
+  <li>Messages must be synchronized consistently across all of a user's logged-in devices.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>The system must support 50 million daily active users and 500,000 concurrent connections at peak.</li>
+  <li>End-to-end message delivery latency should be under 500 ms for online recipients (p99).</li>
+  <li>Availability target of 99.99% for message send and receive paths.</li>
+  <li>Messages must be durably stored with no loss once acknowledged as sent.</li>
+  <li>Message ordering within a conversation must be preserved for all participants.</li>
+  <li>The system must sustain a peak throughput of 1 million messages per second.</li>
+  <li>Message content should be protected in transit and at rest to meet privacy expectations.</li>
+  <li>The system must scale horizontally as user and message volume grow, without downtime.</li>
+  <li>Storage and delivery costs should remain efficient as history accumulates over years.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume users are already registered; account signup and contact discovery flows are out of scope.</li>
+  <li>Voice and video calling are excluded; only text and media messaging are in scope.</li>
+  <li>Assume clients have intermittent connectivity and may go offline for extended periods.</li>
+  <li>Content moderation and spam detection are out of scope for this exercise.</li>
+  <li>Payments, stickers marketplace, and bot integrations are excluded.</li>
+</ul>

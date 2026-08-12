@@ -1,0 +1,292 @@
+<h1>Elasticsearch <span class="tag express">Mastery</span></h1>
+<p>Elasticsearch is a distributed, near-real-time search and analytics engine built on top of Apache Lucene. You throw JSON documents at it, it builds an <strong>inverted index</strong> (term → list of documents), and it answers full-text, structured, geo, and aggregation queries in milliseconds across billions of documents by sharding the data and fanning queries out to every shard in parallel. This page covers the core concepts, the full <strong>CRUD query surface</strong> with real request bodies, and — the part everyone gets wrong in interviews — <strong>pagination: the three types, why deep <code>from</code>/<code>size</code> is a trap, and how <code>search_after</code> + Point-in-Time does it correctly</strong>.</p>
+
+<h2>Interview Explanation — 30 seconds</h2>
+<div class="callout tip"><strong>Say this:</strong> "Elasticsearch is a distributed document store and search engine on top of Lucene. Documents are JSON, grouped into an <em>index</em>, which is split into <em>shards</em> (each a self-contained Lucene index) and replicated for HA. On write it analyzes text into terms and stores them in an inverted index; on read a coordinating node scatters the query to every shard, each returns its top matches ranked by BM25 relevance, and the coordinator gathers and merges them. It's <em>near-real-time</em> — writes become searchable after a refresh, ~1 second by default. I use it for full-text search, log/observability analytics, and faceted filtering."</div>
+
+<h2>Core concepts / building blocks</h2>
+<table>
+  <tr><th>Concept</th><th>What it is</th></tr>
+  <tr><td>Document</td><td>A single JSON object — the unit of indexing and search. Has an <code>_id</code> and lives in an index.</td></tr>
+  <tr><td>Index</td><td>A logical collection of documents with a shared <em>mapping</em> (like a table, but schema-flexible). Physically split into shards.</td></tr>
+  <tr><td>Mapping</td><td>The schema: field names → types (<code>text</code>, <code>keyword</code>, <code>integer</code>, <code>date</code>, <code>geo_point</code>, <code>nested</code>…) and how each is analyzed/indexed.</td></tr>
+  <tr><td>Shard (primary)</td><td>A self-contained Lucene index holding a subset of the documents. An index is split into N primary shards <em>at creation</em> (can't change without reindex).</td></tr>
+  <tr><td>Replica shard</td><td>A copy of a primary on another node — provides HA (failover) and extra read throughput. Configurable and changeable any time.</td></tr>
+  <tr><td>Node / Cluster</td><td>A node is one ES process; a cluster is nodes sharing data. Roles: master (cluster state), data (holds shards), coordinating (routes queries), ingest.</td></tr>
+  <tr><td>Inverted index</td><td>The core structure: for every <em>term</em>, the sorted list of documents containing it (a postings list) — turns "which docs contain 'search'?" into an O(1) lookup + list scan.</td></tr>
+  <tr><td>Analyzer</td><td>The text pipeline at index &amp; query time: character filters → tokenizer → token filters (lowercase, stop-words, stemming). <code>text</code> fields are analyzed; <code>keyword</code> fields are stored verbatim.</td></tr>
+  <tr><td>Segment</td><td>An immutable Lucene file a refresh flushes to. Searches hit all segments; a background <em>merge</em> consolidates them. Immutability is why deletes are just tombstones.</td></tr>
+</table>
+
+<h2>Interview Explanation — 2 minutes</h2>
+<ul>
+  <li><strong>Write path:</strong> a document is routed to a shard by <code>hash(_id) % number_of_primary_shards</code>, written to the in-memory buffer + a translog (durability), then a periodic <strong>refresh</strong> (default 1s) turns the buffer into a searchable segment — this is why ES is "near-real-time", not real-time.</li>
+  <li><strong>Analysis:</strong> a <code>text</code> field like "Fast Searching" becomes terms <code>[fast, search]</code> (lowercased, stemmed) via an analyzer, and each term points back to the doc in the inverted index. A <code>keyword</code> field stays "Fast Searching" verbatim for exact match/sort/aggregation.</li>
+  <li><strong>Read path:</strong> any node can be the <em>coordinating node</em>. It fans the query to one copy of each shard (query phase → each returns top-K doc IDs + scores), merges/sorts, then a fetch phase pulls the actual <code>_source</code> for the final K. This <strong>scatter-gather</strong> is the key to understanding pagination cost.</li>
+  <li><strong>Relevance:</strong> scored with <strong>BM25</strong> by default (term frequency ↑ score, but saturating; rarer terms weigh more via IDF; longer docs are penalized). Filters (yes/no) skip scoring and are cacheable.</li>
+  <li><strong>Consistency model:</strong> per-document CRUD is strongly consistent and versioned (optimistic concurrency via <code>_seq_no</code>/<code>_primary_term</code>); search is eventually-visible (after refresh). It is <em>not</em> a transactional store — no multi-document ACID.</li>
+</ul>
+
+<h2>Cluster architecture (scatter-gather)</h2>
+<pre class="mermaid">
+flowchart TD
+  C["Client"] --> CO["Coordinating node"]
+  CO -->|query phase| S0["Shard 0 (primary)"]
+  CO -->|query phase| S1["Shard 1 (replica)"]
+  CO -->|query phase| S2["Shard 2 (primary)"]
+  S0 -->|top-K ids + scores| CO
+  S1 -->|top-K ids + scores| CO
+  S2 -->|top-K ids + scores| CO
+  CO -->|merge + sort, then fetch _source| C
+</pre>
+<p>The coordinating node asks each shard for its own top <code>from + size</code> hits, then merges. Remember this: <strong>every shard must produce <code>from + size</code> results even if you only want page 500</strong> — that is the entire reason deep offset pagination is expensive.</p>
+
+<h2>CRUD — Create (index a document)</h2>
+<p>First, create an index with an explicit mapping (recommended in production over dynamic mapping):</p>
+<pre><code>PUT /products
+{
+  "settings": { "number_of_shards": 3, "number_of_replicas": 1 },
+  "mappings": {
+    "properties": {
+      "name":     { "type": "text" },
+      "sku":      { "type": "keyword" },
+      "price":    { "type": "scaled_float", "scaling_factor": 100 },
+      "in_stock": { "type": "boolean" },
+      "created":  { "type": "date" },
+      "tags":     { "type": "keyword" }
+    }
+  }
+}</code></pre>
+<p>Index (write) a document — three variants:</p>
+<pre><code># Explicit id, "index" = create-or-replace (idempotent on _id)
+PUT /products/_doc/1
+{ "name": "Wireless Mouse", "sku": "WM-100", "price": 24.99, "in_stock": true, "created": "2024-01-05", "tags": ["mouse","wireless"] }
+
+# Auto-generated id (POST, no id)
+POST /products/_doc
+{ "name": "Mechanical Keyboard", "sku": "KB-200", "price": 79.00, "in_stock": true }
+
+# create ONLY — fails with 409 if the id already exists (safe insert)
+PUT /products/_create/1
+{ "name": "..." }</code></pre>
+<div class="callout tip"><strong>index vs create:</strong> <code>PUT _doc/{id}</code> (op "index") overwrites; <code>PUT _create/{id}</code> refuses to overwrite. Use <code>_create</code> when a duplicate write must not clobber existing data.</div>
+
+<h2>CRUD — Read</h2>
+<pre><code># Get one document by id (real-time — bypasses refresh, reads the translog)
+GET /products/_doc/1
+
+# Get many by id in one round trip
+GET /products/_mget
+{ "ids": ["1", "2", "3"] }
+
+# Search: full-text match (analyzed) vs exact term (not analyzed)
+GET /products/_search
+{ "query": { "match": { "name": "wireless mouse" } } }
+
+GET /products/_search
+{ "query": { "term": { "sku": "WM-100" } } }   # term = exact, on keyword fields
+
+# Bool query: must (score) + filter (no score, cached) + must_not + should
+GET /products/_search
+{
+  "query": {
+    "bool": {
+      "must":     [ { "match": { "name": "keyboard" } } ],
+      "filter":   [ { "term": { "in_stock": true } },
+                    { "range": { "price": { "gte": 20, "lte": 100 } } } ],
+      "must_not": [ { "term": { "tags": "refurbished" } } ],
+      "should":   [ { "term": { "tags": "wireless" } } ]
+    }
+  }
+}</code></pre>
+<div class="callout tip"><strong>query vs filter context:</strong> clauses in <code>must</code>/<code>should</code> run in <em>query context</em> and compute a relevance <code>_score</code>. Clauses in <code>filter</code>/<code>must_not</code> run in <em>filter context</em> — a yes/no decision, no scoring, and the result bitset is <strong>cached</strong>. Put everything that's a hard yes/no (status, date range, ownership) in <code>filter</code>; it's faster and cache-friendly.</div>
+
+<h2>CRUD — Update</h2>
+<pre><code># Partial update — merge fields (read-modify-reindex under the hood; docs are immutable)
+POST /products/_update/1
+{ "doc": { "price": 22.49, "in_stock": false } }
+
+# Upsert — update if present, otherwise insert the "upsert" body
+POST /products/_update/1
+{ "doc": { "price": 22.49 }, "upsert": { "name": "Wireless Mouse", "price": 22.49 } }
+
+# Scripted update — e.g. atomic counter increment
+POST /products/_update/1
+{ "script": { "source": "ctx._source.views += params.n", "params": { "n": 1 } } }
+
+# Optimistic concurrency: only apply if the doc hasn't changed since you read it
+PUT /products/_doc/1?if_seq_no=42&amp;if_primary_term=1
+{ "name": "Wireless Mouse v2", "price": 22.49 }
+
+# Update many by query
+POST /products/_update_by_query
+{ "query": { "term": { "tags": "clearance" } },
+  "script": { "source": "ctx._source.price *= 0.8" } }</code></pre>
+<div class="callout warn"><strong>Watch out:</strong> there is no in-place edit. A partial update fetches the doc, applies the change, and re-indexes a whole new version (the old one becomes a tombstone until segment merge). High-frequency updates to the same doc are an anti-pattern — model hot counters in Redis, not ES.</div>
+
+<h2>CRUD — Delete</h2>
+<pre><code># Delete one by id (creates a tombstone; space reclaimed on merge)
+DELETE /products/_doc/1
+
+# Delete many by query
+POST /products/_delete_by_query
+{ "query": { "range": { "created": { "lt": "2020-01-01" } } } }
+
+# Drop the whole index
+DELETE /products</code></pre>
+
+<h2>CRUD — Bulk (the throughput API)</h2>
+<p>Never index documents one HTTP request at a time in production. The Bulk API takes newline-delimited JSON (NDJSON): an action line, then (for index/create/update) a source line. One round trip, many ops.</p>
+<pre><code>POST /_bulk
+{ "index":  { "_index": "products", "_id": "1" } }
+{ "name": "Wireless Mouse", "price": 24.99 }
+{ "update": { "_index": "products", "_id": "1" } }
+{ "doc": { "price": 19.99 } }
+{ "delete": { "_index": "products", "_id": "2" } }
+</code></pre>
+<div class="callout tip"><strong>Say this:</strong> "Batch with Bulk — a few MB or ~1–5k docs per request — and index without an <code>_id</code> when you can, so ES auto-generates one and skips the read-before-write dedupe check."</div>
+
+<h2>Pagination — the three types</h2>
+<p>This is the highest-signal Elasticsearch interview topic. There are three ways to page, and choosing wrong is a real production outage.</p>
+<table>
+  <tr><th>Type</th><th>Mechanism</th><th>Good for</th><th>Cost / limit</th></tr>
+  <tr><td><strong>Offset</strong> — <code>from</code> / <code>size</code></td><td>Skip <code>from</code>, take <code>size</code>. Each shard returns <code>from+size</code> hits to the coordinator.</td><td>Shallow paging: jump-to-page UIs, first few pages.</td><td>Capped at <code>index.max_result_window</code> = <strong>10 000</strong>. Cost grows O(from+size) <em>per shard</em> — deep pages blow up heap.</td></tr>
+  <tr><td><strong>Cursor / keyset</strong> — <code>search_after</code></td><td>"Give me results after this sort value." Stateless cursor = the sort values of the last hit.</td><td>Deep pagination, infinite scroll, "next page" flows. The correct default for &gt; a few pages.</td><td>No jump-to-arbitrary-page; needs a deterministic total sort (with a tiebreaker). Pair with a PIT for consistency.</td></tr>
+  <tr><td><strong>Snapshot</strong> — <code>scroll</code></td><td>Freezes a snapshot of the index and streams batches via a scroll_id.</td><td>Bulk export / reindex of an entire result set (offline jobs).</td><td>Stateful &amp; heavy (holds segments open); <strong>not</strong> for live user pagination. Superseded by PIT + <code>search_after</code>.</td></tr>
+</table>
+
+<h3>1. Offset pagination — <code>from</code> / <code>size</code></h3>
+<pre><code>GET /products/_search
+{ "from": 20, "size": 10, "sort": [ { "price": "asc" } ],
+  "query": { "match_all": {} } }</code></pre>
+<p>Page 3 with page size 10 → <code>from:20, size:10</code>. Simple, supports random page access. But to return page 501 (<code>from:5000</code>), <strong>each of the N shards must build and ship 5010 hits</strong> to the coordinator, which then sorts ~N×5010 and discards all but 10. That's why <code>from + size</code> is hard-capped at <code>max_result_window</code> (10 000) — beyond it you get an error, by design.</p>
+<div class="callout warn"><strong>Gotcha:</strong> raising <code>max_result_window</code> to "fix" a deep-pagination error is the classic mistake — it just moves the OOM further out. Past ~page 1000 you must switch to <code>search_after</code>.</div>
+
+<h3>2. Keyset pagination — <code>search_after</code> (the right way to go deep)</h3>
+<p>Instead of an offset, you remember the <em>sort values of the last row you saw</em> and ask for everything after it. Cost is constant per page regardless of depth. It requires a <strong>total, deterministic sort</strong> — always add a unique tiebreaker so ties never drop or duplicate rows.</p>
+<pre><code># Page 1 — normal search, note the sort tiebreaker (_shard_doc / _id)
+GET /products/_search
+{
+  "size": 10,
+  "sort": [ { "price": "asc" }, { "_id": "asc" } ],
+  "query": { "term": { "in_stock": true } }
+}
+# → each hit has a "sort" array, e.g. the last hit: "sort": [24.99, "WM-100"]
+
+# Page 2 — pass the last hit's sort values as search_after
+GET /products/_search
+{
+  "size": 10,
+  "sort": [ { "price": "asc" }, { "_id": "asc" } ],
+  "search_after": [24.99, "WM-100"],
+  "query": { "term": { "in_stock": true } }
+}</code></pre>
+<div class="callout tip"><strong>Why a tiebreaker?</strong> If you sort only by <code>price</code> and 50 products cost 24.99, the cursor <code>[24.99]</code> is ambiguous — you'd skip or repeat rows at the boundary. Adding <code>_id</code> (or <code>_shard_doc</code> under a PIT) makes every sort key unique, so the cursor points at exactly one row.</div>
+
+<h3>3. Complex / consistent deep pagination — PIT + <code>search_after</code></h3>
+<p><code>search_after</code> alone runs against the <em>live</em> index — if documents are inserted/deleted between pages, rows can shift. A <strong>Point-in-Time (PIT)</strong> freezes a consistent view so the whole pagination sees one snapshot. This is the modern replacement for the <code>scroll</code> API.</p>
+<pre><code># 1) Open a PIT (returns an id); keep_alive is how long the view lives
+POST /products/_pit?keep_alive=2m
+# → { "id": "46ToAwMDaWR5B..." }
+
+# 2) First page — NOTE: no index in the URL; the pit carries it.
+#    Use _shard_doc as the efficient, unique tiebreaker (only valid with a PIT).
+GET /_search
+{
+  "size": 10,
+  "query": { "term": { "in_stock": true } },
+  "pit": { "id": "46ToAwMDaWR5B...", "keep_alive": "2m" },
+  "sort": [ { "price": "asc" }, { "_shard_doc": "asc" } ],
+  "track_total_hits": false
+}
+
+# 3) Next page — feed back the LAST hit's sort array AND the (possibly refreshed) pit id
+GET /_search
+{
+  "size": 10,
+  "query": { "term": { "in_stock": true } },
+  "pit": { "id": "46ToAwMDaWR5B...", "keep_alive": "2m" },
+  "sort": [ { "price": "asc" }, { "_shard_doc": "asc" } ],
+  "search_after": [24.99, 421]
+}
+
+# 4) When done, close it to free resources
+DELETE /_pit
+{ "id": "46ToAwMDaWR5B..." }</code></pre>
+<div class="callout tip"><strong>Two performance flags:</strong> set <code>"track_total_hits": false</code> so ES stops counting the exact total after 10k (counting all matches is expensive and you rarely need it while deep-paging); and prefer <code>_shard_doc</code> as the tiebreaker under a PIT — it's a cheap, globally-unique, monotonic doc counter.</div>
+
+<h3>Bonus: paginating aggregations — <code>composite</code> + <code>after</code></h3>
+<p><code>from</code>/<code>size</code> don't page <em>buckets</em>. To page through millions of aggregation buckets (e.g. every SKU's sales) use a <code>composite</code> aggregation and feed its <code>after_key</code> back like a cursor:</p>
+<pre><code>GET /products/_search
+{ "size": 0,
+  "aggs": { "by_tag": { "composite": {
+      "size": 100,
+      "sources": [ { "tag": { "terms": { "field": "tags" } } } ],
+      "after": { "tag": "wireless" }      // ← cursor from the previous response's after_key
+  } } } }</code></pre>
+
+<h2>Types of pagination — how to choose</h2>
+<ul>
+  <li><strong>Offset (<code>from</code>/<code>size</code>)</strong> → shallow, jump-to-page. Same idea as SQL <code>LIMIT/OFFSET</code>. Simple, but O(offset) and capped at 10k.</li>
+  <li><strong>Keyset / cursor (<code>search_after</code>)</strong> → deep paging &amp; infinite scroll. Same idea as SQL "keyset pagination" (<code>WHERE (price,id) &gt; (?, ?) ORDER BY price,id</code>). Constant cost per page, no arbitrary jumps.</li>
+  <li><strong>Snapshot (<code>scroll</code>)</strong> → one-shot full export in a batch job. Consistent but stateful/heavy; don't use for user-facing UIs.</li>
+  <li><strong>PIT + <code>search_after</code></strong> → deep paging that must be <em>consistent</em> across pages (report exports, "download all matching"). The recommended modern approach; replaces scroll.</li>
+  <li><strong>Composite <code>after_key</code></strong> → paging aggregation buckets, not documents.</li>
+</ul>
+<div class="callout warn"><strong>Rule of thumb:</strong> first few pages of a UI → <code>from</code>/<code>size</code>. Anything that can go deep, infinite-scroll, or export → <code>search_after</code> (add a PIT if consistency matters). Reach for <code>scroll</code> only for legacy batch jobs.</div>
+
+<h2>Why was this built?</h2>
+<p>Shay Banon created Elasticsearch (2010) to put a distributed, JSON/REST, horizontally-scalable layer over Apache Lucene. Lucene is a brilliant single-machine search library but has no clustering, no sharding, no REST API, and no easy scale-out. Databases at the time did full-text search poorly (LIKE '%x%' can't use a B-tree; MySQL FULLTEXT was limited and didn't scale). Elasticsearch made Lucene distributed and developer-friendly, and became the backbone of the ELK/Elastic Stack for logging and observability.</p>
+
+<h2>Why not other alternatives?</h2>
+<table>
+  <tr><th>Alternative</th><th>vs Elasticsearch</th><th>When it wins</th></tr>
+  <tr><td>PostgreSQL full-text / <code>pg_trgm</code></td><td>One system, transactional, no extra infra</td><td>Modest search volumes where you already run Postgres and want ACID + search together</td></tr>
+  <tr><td>OpenSearch</td><td>Apache-2.0 fork of ES 7.10 (AWS-led) after Elastic's license change</td><td>You want a permissively-licensed, AWS-managed drop-in; API-compatible for most use</td></tr>
+  <tr><td>Apache Solr</td><td>Also Lucene-based; mature, strong faceting</td><td>Existing Solr shops; some prefer its config model</td></tr>
+  <tr><td>Algolia / Typesense</td><td>Managed, ultra-low-latency instant search, simpler</td><td>Product/site search where you want turnkey typo-tolerance and speed over analytics</td></tr>
+  <tr><td>Vector DBs (Pinecone, Milvus)</td><td>Purpose-built ANN vector search</td><td>Pure semantic/embedding search at scale (though ES now has <code>dense_vector</code> + kNN too)</td></tr>
+  <tr><td>ClickHouse</td><td>Columnar OLAP, faster for pure analytical aggregations</td><td>Huge analytical scans/aggregations where you don't need full-text relevance</td></tr>
+</table>
+
+<h2>Advantages</h2>
+<ul>
+  <li><strong>Full-text relevance:</strong> analyzers, stemming, fuzziness, synonyms, BM25 scoring out of the box.</li>
+  <li><strong>Horizontal scale:</strong> shard + replicate across nodes; queries fan out in parallel.</li>
+  <li><strong>Rich queries:</strong> full-text, structured filters, geo, nested/parent-child, aggregations, and kNN vector search in one engine.</li>
+  <li><strong>Near-real-time:</strong> writes searchable within ~1s; great for logs/metrics dashboards.</li>
+  <li><strong>Ecosystem:</strong> Kibana, Beats, Logstash, ingest pipelines — the de-facto observability stack.</li>
+</ul>
+
+<h2>Drawbacks / When NOT to use it</h2>
+<div class="callout warn"><strong>Anti-use-cases:</strong>
+<ul>
+  <li><strong>System of record / transactions</strong> — no multi-doc ACID, eventual visibility, and reindex-on-update. Keep the source of truth in a real DB and index <em>into</em> ES.</li>
+  <li><strong>Frequent updates to the same document</strong> — every update reindexes the whole doc. Use Redis/DB for hot counters.</li>
+  <li><strong>Deep random-access pagination for huge result sets via <code>from</code>/<code>size</code></strong> — use <code>search_after</code>; don't fight the 10k window.</li>
+  <li><strong>Tiny datasets</strong> — a Postgres index is simpler and cheaper than running a cluster.</li>
+  <li><strong>Strong consistency / joins across documents</strong> — ES denormalizes; there are no real joins (only limited nested/parent-child).</li>
+</ul></div>
+
+<h2>Trade-offs &amp; production concerns</h2>
+<ul>
+  <li><strong>Shard count is (mostly) fixed:</strong> primary shard count is set at index creation and needs a <em>reindex</em> to change. Too few = hot shards; too many = overhead. Aim for ~10–50 GB per shard.</li>
+  <li><strong>Refresh interval:</strong> default 1s. Increasing it (e.g. <code>30s</code>) during heavy bulk loads boosts indexing throughput at the cost of search freshness.</li>
+  <li><strong>Mapping explosion:</strong> dynamic mapping on arbitrary JSON keys can create thousands of fields and blow up the cluster state. Disable dynamic mapping or use <code>flattened</code> fields for unbounded keys.</li>
+  <li><strong>text vs keyword:</strong> you can't sort/aggregate on an analyzed <code>text</code> field — you need a <code>keyword</code> sub-field (the standard <code>field.keyword</code> multi-field pattern).</li>
+  <li><strong>Deep pagination heap pressure:</strong> big <code>from</code> or huge <code>size</code> across many shards is a top cause of circuit-breaker OOMs.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Deep-dive Q&amp;A — model answers</h3>
+  <details><summary>What actually is an inverted index?</summary><p>It's a map from <em>term → sorted list of document ids containing that term</em> (the postings list), often with term frequencies and positions. To answer "which docs contain 'search'?" you look up the term and get the doc list directly, instead of scanning every document (a "forward" index would be doc → its words). Combined with the analyzer that normalizes text into terms at index time, this is what makes full-text search fast. Boolean queries intersect/union postings lists; phrase queries also use the stored positions.</p></details>
+  <details><summary>Why is Elasticsearch "near-real-time" and not real-time?</summary><p>A write goes into an in-memory buffer plus the translog (for durability), but it isn't searchable until a <em>refresh</em> turns the buffer into a new immutable Lucene segment — by default every 1 second. So there's a sub-second lag between indexing and searchability. GET-by-id is the exception: it's real-time because it can read the translog directly. You can force <code>?refresh=true</code> on a write for immediate visibility, but doing it per-request kills throughput by creating tiny segments.</p></details>
+  <details><summary>Explain the difference between <code>match</code> and <code>term</code>.</summary><p><code>match</code> is a full-text query: it runs the search string through the same analyzer as the field, so "Wireless Mouse" becomes <code>[wireless, mouse]</code> and matches analyzed <code>text</code> fields. <code>term</code> is an exact, non-analyzed lookup of a single token — use it on <code>keyword</code> fields (ids, statuses, tags). A classic bug is running <code>term</code> against a <code>text</code> field: the field was lowercased/stemmed at index time but your <code>term</code> value wasn't analyzed, so it silently matches nothing.</p></details>
+  <details><summary>Walk through what happens on a search request, and where pagination cost comes from.</summary><p>A coordinating node receives the query and fans it to one copy (primary or replica) of every shard — the <em>query phase</em>. Each shard runs the query locally and returns the ids + sort/score of its own top <code>from + size</code> hits. The coordinator merges all of those, sorts globally, and keeps the window it needs; then the <em>fetch phase</em> pulls the <code>_source</code> for just the final <code>size</code> docs. The cost of deep offset pagination is right there: to serve <code>from:9990, size:10</code>, every shard ships 10 000 hits to the coordinator, which sorts N×10 000 and throws almost all away — that's O(from+size) per shard and why the 10k <code>max_result_window</code> exists.</p></details>
+  <details><summary>You need to export 5 million matching documents. How do you paginate?</summary><p>Not with <code>from</code>/<code>size</code> — you'd hit the 10k window and OOM the heap. Open a <strong>Point-in-Time</strong> for a consistent snapshot, then loop with <code>search_after</code>, sorting on a unique key (e.g. <code>_shard_doc</code>), passing each page's last <code>sort</code> array as the next <code>search_after</code>, with <code>track_total_hits:false</code> and a reasonable <code>size</code> (say 1000). Close the PIT at the end. (The older <code>scroll</code> API also works for a one-shot export but is heavier and now discouraged in favor of PIT + <code>search_after</code>.)</p></details>
+  <details><summary>Why does <code>search_after</code> require a tiebreaker, and what's the risk without one?</summary><p><code>search_after</code> is "resume after this exact sort position." If the sort isn't unique — say you sort only by <code>price</code> and many docs share a price — the cursor value is ambiguous at the boundary between pages, so rows with the boundary value can be skipped or returned twice. Adding a globally-unique tiebreaker (<code>_id</code>, or <code>_shard_doc</code> under a PIT) makes every document's sort key unique, so the cursor identifies exactly one row and paging is lossless.</p></details>
+  <details><summary>Why can't I sort or aggregate on my <code>text</code> field?</summary><p>Analyzed <code>text</code> fields are tokenized into multiple terms and stored in the inverted index, not as a single sortable value, and they don't have <em>doc values</em> (the columnar structure ES uses for sort/aggregation) by default. So ES refuses to sort/aggregate on them (or warns and needs fielddata, which is memory-hungry). The standard fix is a multi-field: index the field as <code>text</code> for search AND as <code>field.keyword</code> (a <code>keyword</code> sub-field) for exact sort/aggregation.</p></details>
+  <details><summary>How does optimistic concurrency control work in ES?</summary><p>Every document carries <code>_seq_no</code> (a per-shard monotonically increasing write counter) and <code>_primary_term</code> (bumped on primary failover). When you read a doc you get both; on write you pass <code>if_seq_no</code> and <code>if_primary_term</code>. ES applies the write only if they still match — otherwise it returns a 409 conflict, meaning someone else wrote in between. This gives you compare-and-swap semantics for concurrent updates without locks (the older <code>version</code>-based approach is deprecated in favor of seq_no/primary_term).</p></details>
+  <details><summary>How would you size shards, and why does it matter for pagination?</summary><p>Target roughly 10–50 GB per shard and keep shard count proportional to data and query parallelism — too many small shards waste heap on cluster state and per-shard overhead; too few create hot shards. It matters for pagination because every query fans out to every shard and each returns <code>from+size</code> hits: more shards means more partial results to merge at the coordinator, so deep offset pagination gets more expensive as shard count grows. Right-sizing shards plus using <code>search_after</code> keeps the coordinator's merge cheap.</p></details>
+  <details><summary>How do you keep Elasticsearch in sync with your primary database?</summary><p>Treat ES as a derived read model, never the source of truth. Common patterns: (1) dual-write from the app (simple but risky — the two can diverge on partial failure); (2) transactional outbox + a CDC pipeline (Debezium reading the DB's change log → Kafka → an indexer into ES) which is the robust, at-least-once approach; (3) periodic reindex jobs for backfills. Make the indexer idempotent (index by primary key) so replays are safe, and reindex into a new index behind an alias for zero-downtime mapping changes.</p></details>
+</div>

@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Alpha Platform — Architecture (Interview Brief)</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+
+  <!-- No-flash dark mode (same pattern as the main site) -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'dark' || (!t && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+          document.documentElement.classList.add('dark');
+        }
+      } catch (e) {}
+    })();
+  </script>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
+
+  <style>
+    :root{
+      --bg:#ffffff; --panel:#fbfbf8; --text:#24292f; --heading:#1f2328; --muted:#656d76;
+      --border:#eaecef; --accent:#6639ba; --accent-bg:#ece7fb;
+      --write:#bc4c00; --write-bg:#fff1e0;
+      --read:#1a7f37; --read-bg:#ddf4e4;
+      --auth:#0969da; --auth-bg:#ddeeff;
+      --line:#8c98a8; --code-bg:#0d1117; --code-text:#e6edf3;
+    }
+    html.dark{
+      --bg:#0f172a; --panel:#111827; --text:#cbd5e1; --heading:#f1f5f9; --muted:#94a3b8;
+      --border:#1e293b; --accent:#c4b5fd; --accent-bg:#332a55;
+      --write:#fed7aa; --write-bg:#4a2c0c;
+      --read:#bbf7d0; --read-bg:#14532d;
+      --auth:#93c5fd; --auth-bg:#0f243f;
+      --line:#6b7686; --code-bg:#0b1020; --code-text:#e6edf3;
+    }
+    body{ background:var(--bg); color:var(--text); }
+    h1,h2,h3{ color:var(--heading); }
+    .panel{ background:var(--panel); border:1px solid var(--border); }
+    .muted{ color:var(--muted); }
+    .box{ border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+    .node{ border:1.5px solid var(--line); border-radius:10px; padding:.5rem .65rem; font-size:12.5px; line-height:1.25; background:var(--bg); }
+    .node b{ color:var(--heading); font-weight:600; }
+    .tag-write{ background:var(--write-bg); color:var(--write); }
+    .tag-read{ background:var(--read-bg); color:var(--read); }
+    .tag-auth{ background:var(--auth-bg); color:var(--auth); }
+    .tag-cfg{ background:var(--accent-bg); color:var(--accent); }
+    .chip{ display:inline-block; padding:.08rem .5rem; border-radius:999px; font-size:10.5px; font-weight:700; letter-spacing:.02em; }
+    code{ background:var(--accent-bg); color:var(--accent); padding:.05rem .35rem; border-radius:5px; font-size:12px; }
+    .arrow{ color:var(--line); font-size:20px; line-height:1; }
+    .lbl{ font-size:10.5px; color:var(--muted); }
+    a{ color:var(--auth); }
+    ::-webkit-scrollbar{ height:10px; width:10px; }
+    ::-webkit-scrollbar-thumb{ background:var(--line); border-radius:8px; }
+    .kbd{ font-family:ui-monospace,Menlo,monospace; font-size:11.5px; }
+  </style>
+</head>
+
+<body class="min-h-screen">
+  <div class="max-w-5xl mx-auto px-5 md:px-8 py-8">
+
+    <!-- Header -->
+    <header class="flex items-start justify-between gap-4 mb-8">
+      <div>
+        <div class="chip tag-cfg mb-2">INTERVIEW BRIEF</div>
+        <h1 class="text-2xl md:text-3xl font-bold tracking-tight">Alpha Platform — Architecture</h1>
+        <p class="muted mt-1 text-sm">Enterprise low-code case-management &amp; workflow platform · Nx monorepo · NestJS + Angular + PostgreSQL</p>
+      </div>
+      <button id="theme-toggle" title="Toggle dark mode"
+              class="shrink-0 h-9 w-9 grid place-items-center rounded-lg border"
+              style="border-color:var(--border); color:var(--muted);">
+        <span id="theme-icon">🌙</span>
+      </button>
+    </header>
+
+    <!-- Pitch -->
+    <section class="box p-5 mb-6">
+      <h2 class="text-base font-bold mb-2">① The one-liner</h2>
+      <p class="text-sm leading-relaxed">
+        Alpha is a <b>metadata-driven case-management &amp; BPM platform</b>. Business users <em>design</em> case types, forms/pages,
+        inboxes and workflows in <b>Workflow Studio</b>; other users <em>operate</em> on those cases through a
+        <b>Case Manager workbench</b> that <b>renders itself from configuration</b>. It's an
+        <b>Nx monorepo</b> of Angular 18 frontends + ~13 NestJS microservices on PostgreSQL, shipped via Jenkins → Docker → Helm/K8s.
+      </p>
+      <div class="grid sm:grid-cols-3 gap-3 mt-4">
+        <div class="node"><b>Metadata-driven runtime</b><div class="muted mt-1">The config <em>is</em> the product — behaviour changes without code deploys.</div></div>
+        <div class="node"><b>CQRS-style split</b><div class="muted mt-1">jBPM + case DB = write side; “enquiry” = rebuildable read projection.</div></div>
+        <div class="node"><b>Config-as-code</b><div class="muted mt-1">Config is versioned with git-like branch / diff / commit / PR.</div></div>
+      </div>
+    </section>
+
+    <!-- Diagram -->
+    <section class="box p-5 mb-6">
+      <h2 class="text-base font-bold mb-1">② System map</h2>
+      <p class="lbl mb-4">Frontends call each service <b>directly</b> behind ingress/nginx — not a single gateway.
+        <span class="chip tag-write ml-1">write path</span>
+        <span class="chip tag-read ml-1">read path</span>
+        <span class="chip tag-auth ml-1">auth</span>
+        <span class="chip tag-cfg ml-1">config</span>
+      </p>
+
+      <!-- Frontends -->
+      <div class="lbl mb-1">FRONTENDS · Angular 18 + PrimeNG 17</div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
+        <div class="node"><b>Workflow Studio</b><div class="muted">designer · :4200</div></div>
+        <div class="node"><b>Case Manager</b><div class="muted">workbench · :5200</div></div>
+        <div class="node"><b>Admin UI</b><div class="muted">ops · :6200</div></div>
+        <div class="node"><b>Delta UI</b><div class="muted">diff/PR review · :4300</div></div>
+      </div>
+      <div class="text-center arrow mb-2">↓ &nbsp; HTTPS via ingress (path prefixes: <span class="kbd">/configservice /caseservice /adminservice …</span>) &nbsp; ↓</div>
+
+      <!-- Edge -->
+      <div class="lbl mb-1">EDGE</div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
+        <div class="node"><span class="chip tag-auth">BFF</span> <b class="ml-1">backend/admin</b><div class="muted mt-1">true BFF — aggregates config + module service <em>for Admin UI only</em></div></div>
+        <div class="node"><b>alpha-request-service</b><div class="muted mt-1">generic <em>outbound</em> proxy for 3rd-party/connector calls (auth injection + SSRF guard) — <em>not</em> an internal gateway</div></div>
+      </div>
+
+      <!-- Core services -->
+      <div class="lbl mb-1 mt-3">BACKEND SERVICES · NestJS 10 + TypeORM</div>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-2">
+        <div class="node tag-write"><b>alpha-case-service</b><div>case lifecycle + orchestration</div></div>
+        <div class="node tag-write"><b>alpha-jbpm-service</b><div>wraps KIE-Server / jBPM REST</div></div>
+        <div class="node tag-write"><b>alpha-task-distributor</b><div>work allocation</div></div>
+        <div class="node tag-cfg"><b>alpha-config-service</b><div>config store · ledger <em>write</em></div></div>
+        <div class="node tag-cfg"><b>alpha-delta-service</b><div>git-like config API</div></div>
+        <div class="node tag-cfg"><b>alpha-module-service</b><div>UI modules/plugins + Marketplace</div></div>
+        <div class="node tag-auth"><b>alpha-auth-service</b><div>OIDC + server-side session</div></div>
+        <div class="node tag-read"><b>gts</b> (Global Task Syncer)<div>jBPM → enquiry outbox syncer</div></div>
+        <div class="node tag-read"><b>alpha-dashboard-service</b><div>dashboard APIs</div></div>
+      </div>
+
+      <!-- Data layer -->
+      <div class="text-center arrow my-2">↓</div>
+      <div class="lbl mb-1">DATA &amp; INFRA</div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <div class="node"><b>PostgreSQL</b><div class="muted">shared DB · row-level tenant isolation</div></div>
+        <div class="node tag-read"><b>enquiry read model</b><div>inbox/search projection</div></div>
+        <div class="node"><b>RabbitMQ</b><div class="muted">pull-task flow (optional)</div></div>
+        <div class="node tag-auth"><b>Neutrinos IDS</b><div>OIDC identity server (V1/V2)</div></div>
+      </div>
+    </section>
+
+    <!-- CQRS flow -->
+    <section class="box p-5 mb-6">
+      <h2 class="text-base font-bold mb-3">③ The read/write split (the flow to explain)</h2>
+      <div class="flex flex-wrap items-center gap-2 text-[12.5px]">
+        <span class="node tag-write">Case action</span><span class="arrow">→</span>
+        <span class="node tag-write">jBPM task/process state</span><span class="arrow">→</span>
+        <span class="node">DB trigger fills <span class="kbd">task_index_outbox</span></span><span class="arrow">→</span>
+        <span class="node tag-read"><b>GTS</b> cron polls outbox</span><span class="arrow">→</span>
+        <span class="node tag-read"><b>enquiry</b> read model</span><span class="arrow">→</span>
+        <span class="node">fast inbox / search</span>
+      </div>
+      <ul class="text-sm mt-4 space-y-1.5 list-disc pl-5">
+        <li><b>Write side:</b> <code>alpha-case-service</code> orchestrates workflow; <code>alpha-jbpm-service</code> owns process/task state via KIE-Server REST (<span class="kbd">/server/containers/.../processes</span>).</li>
+        <li><b>Read side:</b> <code>libs/enquiry</code> is a CQRS read projection (SDKs: <span class="kbd">enquiry-sdk</span>, <span class="kbd">task-sync-sdk</span>, <span class="kbd">recovery-sdk</span>).</li>
+        <li><b>Bridge:</b> <b>transactional outbox</b> — a jBPM <span class="kbd">taskevent</span> trigger writes the outbox; GTS polls &amp; pushes to enquiry, with a legacy <span class="kbd">createdon</span> poll + recovery as fallback. Resilient to missed events.</li>
+      </ul>
+    </section>
+
+    <!-- Config ledger -->
+    <section class="box p-5 mb-6">
+      <h2 class="text-base font-bold mb-3">④ Config-as-code (the “Delta” story)</h2>
+      <div class="flex flex-wrap items-center gap-2 text-[12.5px] mb-4">
+        <span class="node tag-cfg">Studio edits config</span><span class="arrow">→</span>
+        <span class="node tag-cfg">config-service persists + <span class="kbd">recordChangeEvent</span> (commit on branch)</span><span class="arrow">→</span>
+        <span class="node tag-cfg">Delta UI shows branches/diffs/PRs</span><span class="arrow">→</span>
+        <span class="node tag-cfg">PR merge → lifecycle event → back to config-service</span>
+      </div>
+      <ul class="text-sm space-y-1.5 list-disc pl-5">
+        <li><code>alpha-config-service</code> — source-of-truth persistence + <b>ledger write side</b>.</li>
+        <li><code>alpha-delta-service</code> — <b>git-like API surface</b>: branch / commit / diff / pull-request / tag / comment controllers.</li>
+        <li><code>libs/change-tracking-utils</code> — per-config-type adapters (<span class="kbd">load/save/describe/diff</span>) for <span class="kbd">case_definition, pages, inbox, bpm, ui_theme, translation…</span></li>
+        <li><b>Engine caveat:</b> the actual commit/branch/merge algorithm lives in an external SDK <code>@neutrinos/project-sdk-config-ledger</code> — this repo shows how it's <em>wired &amp; consumed</em>, not the internal storage model.</li>
+      </ul>
+    </section>
+
+    <!-- Auth + tenancy -->
+    <section class="grid md:grid-cols-2 gap-6 mb-6">
+      <div class="box p-5">
+        <h2 class="text-base font-bold mb-2">⑤ Auth</h2>
+        <ul class="text-sm space-y-1.5 list-disc pl-5">
+          <li><code>alpha-auth-service</code> runs a full <b>OIDC authorization-code flow with PKCE</b> (<span class="kbd">openid-client</span>).</li>
+          <li>Browser = <b>server-side session cookie</b> holding the tokenset; API/service calls = <b>bearer-token introspection</b>.</li>
+          <li><b>IDS</b> = Neutrinos Identity Server (OIDC issuer); <code>libs/ids-adapter</code> supports <b>V1/V2</b> via <span class="kbd">IDS_V2_ENABLED</span>.</li>
+        </ul>
+      </div>
+      <div class="box p-5">
+        <h2 class="text-base font-bold mb-2">⑥ Multi-tenancy</h2>
+        <ul class="text-sm space-y-1.5 list-disc pl-5">
+          <li><b>Row-level isolation</b> in a shared DB + configurable schema (<em>not</em> schema-per-tenant).</li>
+          <li><span class="kbd">tenants</span> table keyed by <span class="kbd">subdomain</span>.</li>
+          <li>Tenant resolved <b>from the IDS token</b>: middleware sets <span class="kbd">req.tenant = introspection.organisationId</span>, which scopes all queries.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Talking points + gotchas -->
+    <section class="box p-5 mb-6" style="border-color:var(--accent);">
+      <h2 class="text-base font-bold mb-3">⑦ What to emphasize &nbsp;·&nbsp; and the gotchas</h2>
+      <div class="grid md:grid-cols-2 gap-5">
+        <div>
+          <div class="chip tag-read mb-2">LEAD WITH</div>
+          <ol class="text-sm space-y-1.5 list-decimal pl-5">
+            <li><b>Metadata-driven runtime</b> — designers change behaviour with no code deploy.</li>
+            <li><b>CQRS read/write split</b> — jBPM is truth; enquiry is a rebuildable projection kept in sync by a resilient outbox.</li>
+            <li><b>Config-as-code</b> — versioned config with promotion/diff between environments.</li>
+            <li><b>Uniform service chassis</b> — every NestJS service shares session/IDS/tracing/feature-flag middleware; Nx tags enforce module boundaries.</li>
+          </ol>
+        </div>
+        <div>
+          <div class="chip tag-write mb-2">DON'T MISSTATE</div>
+          <ul class="text-sm space-y-1.5 list-disc pl-5">
+            <li>Not a single API gateway — <b>per-service direct calls</b> behind ingress, one <b>admin BFF</b>, one <b>outbound connector proxy</b>.</li>
+            <li>Tenancy is <b>row-level</b>, not schema-per-tenant.</li>
+            <li>RabbitMQ is used <b>only for pull-task</b>; the event-emitter bus is <b>in-process</b> within config-service, not cross-service. No first-party Redis.</li>
+            <li>The ledger <b>engine is an external SDK</b> — know the boundary of what's in-repo.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Quick ref table -->
+    <section class="box p-5 mb-8 overflow-x-auto">
+      <h2 class="text-base font-bold mb-3">Quick reference — services</h2>
+      <table class="text-sm w-full border-collapse min-w-[520px]">
+        <thead>
+          <tr class="text-left" style="border-bottom:1px solid var(--border);">
+            <th class="py-1.5 pr-4">Concern</th><th class="py-1.5 pr-4">Where</th>
+          </tr>
+        </thead>
+        <tbody class="align-top">
+          <tr style="border-bottom:1px solid var(--border);"><td class="py-1.5 pr-4">Admin BFF</td><td class="py-1.5 pr-4"><span class="kbd">backend/admin</span></td></tr>
+          <tr style="border-bottom:1px solid var(--border);"><td class="py-1.5 pr-4">Outbound connector proxy</td><td class="py-1.5 pr-4"><span class="kbd">alpha-request-service</span></td></tr>
+          <tr style="border-bottom:1px solid var(--border);"><td class="py-1.5 pr-4">Workflow engine (KIE/jBPM)</td><td class="py-1.5 pr-4"><span class="kbd">alpha-jbpm-service</span></td></tr>
+          <tr style="border-bottom:1px solid var(--border);"><td class="py-1.5 pr-4">Case lifecycle + orchestration</td><td class="py-1.5 pr-4"><span class="kbd">alpha-case-service</span></td></tr>
+          <tr style="border-bottom:1px solid var(--border);"><td class="py-1.5 pr-4">Read model / inbox search</td><td class="py-1.5 pr-4"><span class="kbd">libs/enquiry</span> + syncer <span class="kbd">backend/gts</span></td></tr>
+          <tr style="border-bottom:1px solid var(--border);"><td class="py-1.5 pr-4">Auth (OIDC/session)</td><td class="py-1.5 pr-4"><span class="kbd">alpha-auth-service</span> + <span class="kbd">libs/ids-adapter</span></td></tr>
+          <tr><td class="py-1.5 pr-4">Config versioning</td><td class="py-1.5 pr-4"><span class="kbd">alpha-config-service</span> (write) + <span class="kbd">alpha-delta-service</span> (API) + <span class="kbd">change-tracking-utils</span></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <footer class="lbl text-center pb-6">Prep notes · evidence-backed from the alpha-core repo. Diagram is a mental model, not a network topology.</footer>
+  </div>
+
+  <script>
+    const btn = document.getElementById('theme-toggle');
+    const icon = document.getElementById('theme-icon');
+    function sync(){ icon.textContent = document.documentElement.classList.contains('dark') ? '☀️' : '🌙'; }
+    sync();
+    btn.addEventListener('click', function(){
+      document.documentElement.classList.toggle('dark');
+      try { localStorage.setItem('theme', document.documentElement.classList.contains('dark') ? 'dark' : 'light'); } catch(e){}
+      sync();
+    });
+  </script>
+</body>
+</html>

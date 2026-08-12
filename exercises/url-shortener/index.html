@@ -1,0 +1,38 @@
+<h1>URL Shortener — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a service that converts long URLs into short aliases and redirects users from a short alias back to the original URL.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can submit a long URL and receive a unique short link in return.</li>
+  <li>Accessing a short link must redirect the requester to the original long URL.</li>
+  <li>The system must guarantee that each generated short alias maps to exactly one long URL and is never reused.</li>
+  <li>Users can optionally request a custom alias (vanity URL), which must be rejected if already taken.</li>
+  <li>Users can optionally set an expiration date after which the short link stops resolving.</li>
+  <li>Registered users can view a list of the links they have created.</li>
+  <li>The system must track and expose click/analytics counts per short link (total clicks, and ideally referrer/geo/time breakdowns).</li>
+  <li>The system must validate submitted URLs and reject malformed input.</li>
+  <li>The system must detect and block links to known malicious or disallowed destinations.</li>
+  <li>Users can delete or deactivate a short link they own.</li>
+  <li>The same long URL submitted multiple times may either return a new alias or the existing one (behavior must be defined).</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Read-heavy workload: expect roughly a 100:1 redirect-to-creation ratio.</li>
+  <li>Scale target: ~100M new URLs created per month and billions of redirects per month.</li>
+  <li>Redirect latency should be low, with a p99 under ~100 ms.</li>
+  <li>Availability target of 99.99% for the redirect path, since broken links directly break users' shared content.</li>
+  <li>Short aliases must be as short as practical while supporting the projected total URL volume for several years.</li>
+  <li>Links must be durable and persist for at least the configured lifetime (default: indefinitely unless expired).</li>
+  <li>Alias generation must avoid predictable/enumerable sequences where enumeration is a privacy or abuse concern.</li>
+  <li>The system must withstand abuse (spam creation, click inflation) via rate limiting.</li>
+  <li>Cost per stored URL and per redirect should remain low at the target scale.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume HTTP redirects are acceptable; building a full analytics/BI dashboard product is out of scope.</li>
+  <li>Assume authentication exists for account features; designing the auth system itself is out of scope.</li>
+  <li>Editing an existing short link to point at a different destination is excluded unless stated otherwise.</li>
+  <li>Assume standard web/mobile clients; no offline resolution is required.</li>
+</ul>

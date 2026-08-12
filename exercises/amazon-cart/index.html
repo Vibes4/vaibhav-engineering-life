@@ -1,0 +1,38 @@
+<h1>Amazon Cart — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design the shopping cart service for a large e-commerce platform that lets shoppers collect items and carry them through to checkout.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can add an item (with quantity and variant such as size/color) to their cart.</li>
+  <li>Users can update quantities, remove items, and clear the cart.</li>
+  <li>The system must persist a signed-in user's cart so it is available across sessions and devices.</li>
+  <li>The system must support guest carts and merge them into the user's cart upon sign-in.</li>
+  <li>The system must show current per-item price, subtotal, and applicable taxes/shipping estimates.</li>
+  <li>The system must reflect item availability and flag out-of-stock or price-changed items at view time.</li>
+  <li>Users can save items for later / move them to a wishlist and back into the cart.</li>
+  <li>The system must apply eligible promotions, coupons, and quantity limits to the cart.</li>
+  <li>The system must hand off the cart contents to the checkout/order flow to place an order.</li>
+  <li>The system must support multiple concurrent carts contexts where applicable (e.g., business vs personal).</li>
+  <li>The system must validate cart contents (stock, price, limits) at checkout initiation.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support hundreds of millions of active shoppers with tens of thousands of cart operations per second at peak (e.g., major sale events).</li>
+  <li>Add-to-cart and view-cart operations should respond within ~100–200 ms at p99.</li>
+  <li>Availability target of 99.99%; the cart must remain writable even during partial backend degradation.</li>
+  <li>A saved cart must be durable and must not lose items that were successfully added.</li>
+  <li>The cart should favor high availability, tolerating brief inconsistency (e.g., stale price) reconciled before checkout.</li>
+  <li>The system must scale elastically for seasonal spikes without manual capacity changes.</li>
+  <li>Cart data must be secured and scoped so users can only access their own carts.</li>
+  <li>The system must handle concurrent updates to the same cart from multiple devices without losing changes.</li>
+  <li>Cost per stored cart should be optimized given many idle/abandoned carts.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Payment processing, order fulfillment, and inventory reservation are handled by downstream services and out of scope.</li>
+  <li>Pricing and promotion computation logic is assumed to be provided by a pricing service.</li>
+  <li>Product catalog details and search are out of scope; the cart references product identifiers.</li>
+  <li>Assume authentication and user identity are provided by an existing platform service.</li>
+</ul>

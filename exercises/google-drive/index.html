@@ -1,0 +1,40 @@
+<h1>Google Drive — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a cloud file-storage and synchronization service that lets users store, sync, share, and collaborate on files and folders across multiple devices.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can upload, download, rename, move, and delete files and folders of arbitrary type.</li>
+  <li>The system must keep a user's files synchronized automatically across all their signed-in devices (desktop, web, mobile).</li>
+  <li>Users can share individual files or folders with other users or via a link, with per-recipient permissions (view, comment, edit).</li>
+  <li>The system must support offline edits on a device and reconcile them once the device reconnects.</li>
+  <li>Users can view and restore previous versions of a file for a defined retention window.</li>
+  <li>The system must support resumable uploads and downloads for large files that survive network interruptions.</li>
+  <li>Users can search their files by name, type, owner, and content (for supported document types).</li>
+  <li>Users can recover deleted files from a trash/bin for a defined period before permanent deletion.</li>
+  <li>The system must show per-user and per-organization storage quota usage and enforce quota limits.</li>
+  <li>Users can star, organize into folders, and see recently accessed and shared-with-me items.</li>
+  <li>The system must generate previews/thumbnails for common file types (images, PDFs, documents, video).</li>
+  <li>The system must record an activity/audit log of changes and shares on a file.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support on the order of 1 billion registered users with hundreds of millions of daily active users.</li>
+  <li>Individual file size up to 5 GB (or larger for paid tiers); total stored data at exabyte scale growing tens of PB per day.</li>
+  <li>Sync propagation of a change to other online devices should complete within a few seconds under normal conditions.</li>
+  <li>Metadata operations (list folder, open file) should return within ~200 ms at the 99th percentile.</li>
+  <li>Durability of stored files must be extremely high (target 99.999999999% / eleven nines) with no data loss on device failure.</li>
+  <li>Service availability target of 99.9% or higher for uploads, downloads, and sync.</li>
+  <li>All files must be encrypted in transit and at rest; sharing and access must respect fine-grained authorization.</li>
+  <li>The system must handle read-heavy access patterns with far more reads/syncs than writes.</li>
+  <li>Storage and bandwidth cost per user must be optimized, favoring not re-transferring unchanged data.</li>
+  <li>Concurrent edits and conflicting offline changes must resolve deterministically without silent data loss.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Real-time collaborative document editing (operational transforms in a live editor) is treated as a separate product and out of scope.</li>
+  <li>Assume authentication, account management, and billing are provided by existing platform services.</li>
+  <li>Native desktop/mobile client engineering details are assumed and not designed here.</li>
+  <li>Enterprise admin governance, e-discovery, and DLP policies are out of scope for this exercise.</li>
+</ul>

@@ -1,0 +1,39 @@
+<h1>Distributed Cache — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a distributed in-memory caching service that application clients use to store and retrieve key-value data across many nodes.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Clients can set, get, and delete values by key.</li>
+  <li>The system must support per-key time-to-live (TTL) with automatic expiration.</li>
+  <li>Clients can set a value conditionally (e.g. only if absent) to support simple coordination.</li>
+  <li>The system must support atomic increment and decrement operations on numeric values.</li>
+  <li>The system must distribute keys across many nodes so total capacity exceeds a single machine.</li>
+  <li>The system must automatically rebalance keys when nodes are added or removed.</li>
+  <li>The system must apply an eviction policy when memory is full.</li>
+  <li>Clients can batch multiple get or set operations in a single request.</li>
+  <li>The system must expose operational metrics such as hit ratio, latency, and memory usage.</li>
+  <li>The system must support optional replication of keys for read scaling and failover.</li>
+  <li>Administrators can flush a namespace or the entire cache.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Serve 10M+ operations per second across the cluster at peak.</li>
+  <li>Read and write latency must be under 1 ms at p99 within a data center.</li>
+  <li>The cluster must scale horizontally to hundreds of nodes and tens of terabytes of aggregate memory.</li>
+  <li>Availability target of 99.99%; loss of any single node must not take down the service.</li>
+  <li>Cached data is treated as non-durable and best-effort; loss on restart is acceptable.</li>
+  <li>Values may be eventually consistent across replicas; bounded staleness is acceptable.</li>
+  <li>Adding or removing a node must move only a small fraction of keys to limit disruption.</li>
+  <li>Access must be restricted to authorized services within the network, with optional encryption in transit.</li>
+  <li>Memory overhead per entry should be minimal to maximize effective cache capacity per dollar.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume the cache is a look-aside cache; the source of truth lives in backing databases owned by callers.</li>
+  <li>Assume clients are trusted internal services within a private network.</li>
+  <li>Persistent durability, snapshots to disk, and point-in-time recovery are out of scope.</li>
+  <li>Complex query, secondary indexes, and range scans are excluded; access is by key only.</li>
+  <li>Cross-region active-active replication is out of scope for this exercise.</li>
+</ul>
