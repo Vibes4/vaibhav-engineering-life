@@ -1,0 +1,40 @@
+<h1>YouTube — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a video-sharing service where users can upload, store, and stream videos on demand.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can upload videos of varying sizes and formats.</li>
+  <li>Viewers can stream/play a video on demand across devices and network conditions.</li>
+  <li>The system must make uploaded videos playable at multiple resolutions/qualities.</li>
+  <li>Users can search for videos by title, description, and metadata.</li>
+  <li>Viewers can like/dislike, comment on, and share videos.</li>
+  <li>Users can subscribe to channels and see content from channels they follow.</li>
+  <li>The system must recommend videos to viewers.</li>
+  <li>The system must track and display per-video view counts and basic engagement metrics.</li>
+  <li>Creators can manage (edit metadata, set visibility, delete) their uploaded videos.</li>
+  <li>The system must generate thumbnails and support captions/subtitles.</li>
+  <li>The system must enforce content policy and allow flagging/removal of disallowed content.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Scale target: ~2B users, hundreds of hours of video uploaded per minute, and billions of views per day.</li>
+  <li>Heavily read-dominated: views vastly outnumber uploads.</li>
+  <li>Playback should start quickly, with time-to-first-frame p99 under ~1–2 seconds.</li>
+  <li>Streaming must adapt to the viewer's bandwidth to minimize buffering.</li>
+  <li>Availability target of 99.99% for the playback path.</li>
+  <li>Uploaded video content must be durably stored with very high durability (e.g., 99.999999999%).</li>
+  <li>Content must be delivered with low latency to a global audience.</li>
+  <li>The system must scale storage cost-effectively as the catalog grows continuously.</li>
+  <li>View counts and metadata can be eventually consistent; content availability should not be.</li>
+  <li>User data and unlisted/private content must be access-controlled.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Focus on on-demand video; live streaming is out of scope unless stated.</li>
+  <li>Monetization, ads, and creator payouts are excluded.</li>
+  <li>Assume authentication and account management exist.</li>
+  <li>Detailed recommendation-model design is out of scope; treat recommendations as a capability requirement.</li>
+  <li>Copyright/content-ID matching internals are excluded beyond the flagging requirement.</li>
+</ul>

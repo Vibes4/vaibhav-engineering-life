@@ -1,0 +1,39 @@
+<h1>Notification Service — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a centralized notification service that lets other systems send messages to users across multiple channels such as push, SMS, email, and in-app.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Client systems can submit a notification request specifying recipient(s), channel(s), and content via an API.</li>
+  <li>The system must support multiple delivery channels: mobile push, SMS, email, and in-app notifications.</li>
+  <li>The system must support templated messages with per-recipient personalization variables.</li>
+  <li>Users can manage per-channel and per-category preferences and opt out / unsubscribe.</li>
+  <li>The system must respect user preferences, quiet hours, and do-not-disturb settings before sending.</li>
+  <li>The system must support both immediate and scheduled/deferred delivery.</li>
+  <li>The system must deduplicate and rate-limit notifications so a user is not spammed for the same event.</li>
+  <li>The system must track and expose delivery status (queued, sent, delivered, failed, opened) per notification.</li>
+  <li>The system must retry failed sends and support fallback to an alternate channel when configured.</li>
+  <li>The system must support fan-out to large audiences (e.g., broadcast to millions) as well as targeted single-user sends.</li>
+  <li>The system must maintain an audit trail of what was sent to whom and when.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support sending on the order of billions of notifications per day with peaks of hundreds of thousands per second.</li>
+  <li>Accept-and-enqueue latency for a send request should be under ~100 ms at p99.</li>
+  <li>Availability target of 99.99% for the ingestion API; no accepted request should be dropped.</li>
+  <li>Delivery must be at-least-once with deduplication so a user is not shown duplicates.</li>
+  <li>The system must degrade gracefully and absorb bursts via buffering when downstream providers throttle.</li>
+  <li>User preferences and opt-out compliance must be enforced reliably (regulatory: CAN-SPAM, GDPR, TCPA).</li>
+  <li>Message content and recipient contact data must be encrypted in transit and at rest.</li>
+  <li>The system must be horizontally scalable and isolate channels so one slow provider does not block others.</li>
+  <li>Time-sensitive notifications (e.g., OTP) should be prioritized and delivered within seconds.</li>
+  <li>Cost per message should be optimized, including choosing efficient providers per region/channel.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Actual last-mile delivery relies on third-party providers (APNs, FCM, SMS gateways, SMTP) treated as external dependencies.</li>
+  <li>Composing business logic that decides when to notify lives in calling services, not this service.</li>
+  <li>User identity, contact-detail collection, and device-token registration source of truth are assumed provided.</li>
+  <li>Rich analytics dashboards and campaign management UI are out of scope.</li>
+</ul>

@@ -1,0 +1,115 @@
+/* DSA practice page — reuses the theme variables from ../styles.css.
+   This page does NOT load Tailwind, so the base page colours are set here
+   (theme-aware) instead of via utility classes. */
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: #ffffff;
+  color: var(--content-text);
+}
+html.dark body { background: #0f172a; }
+
+.dsa-shell { display: flex; height: 100vh; overflow: hidden; }
+
+/* ---- problem list (left) ---- */
+.dsa-list {
+  width: 300px; flex-shrink: 0; height: 100vh; overflow-y: auto;
+  background: #f6f8fa; border-right: 1px solid var(--border-soft);
+}
+html.dark .dsa-list { background: #0b1020; }
+.dsa-list-head { position: sticky; top: 0; z-index: 5; padding: 14px; background: inherit;
+  border-bottom: 1px solid var(--border-soft); }
+.dsa-list-head h1 { font-size: 15px; font-weight: 800; margin: 0 0 2px; color: var(--heading); }
+.dsa-list-head .sub { font-size: 11px; color: var(--muted); }
+.dsa-search { width: 100%; margin-top: 10px; padding: 7px 10px; font-size: 13px; border-radius: 6px;
+  border: 1px solid var(--border-soft); background: #ffffff; color: var(--content-text); }
+html.dark .dsa-search { background: #111827; }
+.dsa-search::placeholder { color: var(--muted); }
+.dsa-filters { display: flex; gap: 5px; margin-top: 8px; flex-wrap: wrap; }
+.dsa-filter { font-size: 11px; padding: 3px 9px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--border-soft); background: transparent; color: var(--muted); }
+.dsa-filter.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.dsa-item { display: flex; align-items: center; width: 100%; text-align: left;
+  border-left: 3px solid transparent; background: transparent; color: var(--nav-text);
+  border-bottom: 1px solid var(--border-soft); }
+.dsa-item:hover { background: var(--nav-hover); }
+.dsa-item.active { background: var(--nav-active-bg); border-left-color: var(--accent); color: var(--nav-active-text); }
+.dsa-item-main { flex: 1; min-width: 0; padding: 10px 6px 10px 14px; cursor: pointer; }
+.dsa-item-lc { flex: 0 0 auto; align-self: stretch; display: flex; align-items: center; padding: 0 13px;
+  color: var(--muted); text-decoration: none; font-weight: 800; font-size: 14px; }
+.dsa-item-lc:hover { color: #f59e0b; background: var(--nav-hover); }
+.dsa-item .t { font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.dsa-item .idx { display: inline-block; min-width: 22px; font-size: 11px; font-weight: 700; color: var(--muted); }
+.dsa-item .m { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.dsa-item .solved { color: #22c55e; }
+.pill { font-size: 9.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px; text-transform: uppercase; letter-spacing: .03em; }
+.pill.Easy { background: #dcfce7; color: #166534; } .pill.Medium { background: #fef9c3; color: #854d0e; } .pill.Hard { background: #fee2e2; color: #991b1b; }
+html.dark .pill.Easy { background: #14532d; color: #bbf7d0; } html.dark .pill.Medium { background: #422006; color: #fde68a; } html.dark .pill.Hard { background: #450a0a; color: #fecaca; }
+
+/* ---- work area (right) ---- */
+.dsa-main { flex: 1; height: 100vh; overflow-y: auto; padding: 20px 24px 60px; }
+.dsa-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.dsa-topbar a { font-size: 13px; color: var(--link); text-decoration: none; }
+.dsa-statement h2 { font-size: 22px; margin: 0 0 6px; color: var(--heading); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.dsa-statement .tags { font-size: 11px; color: var(--muted); margin: 4px 0 12px; }
+.dsa-statement p { line-height: 1.6; }
+.dsa-io { background: var(--interview-bg); border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 14px; margin: 12px 0; font-size: 13.5px; }
+
+/* ---- example test cases ---- */
+.dsa-examples { margin: 16px 0; }
+.dsa-ex-head { font-size: 13px; font-weight: 800; color: var(--heading); margin-bottom: 8px; text-transform: uppercase; letter-spacing: .04em; }
+.dsa-example { border: 1px solid var(--border-soft); border-radius: 8px; margin: 8px 0; overflow: hidden; }
+.dsa-example .ex-n { font-size: 12px; font-weight: 700; color: var(--muted); padding: 7px 12px; background: var(--interview-bg); border-bottom: 1px solid var(--border-soft); }
+.dsa-example .ex-row { display: grid; grid-template-columns: 74px 1fr; gap: 8px; padding: 8px 12px; align-items: start; }
+.dsa-example .ex-k { font-size: 12px; font-weight: 700; color: var(--muted); padding-top: 4px; }
+.dsa-example pre { margin: 0; padding: 6px 10px; background: var(--code-head-bg); color: var(--code-text); border-radius: 6px; font-size: 12.5px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.dsa-ex-more { font-size: 12px; color: var(--muted); margin-top: 6px; font-style: italic; }
+
+/* ---- actions (LeetCode link + mark solved) ---- */
+.dsa-actions { display: flex; gap: 10px; align-items: center; margin-top: 20px; flex-wrap: wrap; }
+.dsa-lc { display: inline-block; padding: 9px 18px; border-radius: 8px; background: #ffa116; color: #1a1a1a;
+  font-weight: 800; font-size: 13.5px; text-decoration: none; }
+.dsa-lc:hover { filter: brightness(1.06); }
+
+/* ---- editor ---- */
+.dsa-editor-bar { display: flex; align-items: center; gap: 8px; margin: 16px 0 8px; flex-wrap: wrap; }
+.dsa-lang { display: inline-flex; border: 1px solid var(--border-soft); border-radius: 7px; overflow: hidden; }
+.dsa-lang button { padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; background: transparent; color: var(--muted); }
+.dsa-lang button.active { background: var(--accent); color: #fff; }
+.dsa-editor-bar .spacer { flex: 1; }
+.dsa-btn { padding: 7px 16px; font-size: 13px; font-weight: 700; border-radius: 7px; cursor: pointer; border: 1px solid var(--border-soft); background: var(--interview-bg); color: var(--content-text); }
+.dsa-btn.run { background: #16a34a; color: #fff; border-color: #16a34a; }
+.dsa-btn.run:hover { background: #15803d; }
+.dsa-btn:disabled { opacity: .5; cursor: default; }
+.dsa-editor { position: relative; border: 1px solid var(--border-soft); border-radius: 8px; overflow: hidden; }
+.dsa-editor textarea {
+  width: 100%; min-height: 320px; resize: vertical; display: block;
+  padding: 14px 16px; border: none; outline: none;
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13.5px; line-height: 1.55;
+  background: var(--code-bg); color: var(--code-text); tab-size: 2;
+}
+.dsa-hint { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+
+/* ---- results ---- */
+.dsa-results { margin-top: 18px; }
+.dsa-summary { font-size: 14px; font-weight: 700; margin-bottom: 10px; padding: 10px 14px; border-radius: 8px; }
+.dsa-summary.ok { background: #dcfce7; color: #166534; } .dsa-summary.bad { background: #fee2e2; color: #991b1b; } .dsa-summary.run { background: var(--interview-bg); color: var(--muted); }
+html.dark .dsa-summary.ok { background: #14532d; color: #bbf7d0; } html.dark .dsa-summary.bad { background: #450a0a; color: #fecaca; }
+.dsa-case { border: 1px solid var(--border-soft); border-radius: 8px; margin: 8px 0; overflow: hidden; }
+.dsa-case > summary { cursor: pointer; padding: 9px 14px; font-size: 13px; font-weight: 600; list-style: none; display: flex; align-items: center; gap: 8px; }
+.dsa-case > summary::-webkit-details-marker { display: none; }
+.dsa-case .badge { font-size: 11px; font-weight: 800; padding: 1px 8px; border-radius: 999px; }
+.dsa-case .badge.pass { background: #16a34a; color: #fff; } .dsa-case .badge.fail { background: #dc2626; color: #fff; }
+.dsa-case pre { margin: 0; padding: 8px 14px 12px; background: var(--code-head-bg); color: var(--code-text); font-size: 12.5px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.dsa-case .row { display: grid; grid-template-columns: 80px 1fr; gap: 6px; padding: 2px 14px; font-size: 12.5px; }
+.dsa-case .row .k { color: var(--muted); font-weight: 600; }
+.dsa-case .row .v { font-family: "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.dsa-solution { margin-top: 16px; }
+.dsa-solution summary { cursor: pointer; font-weight: 700; color: var(--interview-heading); }
+.dsa-solution pre { margin-top: 8px; background: var(--code-bg); color: var(--code-text); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+
+@media (max-width: 820px) {
+  .dsa-shell { flex-direction: column; height: auto; overflow: visible; }
+  .dsa-list { width: 100%; height: auto; max-height: 40vh; }
+  .dsa-main { height: auto; }
+}

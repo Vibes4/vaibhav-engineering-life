@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>System Design Mastery — The Architect's Roadmap</title>
+<style>
+  :root {
+    --bg: #17141f;
+    --dot: #241f30;
+    --panel: #1d1927;
+    --border: #332c45;
+    --text: #e8e4f2;
+    --muted: #948ca8;
+    --accent: #a78bfa;
+    --node: #553f7d;
+    --node-stroke: #7c5fb8;
+    --sub: #3a2f57;
+    --sub-stroke: #5a4a85;
+    --gate: #d29922;
+    --done: #56d364;
+    --track: #2a2338;
+    --edge: #4a4360;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column;
+  }
+
+  header {
+    padding: .8rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  }
+  header h1 { font-size: 1rem; white-space: nowrap; font-weight: 700; }
+  header h1 .mono { color: var(--accent); font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+  #overall { font-size: .78rem; color: var(--muted); display: flex; align-items: center; gap: .5rem; }
+  #overall .bar { width: 140px; height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  #overall .bar i { display: block; height: 100%; background: var(--done); border-radius: 3px; }
+  .toolbar { margin-left: auto; display: flex; gap: .45rem; }
+  .toolbar button {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: .3rem .75rem; cursor: pointer; font-size: .78rem;
+  }
+  .toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+
+  #stage {
+    flex: 1 1 auto; position: relative; cursor: grab;
+    background-image: radial-gradient(var(--dot) 1.5px, transparent 1.5px);
+    background-size: 26px 26px;
+  }
+  #stage.panning { cursor: grabbing; }
+  svg { width: 100%; height: 100%; display: block; }
+
+  .edge { fill: none; stroke: var(--edge); stroke-width: 1.6; opacity: .85; }
+
+  .node { cursor: pointer; }
+  .node rect.box { fill: var(--node); stroke: var(--node-stroke); stroke-width: 1.3; filter: drop-shadow(0 3px 6px rgba(0,0,0,.45)); }
+  .node.sub rect.box { fill: var(--sub); stroke: var(--sub-stroke); }
+  .node text { pointer-events: none; user-select: none; fill: #fff; }
+  .node .label { font-size: 13.5px; font-weight: 700; }
+  .node.sub .label { font-size: 12.5px; font-weight: 600; }
+  .node .cnt { font-size: 10px; fill: #cfc6e8; font-family: ui-monospace, Consolas, monospace; }
+  .node rect.track { fill: rgba(0,0,0,.35); }
+  .node rect.fill  { fill: var(--done); }
+  .node.done rect.box { stroke: var(--done); }
+
+  #hint {
+    position: absolute; bottom: 14px; left: 16px; z-index: 5;
+    color: var(--muted); font-size: .72rem; background: rgba(23,20,31,.85);
+    border: 1px solid var(--border); border-radius: 6px; padding: .35rem .6rem;
+    pointer-events: none;
+  }
+
+  /* ── side panel ── */
+  #panel {
+    position: absolute; top: 0; right: 0; bottom: 0; width: 430px; max-width: 92vw;
+    background: var(--panel); border-left: 1px solid var(--border);
+    transform: translateX(102%); transition: transform .22s ease;
+    z-index: 20; display: flex; flex-direction: column;
+    box-shadow: -12px 0 30px rgba(0,0,0,.45);
+  }
+  #panel.open { transform: translateX(0); }
+  #panel-head { padding: 1rem 1.1rem .8rem; border-bottom: 1px solid var(--border); }
+  #panel-head .code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; font-size: .78rem; font-weight: 700; }
+  #panel-head h2 { font-size: 1.05rem; margin: .15rem 0 .35rem; }
+  #panel-head .desc { color: var(--muted); font-size: .82rem; line-height: 1.45; }
+  #panel-head .gate {
+    border: 1px dashed var(--gate); border-radius: 6px; color: var(--gate);
+    font-size: .76rem; padding: .4rem .6rem; margin-top: .6rem; line-height: 1.4;
+  }
+  #panel-head .gate::before { content: "⛩ MASTERY GATE — "; font-weight: 700; }
+  #panel-head .dir { color: var(--accent); font-family: ui-monospace, Consolas, monospace; font-size: .72rem; margin-top: .5rem; }
+  #panel-close {
+    position: absolute; top: .7rem; right: .8rem;
+    background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer;
+  }
+  #panel-close:hover { color: var(--text); }
+  #panel-body { flex: 1; overflow-y: auto; padding: .6rem .8rem 1.5rem; }
+  .item {
+    display: flex; gap: .65rem; align-items: flex-start;
+    padding: .55rem .6rem; border-radius: 8px; cursor: pointer;
+  }
+  .item:hover { background: rgba(167,139,250,.07); }
+  .item input { margin-top: .25rem; accent-color: var(--done); width: 15px; height: 15px; cursor: pointer; }
+  .item .t { font-size: .86rem; font-weight: 600; }
+  a.t.link { color: var(--accent); text-decoration: none; }
+  a.t.link:hover { text-decoration: underline; }
+  .item .d { font-size: .76rem; color: var(--muted); line-height: 1.4; margin-top: .1rem; }
+  .item.checked .t { color: var(--done); text-decoration: line-through; text-decoration-thickness: 1px; }
+  .group-label {
+    font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    padding: .8rem .6rem .25rem; font-weight: 700;
+  }
+
+  footer {
+    flex: 0 0 auto; padding: .4rem 1.25rem; border-top: 1px solid var(--border);
+    background: var(--panel); color: var(--muted); font-size: .7rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="index.html" style="color:#a78bfa;text-decoration:none;font-size:.82rem;white-space:nowrap">← Back to app</a>
+  <h1><span class="mono">$ roadmap</span> System Design &amp; Distributed Systems Mastery</h1>
+  <div id="overall"><span id="overall-txt">0 / 0</span><span class="bar"><i id="overall-fill" style="width:0%"></i></span></div>
+  <div class="toolbar">
+    <button onclick="fit()">⛶ Fit</button>
+    <button onclick="fitWidth()">↔ Fit width</button>
+    <button onclick="resetProgress()">Reset progress</button>
+  </div>
+</header>
+
+<div id="stage">
+  <svg id="svg"><g id="view"></g></svg>
+  <div id="hint">read top → bottom · click a node to open its article list · drag = pan · scroll = zoom</div>
+  <div id="panel">
+    <button id="panel-close" onclick="closePanel()">✕</button>
+    <div id="panel-head"></div>
+    <div id="panel-body"></div>
+  </div>
+</div>
+
+<footer>
+  master each node before the edge below it · every article honors: Problem → Options → Decision → Tradeoffs → Failure Modes → Metrics → Scaling → Cost → Production Examples
+</footer>
+
+<script>
+/* ───────────── DATA — tiers → sub-branches → article leaves ───────────── */
+const L = (name, desc) => ({ name, desc });
+
+/* Leaves that map to an existing article in this app open it in a new tab.
+   (Unmapped leaves stay as progress-checklist items.) */
+const LINKS = {
+  "Async I/O & Event Loops":      "node-specific::event-loop",
+  "Actor Model & CSP":            "mastery::concurrency",
+  "Lock-Free & CAS":              "mastery::concurrency",
+  "Latency Numbers":              "mastery::performance-engineering",
+  "GC & Pauses":                  "mastery::performance-engineering",
+  "Tail Latency Amplification":   "mastery::performance-engineering",
+  "DNS & Anycast":                "mastery::dns",
+  "HTTP/1.1 → 2 → 3 (QUIC)":      "mastery::http",
+  "TLS & Connection Cost":        "mastery::tls",
+  "Load Balancing L4 vs L7":      "mastery::load-balancing",
+  "MVCC & Isolation Levels":      "sql::transactions-acid",
+  "CAP — Correctly Stated":       "mastery::distributed-systems",
+  "Idempotency & Retries":        "system-design/case-studies::payment-system",
+  "CRDTs":                        "system-design/case-studies::google-docs",
+  "Cache Placement & Patterns":   "system-design::caching",
+  "Stampedes & Hot Keys":         "system-design::caching",
+  "Rate Limiting":                "mastery::rate-limiting",
+  "Circuit Breakers & Bulkheads": "mastery::rate-limiting",
+  "Queues vs Streams vs Pub/Sub": "system-design::message-queues",
+  "Outbox & CDC":                 "system-design::message-queues",
+  "Redis":                        "mastery::redis",
+  "Elasticsearch / Lucene":       "mastery::elasticsearch",
+  "Kafka":                        "mastery::kafka",
+  "Kubernetes":                   "mastery::kubernetes",
+  "S3 & Object Storage":          "system-design/case-studies::s3",
+  "Serverless & FaaS":            "system-design/case-studies::lambda",
+  "Metrics, Logs & Traces":       "mastery::observability",
+  "Security Architecture":        "mastery::auth",
+  "URL Shortener / Paste":        "system-design::url-shortener",
+  "News Feed / Timeline":         "system-design/case-studies::twitter-timeline",
+  "Chat & Presence":              "system-design::chat-system",
+  "Rate Limiter / API Gateway":   "mastery::rate-limiting",
+  "Ride Matching / Proximity":    "system-design/case-studies::uber-nearby-drivers",
+  "Video Pipeline":               "system-design/case-studies::youtube",
+  "Payment / Ledger":             "system-design/case-studies::payment-system",
+  "Search Autocomplete":          "exercises::search-engine",
+  "Metrics / Monitoring System":  "mastery::observability"
+};
+const appHref = (name) => LINKS[name] ? ("index.html#" + LINKS[name]) : null;
+
+const TIERS = [
+{ code:"1.0", name:"Foundational Systems", dir:"10-cheat-sheets/",
+  desc:"The machine underneath. Architects who skip this blame 'the network' for what is a GC pause or a page-cache miss.",
+  gate:"Explain a timeout on a healthy-CPU service (queueing, GC, page faults, lock convoy); size a thread pool with Little's Law; recite the latency ladder from memory.",
+  subs:[
+  { code:"1.1", name:"Concurrency", desc:"The smallest distributed system: multiple actors, shared state, no global ordering.", leaves:[
+    L("Threads, Processes & Coroutines","Execution models, context-switch cost, why 'just add threads' dies at C10K, green vs OS threads."),
+    L("Memory Models & Visibility","Happens-before, reordering, cache coherence (MESI), false sharing — why correct-looking code lies under load."),
+    L("Mutex, Semaphore & RW Locks","Contention, convoy effect, priority inversion; when a lock beats lock-free and when it doesn't."),
+    L("Lock-Free & CAS","Compare-and-swap, ABA problem, ring buffers — the same primitive behind optimistic concurrency control."),
+    L("Deadlock, Livelock, Starvation","Detection vs avoidance vs lock ordering; the local preview of distributed deadlock in 2PC."),
+    L("Async I/O & Event Loops","epoll / kqueue / io_uring, reactor vs proactor; why nginx beats Apache and what it costs in debuggability."),
+    L("Actor Model & CSP","Message passing over shared memory (Erlang, Akka, Go channels) — the model that scales to a cluster."),
+  ]},
+  { code:"1.2", name:"OS & Hardware", desc:"The OS is the first cloud you ever used: it virtualizes CPU, memory, disk — and lies the same ways clouds do.", leaves:[
+    L("CPU Scheduling & NUMA","Run queues, CFS, core pinning, NUMA locality — why 64 cores can lose to 16."),
+    L("Virtual Memory & Paging","Page tables, TLB, faults, mmap, swap death; the page cache as the OS's built-in read cache."),
+    L("Filesystems & Durability","fsync semantics, write barriers, journaling, O_DIRECT — what 'the write succeeded' really guarantees."),
+    L("Disk Physics: HDD/SSD/NVMe","Seek vs sequential, write amplification, erase blocks — why LSM trees exist at all."),
+    L("Zero-Copy & the Data Path","sendfile, DMA, kernel bypass — how Kafka pushes GB/s through commodity boxes."),
+    L("Latency Numbers","L1 ~1ns → RAM ~100ns → SSD ~100µs → DC RTT ~0.5ms → cross-continent ~150ms. The multiplication table of estimation."),
+  ]},
+  { code:"1.3", name:"Runtime Realities", desc:"Tail latency is usually born inside the process, not on the wire.", leaves:[
+    L("GC & Pauses","Stop-the-world vs concurrent GC, heap sizing — a 2s GC pause looks identical to a network partition."),
+    L("Tail Latency Amplification","p99 vs p50; fan-out math — one call to 100 shards experiences the p99.99; hedged requests."),
+    L("In-Process Backpressure","Bounded queues, pool sizing via Little's Law, rejection over buffering — micro version of Flow Control."),
+  ]},
+]},
+
+{ code:"2.0", name:"Data & Networks", dir:"01-storage/ · 02-cache/",
+  desc:"Two halves of one question: where does state live, and how does it move?",
+  gate:"Pick B-Tree vs LSM for a stated read/write ratio via amplification math; narrate a timeout packet-by-packet; name the isolation anomaly your last project silently tolerated.",
+  subs:[
+  { code:"2.1", name:"Networking", desc:"The widest gap between abstraction ('send a message') and reality (loss, reorder, duplication, delay, lies).", leaves:[
+    L("TCP Deep Mechanics","Handshake, slow start, CUBIC/BBR, Nagle vs delayed ACK, HOL blocking — 'TCP is reliable' is a half-truth."),
+    L("UDP & When to Abandon TCP","Datagrams, app-level reliability; DNS, QUIC, video, gaming — where TCP's guarantees are the problem."),
+    L("HTTP/1.1 → 2 → 3 (QUIC)","Multiplexing, HOL blocking at each layer, 0-RTT — what actually changed and what it costs."),
+    L("TLS & Connection Cost","Handshake RTTs, session resumption, mTLS — why connection pooling is an architecture decision."),
+    L("DNS & Anycast","Resolution path, TTL as a control plane, GeoDNS, BGP anycast — the oldest eventually-consistent database."),
+    L("Load Balancing L4 vs L7","NAT/DSR/proxy modes, consistent-hash LB, draining — where the LB itself becomes the SPOF."),
+    L("Sockets, Pooling, Keep-Alive","Ephemeral port exhaustion, TIME_WAIT, SYN floods — the failures under every 'connection refused'."),
+  ]},
+  { code:"2.2", name:"Storage Engines", desc:"You don't choose a database by features — you choose its engine, and the engine dictates the amplification triangle.", leaves:[
+    L("B-Trees & B+Trees","Page splits, fill factor, clustered vs secondary indexes — read-optimized, pays in random writes (Postgres, MySQL)."),
+    L("LSM Trees","Memtable → SSTable → compaction (leveled vs tiered), bloom filters, R/W/space amplification (Cassandra, RocksDB)."),
+    L("Write-Ahead Log","The universal durability trick: sequential log first, structure later — ancestor of WALs, Kafka, replication."),
+    L("MVCC & Isolation Levels","Snapshot isolation, write skew, serializable — read-committed is the default nobody chose consciously."),
+    L("Row vs Columnar","OLTP vs OLAP layouts, vectorized execution, Parquet/ORC — one layout can't serve both workloads."),
+    L("Indexing Strategy","Composite, covering, partial, inverted, geospatial — every index is a write tax funding a read subsidy."),
+    L("Embedded Engines","RocksDB / SQLite as building blocks — half of the industrial systems are wrappers around an embedded LSM."),
+  ]},
+  { code:"2.3", name:"Modeling & Serialization", desc:"Schema is the longest-lived decision in any system — code redeploys daily, data models survive a decade.", leaves:[
+    L("Normalize vs Denormalize","Joins vs duplication; access-pattern-first (NoSQL) vs data-first (relational) — and the cost of guessing wrong."),
+    L("Serialization Formats","JSON vs Protobuf vs Avro vs Thrift — size, speed, and above all schema-evolution rules."),
+    L("Schema Evolution","Forward/backward compatibility, registries — decides whether you can ever deploy independently."),
+  ]},
+]},
+
+{ code:"3.0", name:"Distributed Systems Theory", dir:"04-distributed/",
+  desc:"Physics and impossibility results. Everything above is engineering around the constraints proven here.",
+  gate:"State CAP without saying 'pick two'; explain why two timestamps from different machines can't be compared; design an idempotent payment endpoint on a napkin — including the retry racing the original.",
+  subs:[
+  { code:"3.1", name:"Constraints & Time", desc:"What is provably impossible, and why time is the hardest problem in the field.", leaves:[
+    L("CAP — Correctly Stated","A constraint on behavior DURING a partition, not a pick-two triangle; CP vs AP is per-operation."),
+    L("PACELC","The useful extension: Else — Latency vs Consistency, the tradeoff you pay on EVERY request."),
+    L("FLP Impossibility","No deterministic async consensus with one faulty process — why real protocols buy progress with timeouts."),
+    L("The Consistency Spectrum","Linearizable → sequential → causal → RYW → monotonic → eventual; each step buys latency with anomalies."),
+    L("Physical Clocks & NTP","Drift, skew, leap seconds — why wall-clock timestamps can never order events across machines."),
+    L("Lamport & Vector Clocks","Happens-before as the only honest ordering; vector clocks detect concurrency (Dynamo's siblings)."),
+    L("HLC & TrueTime","Hybrid logical clocks (CockroachDB) vs bounded-uncertainty hardware clocks (Spanner) — buying external consistency."),
+  ]},
+  { code:"3.2", name:"Networking Realities", desc:"The audit checklist every design must survive.", leaves:[
+    L("8 Fallacies of Distributed Computing","The network is NOT reliable, latency is NOT zero, bandwidth is NOT infinite…"),
+    L("Partitions & Split-Brain","Partial partitions, asymmetric reachability, gray failures — 'down or slow?' is formally unanswerable."),
+    L("Failure Detection","Heartbeats, timeouts, phi-accrual, leases — detection speed trades against false positives, which cause split-brain."),
+    L("Latency Budgets & Tail at Scale","Decomposing an SLO into per-hop budgets; hedging and backup requests (Dean & Barroso)."),
+    L("Exactly-Once Is a Lie","At-most vs at-least-once delivery; exactly-once PROCESSING = at-least-once + idempotency. The classic senior trap."),
+    L("Idempotency & Retries","Idempotency keys, fencing tokens, retry storms, backoff + jitter — retries are self-inflicted DDoS without budgets."),
+  ]},
+]},
+
+{ code:"4.0", name:"State Dissemination", dir:"03-messaging/ · 04-distributed/",
+  desc:"How nodes merely TALK, before forcing them to AGREE. 95% of a system only needs this tier — knowing which 95% is the senior skill.",
+  gate:"Explain gossip's O(log N) convergence; choose CRDT vs consensus for a given feature (likes-counter vs account-balance); trace a deadline through a 4-hop gRPC chain.",
+  subs:[
+  { code:"4.1", name:"Epidemic Protocols", desc:"Coordinator-free spreading of state: cheap, scalable, weakly consistent.", leaves:[
+    L("Gossip Dissemination","Push vs pull vs push-pull, O(log N) convergence, fanout tuning — how Cassandra/Consul spread cluster state."),
+    L("Membership: SWIM","Indirect probes, suspicion, incarnation numbers — failure detection that scales where heartbeat-to-all cannot."),
+    L("Anti-Entropy & Merkle Trees","Replica repair by comparing hash trees — bandwidth-cheap, staleness-prone (Dynamo-style)."),
+    L("CRDTs","Counters, sets, registers that merge without coordination — conflict-free by construction (Riak, Figma, collab editing)."),
+  ]},
+  { code:"4.2", name:"RPC & Communication", desc:"Point-to-point movement of requests, and the contracts around them.", leaves:[
+    L("RPC Semantics & gRPC","HTTP/2 transport, streaming, PROPAGATED deadlines — the difference between a slow request and a cascading outage."),
+    L("REST vs gRPC vs GraphQL vs Async","Decision matrix: coupling, browser reach, contract evolution, fan-out cost — and when to publish an event instead."),
+    L("Service Discovery","Client-side vs server-side, DNS vs registry (Consul/etcd), health-check semantics — stale discovery as gray failure."),
+    L("Service Mesh & Sidecars","Envoy/Istio: retries, mTLS, policy moved out of app code — for the price of operating a fleet-wide proxy layer."),
+  ]},
+]},
+
+{ code:"5.0", name:"Consensus & Order", dir:"04-distributed/",
+  desc:"The most expensive thing a distributed system can do is agree. Learn the cost so you spend it only where anomalies are unaffordable.",
+  gate:"Walk Raft through a leader crash mid-replication without notes; pinpoint the exact moment 2PC blocks and who holds locks; split a checkout into saga steps with correct compensations.",
+  subs:[
+  { code:"5.1", name:"Consensus & Replication", desc:"Forcing a cluster to act as one machine.", leaves:[
+    L("Quorums & R/W Tuning","N/R/W arithmetic; why R+W>N gives overlap, not linearizability; sloppy quorums and hinted handoff."),
+    L("Paxos & Multi-Paxos","Proposers/acceptors/learners; single-decree is 'easy', Multi-Paxos is where everyone gets hurt (Chubby, Spanner)."),
+    L("Raft","Leader election, log replication, terms, joint consensus — understandability as a design goal (etcd, Consul, CockroachDB)."),
+    L("ZAB & Viewstamped Replication","ZooKeeper's protocol and the forgotten 1988 ancestor — Raft/ZAB/VR are one idea in three costumes."),
+    L("Leader Election & Fencing","Leases, epoch/fencing tokens, zombie leaders — 'I am the leader' is only safe with a token storage checks."),
+    L("Log Replication as Primitive","State machine replication: agree on a log, apply deterministically — the skeleton of Raft, Kafka, every replicated DB."),
+  ]},
+  { code:"5.2", name:"Distributed Transactions", desc:"Atomicity across machines — and the graveyard of protocols that tried.", leaves:[
+    L("Two-Phase Commit","Prepare/commit, coordinator failure, the blocking window holding locks — fine in a DB, a trap across services."),
+    L("3PC & Why Nobody Uses It","The non-blocking fix that only works without partitions — i.e. in a network that doesn't exist."),
+    L("Sagas & Compensation","Choreography vs orchestration; you can cancel an order, not un-send an email — the pattern that replaced 2PC."),
+    L("Percolator Model","2PC layered on MVCC timestamps (Google → TiDB) — modern NewSQL hides 2PC inside the database where it belongs."),
+    L("Deterministic Txns (Calvin)","Pre-order everything through a log, execute without coordination (FaunaDB) — and its interactivity cost."),
+    L("Serializable vs SI, Distributed","Write skew across shards, SELECT FOR UPDATE, retry loops as a first-class client obligation."),
+  ]},
+]},
+
+{ code:"6.0", name:"Scalability Patterns", dir:"05-components/ · 02-cache/ · 03-messaging/",
+  desc:"With theory paid for, patterns become derivations, not vocabulary. Each answers: which theoretical constraint am I trading against?",
+  gate:"Redesign a failing synchronous checkout into an async saga with an outbox; choose and defend a sharding key against the hot-key attack; explain why adding retries made the outage worse.",
+  subs:[
+  { code:"6.1", name:"Partitioning", desc:"Splitting state so no single node owns everything.", leaves:[
+    L("Sharding Strategies","Range vs hash vs directory — range gives locality and hot spots, hash gives balance and kills scans."),
+    L("Consistent Hashing & VNodes","The ring, virtual nodes, bounded-load variants — mod-N moves everything, this moves 1/N."),
+    L("Live Resharding","Split/merge, dual-write migration, shard maps guarded by consensus — the op that kills unprepared systems."),
+    L("Hot Keys & Celebrities","Detection, key salting, dedicated shards — the Bieber problem breaks every balanced-partition assumption."),
+    L("Secondary Indexes on Shards","Local (scatter-gather reads) vs global (distributed-txn writes) — one of the sharpest either/ors in the field."),
+    L("Cross-Shard Queries","Scatter-gather cost, denormalization, co-location by shard key — 'just join it' dies at the shard boundary."),
+  ]},
+  { code:"6.2", name:"Replication & Caching", desc:"Copies of state for availability and speed — and the consistency bill for each copy.", leaves:[
+    L("Leader-Follower Replication","Sync vs async vs semi-sync, lag, read-your-writes violations, failover data loss (RPO)."),
+    L("Multi-Leader & Leaderless","Write conflicts, LWW data loss, read repair, quorum reads — when geography forces it and what you pay."),
+    L("Chain & Quorum Variants","Chain replication (strong + throughput), witnesses, flexible quorums — the menu beyond primary/backup."),
+    L("Cache Placement & Patterns","Client → CDN → gateway → app cache → DB buffer pool; cache-aside vs read/write-through vs write-behind."),
+    L("Invalidation & Consistency","TTL vs explicit vs event-driven (CDC) — stale reads are a product decision, not a bug."),
+    L("Stampedes & Hot Keys","Thundering herd, request coalescing, jittered TTLs — how a cache EXPIRY takes down a database."),
+    L("Failover & Cold Caches","Cache warming, replica promotion, DNS vs VIP failover — the outage that happens AFTER the recovery."),
+  ]},
+  { code:"6.3", name:"Flow Control & Resilience", desc:"The tier most mid-level designs omit. Systems don't die from load — they die from their own uncontrolled reaction to load.", leaves:[
+    L("Rate Limiting","Token bucket vs sliding window, distributed limiter state, per-tenant fairness — limits as a contract."),
+    L("Load Shedding","Priority rejection; degrade gracefully (stale reads, dropped features) before failing completely."),
+    L("Backpressure End-to-End","Bounded queues at every hop, slowness propagated upstream — an unbounded queue is a deferred outage."),
+    L("Circuit Breakers & Bulkheads","Trip thresholds, half-open probing, per-dependency pools — contain failure instead of inheriting it."),
+    L("Retry Discipline","Budgets, jitter, retry at ONE layer only; retry storms and metastable failure — one blip becomes a self-sustaining outage."),
+    L("Graceful Degradation","Feature flags as pressure valves, fallback paths, brownout modes — decide IN ADVANCE what sheds first."),
+  ]},
+  { code:"6.4", name:"Async Architectures", desc:"Decoupling in time: the buffer between producers and consumers of work.", leaves:[
+    L("Queues vs Streams vs Pub/Sub","Competing consumers vs replayable log vs fan-out (SQS / Kafka / SNS) — pick by consumption semantics."),
+    L("Ordering & Partitioned Consumption","Per-key ordering via partitions, consumer groups, rebalance pauses — global order is a myth."),
+    L("Delivery Semantics in Practice","Offsets, commit-then-process vs process-then-commit, dedup tables — theory's lesson with real code."),
+    L("DLQs, Poison Pills & Replay","DLQ policy, quarantine, backfill as a first-class operation — a queue without a DLQ strategy is a landmine."),
+    L("Outbox & CDC","Atomic 'write DB + publish event' via outbox table + Debezium — the standard fix for dual-write inconsistency."),
+    L("Event Sourcing & CQRS","Events as source of truth, projections, snapshots — enormous power, enormous operational cost."),
+  ]},
+]},
+
+{ code:"7.0", name:"Industrial Systems", dir:"06-case-studies/",
+  desc:"Theory wearing production scars. Study each as a bundle of prior-tier decisions with public post-mortems.",
+  gate:"For any two systems here, run a head-to-head for a stated workload: engine, replication model, consistency guarantees, failure behavior — citing a public post-mortem of each.",
+  subs:[
+  { code:"7.1", name:"Databases & Datastores", desc:"The AP lineage (Dynamo) vs the CP lineage (Bigtable/Spanner), and everything between.", leaves:[
+    L("Dynamo & DynamoDB","Consistent hashing + sloppy quorum + vector clocks vs the managed single-digit-ms rewrite — the AP founding document."),
+    L("Cassandra","Dynamo's ring + Bigtable's LSM, tunable consistency, gossip membership — query-first data modeling."),
+    L("Spanner","Paxos groups + 2PC + TrueTime = external consistency, globally — 'consistent AND global' is buyable with hardware and latency."),
+    L("CockroachDB / TiDB","Spanner on commodity clocks (HLC + uncertainty windows) — what you lose without atomic clocks."),
+    L("Redis","Single-threaded core, data structures as API, 16384 cluster slots, Redlock controversy — the most misused system in industry."),
+    L("Elasticsearch / Lucene","Inverted indexes, segment merges, NRT search, split-brain history — replicated but NOT source-of-truth."),
+    L("Bigtable / HBase","Single-master range partitioning over a distributed FS — the CP counterpoint to Dynamo's ring."),
+  ]},
+  { code:"7.2", name:"Infrastructure", desc:"The substrate everything else runs on.", leaves:[
+    L("Kafka","Partitioned replicated log, ISR, consumer groups, KRaft, EOS transactions — the WAL promoted to an organizational nervous system."),
+    L("ZooKeeper / etcd","ZAB/Raft coordination kernels: locks, leases, watches — small, sacred, and a huge blast radius when they fail."),
+    L("Kubernetes","Desired-state reconciliation over etcd, controllers, scheduler — consensus at the bottom, eventual consistency above."),
+    L("S3 & Object Storage","Erasure coding, the 2020 strong-consistency migration, multipart upload — 11 nines as redundancy math."),
+    L("Envoy / Modern Proxies","xDS dynamic config, outlier detection, universal L7 telemetry — the data plane the mesh world standardized on."),
+    L("HDFS → Lakehouse","NameNode as the SPOF lesson, replication → erasure coding, Parquet + Iceberg/Delta."),
+  ]},
+  { code:"7.3", name:"Compute & Processing", desc:"The lineage of large-scale computation.", leaves:[
+    L("MapReduce → Spark → Flink","Batch → in-memory DAGs → true streaming with state and event time — watermarks are the deep end."),
+    L("Lambda vs Kappa","Dual batch/stream paths vs stream-only with replay — the reprocessing question every data platform must answer."),
+    L("Serverless & FaaS","Cold starts, state externalization, concurrency limits — shines when spiky and stateless, quietly bankrupts otherwise."),
+  ]},
+]},
+
+{ code:"8.0", name:"Operating at Scale", dir:"08-production-analysis/",
+  desc:"Design is a claim; production is the test. The difference between architects who draw boxes and architects trusted with the pager.",
+  gate:"Reconstruct a public post-mortem's failure chain back to a design decision; attach an error budget and a monthly bill to your own design; describe the rollback plan for a live schema migration.",
+  subs:[
+  { code:"8.1", name:"Observability & SLOs", desc:"You cannot operate what you cannot see.", leaves:[
+    L("Metrics, Logs & Traces","Three signals, cardinality cost, sampling — distributed tracing is the only honest map of a call graph."),
+    L("SLIs, SLOs & Error Budgets","User-facing SLIs, burn-rate alerting — budgets as the negotiation tool between reliability and velocity."),
+    L("Capacity & Load Testing","Headroom policy, utilization vs saturation, realistic traffic shape — find the knee before customers do."),
+  ]},
+  { code:"8.2", name:"Failure as a Discipline", desc:"Big systems fail big — the physics of cascades, and the practice of learning from them.", leaves:[
+    L("Post-Mortem Analysis","Blameless format, contributing factors over root cause — AWS/Cloudflare/GitHub post-mortems are the field's true textbook."),
+    L("Cascading & Metastable Failures","Retry amplification, cache-miss storms, pool exhaustion chains — overload that sustains itself after the trigger clears."),
+    L("Chaos Engineering","Fault injection, game days, region-evacuation drills — resilience hypotheses are worthless until executed."),
+    L("Incident Response Architecture","Runbooks, kill switches, flag ramps, safe rollback — systems operable DURING incidents, not just recoverable after."),
+  ]},
+  { code:"8.3", name:"Region, Security & Cost", desc:"The constraints that multiply every other decision.", leaves:[
+    L("Multi-Region & DR","Active-passive vs active-active, RPO/RTO math, data residency, region evacuation — the decision that multiplies all costs."),
+    L("Security Architecture","AuthN vs AuthZ (OAuth2/OIDC, mTLS), zero-trust identity, secrets rotation, tenant isolation — a topology property, not a checklist."),
+    L("Cost Engineering","Egress as the silent killer, storage tiering, reserved vs spot, cost-per-request as an SLI — designs come with a monthly bill."),
+    L("Migrations at Scale","Strangler fig, dual-write with verification, shadow traffic, zero-downtime backfill — the highest-risk work an architect signs."),
+  ]},
+]},
+
+{ code:"9.0", name:"The Architect's Judgment", dir:"07-interview-designs/ · 09-projects/",
+  desc:"The root, reached from the bottom. Below this is knowledge; this is deploying it in 45 minutes against an underspecified problem — the interview AND the job.",
+  gate:"ROOT UNLOCKED — take an unfamiliar problem, extract constraints, descend the tree picking exactly the nodes it needs, and present tradeoffs, failure modes, metrics, scaling and cost in 45 minutes.",
+  subs:[
+  { code:"9.1", name:"The Design Method", desc:"The repeatable procedure under the whiteboard.", leaves:[
+    L("Requirement Interrogation","Forcing numbers out of vague asks: DAU → RPS, read/write ratio, consistency needs, latency SLO."),
+    L("Back-of-Envelope Estimation","QPS, storage growth, bandwidth, connections — wrong by 10x gracefully beats false precision."),
+    L("API & Data-Model First","Contracts before boxes — schema and access patterns dictate storage choice, never the reverse."),
+    L("Tradeoff Narration","'I choose X, accepting cost Y, because constraint Z' — unprompted, at every decision. The strongest senior signal."),
+    L("The Evolution Story","1x → 10x → 100x: what breaks first, what gets replaced, what was deferred deliberately."),
+  ]},
+  { code:"9.2", name:"Interview Designs", desc:"The etudes — each one exercises specific tiers below.", leaves:[
+    L("URL Shortener / Paste","ID generation + read-heavy caching etude — simple on purpose, the narration carries it."),
+    L("News Feed / Timeline","Fan-out-on-write vs on-read, the celebrity hybrid — the classic skew problem in costume."),
+    L("Chat & Presence","Connection gateways, per-conversation ordering, receipts, offline sync — dissemination + async under exactly-once pressure."),
+    L("Rate Limiter / API Gateway","Distributed counter state, accuracy vs cost — goes as deep as the interviewer wants."),
+    L("Ride Matching / Proximity","Geohash/H3/quadtrees, high-write location streams, matching under staleness."),
+    L("Video Pipeline","Upload → transcode DAG → CDN — blob storage, async processing, edge delivery in one design."),
+    L("Payment / Ledger","Double-entry, idempotency keys, exactly-once processing, reconciliation — every consensus lesson is load-bearing."),
+    L("Search Autocomplete","Trie vs precomputed top-K, freshness pipelines, per-keystroke latency budgets."),
+    L("Distributed Job Scheduler","Exactly-once firing, leader election, misfire policy — a consensus problem disguised as a utility."),
+    L("Metrics / Monitoring System","Time-series ingestion, downsampling, cardinality explosions — design the observer using every prior tier."),
+  ]},
+  { code:"9.3", name:"Prove It by Building", desc:"Knowledge becomes permanent only after it survives contact with your own code.", leaves:[
+    L("Build a KV Store","WAL + memtable + SSTable + compaction — makes Storage Engines permanent."),
+    L("Build Raft","From the paper, then torture it with a Jepsen-style partition harness — makes Consensus permanent."),
+    L("Build a Message Broker","Partitioned log, consumer offsets, a DLQ — makes Async Architectures permanent."),
+    L("Break All Three","Load-test to the knee, induce the cascade, write the post-mortem — makes Operating at Scale permanent."),
+  ]},
+]},
+];
+
+/* ───────────── progress (localStorage) ───────────── */
+const STORE_KEY = "sdm-progress-v1";
+let done = new Set(JSON.parse(localStorage.getItem(STORE_KEY) || "[]"));
+const leafId = (sub, leaf) => sub.code + "|" + leaf.name;
+function saveProgress() { localStorage.setItem(STORE_KEY, JSON.stringify([...done])); }
+function resetProgress() {
+  if (!confirm("Clear all progress?")) return;
+  done = new Set(); saveProgress(); render(); if (openNode) openPanel(openNode);
+}
+
+/* ───────────── build graph: vertical chain with fan-out/fan-in ───────────── */
+const measurer = document.createElement("canvas").getContext("2d");
+function textW(t, font) { measurer.font = font; return measurer.measureText(t).width; }
+
+const NODE_H = 44, SUB_H = 38, V_TIER = 118, V_SUB = 132, SUB_SPREAD = 250, STAGGER = 24;
+let gnodes = [], gedges = [];
+
+function buildGraph() {
+  gnodes = []; gedges = [];
+  let y = 0, prev = [];   // prev = nodes feeding into the next tier node
+  for (const tier of TIERS) {
+    const tw = Math.max(textW(tier.code + "  " + tier.name, "700 13.5px sans-serif") + 56, 170);
+    const tnode = { ...tier, kind: "tier", x: 0, y, w: tw, h: NODE_H, leaves: tier.subs.flatMap(s => s.leaves.map(l => ({ sub: s, leaf: l }))) };
+    gnodes.push(tnode);
+    for (const p of prev) gedges.push([p, tnode]);
+    const n = tier.subs.length;
+    const subNodes = tier.subs.map((s, i) => {
+      const w = Math.max(textW(s.code + "  " + s.name, "600 12.5px sans-serif") + 56, 150);
+      const x = (i - (n - 1) / 2) * SUB_SPREAD;
+      const sy = y + V_TIER + (i % 2 ? STAGGER : 0);
+      const node = { ...s, kind: "sub", x, y: sy, w, h: SUB_H, leaves: s.leaves.map(l => ({ sub: s, leaf: l })), tier };
+      gnodes.push(node);
+      gedges.push([tnode, node]);
+      return node;
+    });
+    prev = subNodes;
+    y += V_TIER + V_SUB + STAGGER;
+  }
+}
+
+/* ───────────── render ───────────── */
+const svg = document.getElementById("svg"), view = document.getElementById("view"),
+      stage = document.getElementById("stage");
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  parent.appendChild(e); return e;
+}
+
+let bounds = { minX: 0, maxX: 0, maxY: 0 };
+function render() {
+  buildGraph();
+  view.innerHTML = "";
+  const eg = el("g", {}, view), ng = el("g", {}, view);
+  bounds = { minX: 0, maxX: 0, maxY: 0 };
+
+  for (const [a, b] of gedges) {
+    const x1 = a.x, y1 = a.y + a.h, x2 = b.x, y2 = b.y;
+    const dy = Math.max((y2 - y1) * 0.55, 30);
+    el("path", { class: "edge", d: `M ${x1} ${y1} C ${x1} ${y1 + dy}, ${x2} ${y2 - dy}, ${x2} ${y2}` }, eg);
+  }
+
+  for (const n of gnodes) {
+    bounds.minX = Math.min(bounds.minX, n.x - n.w / 2);
+    bounds.maxX = Math.max(bounds.maxX, n.x + n.w / 2);
+    bounds.maxY = Math.max(bounds.maxY, n.y + n.h);
+
+    const total = n.leaves.length;
+    const completed = n.leaves.filter(({ sub, leaf }) => done.has(leafId(sub, leaf))).length;
+    const g = el("g", {
+      class: "node " + n.kind + (completed === total && total > 0 ? " done" : ""),
+      transform: `translate(${n.x - n.w / 2},${n.y})`
+    }, ng);
+    el("rect", { class: "box", width: n.w, height: n.h, rx: 9 }, g);
+
+    const label = el("text", { class: "label", x: n.w / 2, y: n.h / 2 + 1, "text-anchor": "middle" }, g);
+    label.textContent = (n.kind === "tier" ? n.code + "  " : "") + n.name;
+    const cnt = el("text", { class: "cnt", x: n.w / 2, y: n.h - 9, "text-anchor": "middle" }, g);
+    cnt.textContent = completed + " / " + total;
+
+    // progress bar
+    el("rect", { class: "track", x: 8, y: n.h - 6, width: n.w - 16, height: 3.5, rx: 2 }, g);
+    if (completed > 0)
+      el("rect", { class: "fill", x: 8, y: n.h - 6, width: (n.w - 16) * completed / total, height: 3.5, rx: 2 }, g);
+
+    g.addEventListener("click", ev => { if (!dragMoved) { openPanel(n); ev.stopPropagation(); } });
+  }
+  updateOverall();
+}
+
+function updateOverall() {
+  const all = TIERS.flatMap(t => t.subs.flatMap(s => s.leaves.map(l => leafId(s, l))));
+  const d = all.filter(id => done.has(id)).length;
+  document.getElementById("overall-txt").textContent = d + " / " + all.length + " topics";
+  document.getElementById("overall-fill").style.width = (100 * d / all.length) + "%";
+}
+
+/* ───────────── side panel ───────────── */
+const panel = document.getElementById("panel"),
+      phead = document.getElementById("panel-head"),
+      pbody = document.getElementById("panel-body");
+let openNode = null;
+
+function openPanel(n) {
+  openNode = n;
+  let h = `<div class="code">${n.code}${n.kind === "tier" ? " · TIER" : ""}</div><h2>${n.name}</h2>`;
+  if (n.desc) h += `<div class="desc">${n.desc}</div>`;
+  if (n.gate) h += `<div class="gate">${n.gate}</div>`;
+  if (n.dir)  h += `<div class="dir">→ ${n.dir}</div>`;
+  phead.innerHTML = h;
+
+  let b = "";
+  if (n.kind === "tier") {
+    for (const s of n.subs) {
+      b += `<div class="group-label">${s.code} · ${s.name}</div>`;
+      b += s.leaves.map(l => itemHTML(s, l)).join("");
+    }
+  } else {
+    b += n.leaves.map(({ sub, leaf }) => itemHTML(sub, leaf)).join("");
+  }
+  pbody.innerHTML = b;
+  pbody.querySelectorAll(".item").forEach(it => {
+    it.addEventListener("click", ev => {
+      if (ev.target.tagName === "INPUT") return;
+      if (ev.target.closest("a")) return;   // let article links open
+      const cb = it.querySelector("input"); cb.checked = !cb.checked;
+      cb.dispatchEvent(new Event("change"));
+    });
+    it.querySelector("input").addEventListener("change", ev => {
+      const id = it.dataset.id;
+      if (ev.target.checked) done.add(id); else done.delete(id);
+      it.classList.toggle("checked", ev.target.checked);
+      saveProgress(); render();
+    });
+  });
+  panel.classList.add("open");
+}
+function itemHTML(sub, leaf) {
+  const id = leafId(sub, leaf), c = done.has(id);
+  const href = appHref(leaf.name);
+  const title = href
+    ? `<a class="t link" href="${href}" target="_blank" rel="noopener">${leaf.name} ↗</a>`
+    : `<div class="t">${leaf.name}</div>`;
+  return `<div class="item${c ? " checked" : ""}" data-id="${id}">
+    <input type="checkbox" ${c ? "checked" : ""}>
+    <div>${title}<div class="d">${leaf.desc}</div></div>
+  </div>`;
+}
+function closePanel() { panel.classList.remove("open"); openNode = null; }
+window.closePanel = closePanel; window.resetProgress = resetProgress;
+
+/* ───────────── pan / zoom ───────────── */
+let tx = 0, ty = 0, scale = 1;
+function applyView() { view.setAttribute("transform", `translate(${tx},${ty}) scale(${scale})`); }
+function fit() {
+  const r = stage.getBoundingClientRect();
+  const w = bounds.maxX - bounds.minX + 120, h = bounds.maxY + 120;
+  scale = Math.min(r.width / w, r.height / h, 1.3);
+  tx = r.width / 2 - (bounds.minX + bounds.maxX) / 2 * scale;
+  ty = 40;
+  applyView();
+}
+function fitWidth() {
+  const r = stage.getBoundingClientRect();
+  scale = Math.min(r.width / (bounds.maxX - bounds.minX + 120), 1.3);
+  tx = r.width / 2 - (bounds.minX + bounds.maxX) / 2 * scale;
+  ty = 40;
+  applyView();
+}
+window.fit = fit; window.fitWidth = fitWidth;
+
+let panning = false, px = 0, py = 0, dragMoved = false;
+stage.addEventListener("mousedown", e => {
+  if (panel.contains(e.target)) return;
+  panning = true; dragMoved = false; px = e.clientX; py = e.clientY; stage.classList.add("panning");
+});
+window.addEventListener("mousemove", e => {
+  if (!panning) return;
+  const dx = e.clientX - px, dy = e.clientY - py;
+  if (Math.abs(dx) + Math.abs(dy) > 3) dragMoved = true;
+  tx += dx; ty += dy; px = e.clientX; py = e.clientY; applyView();
+});
+window.addEventListener("mouseup", () => { panning = false; stage.classList.remove("panning"); setTimeout(() => dragMoved = false, 0); });
+stage.addEventListener("wheel", e => {
+  if (panel.contains(e.target)) return;
+  e.preventDefault();
+  const r = stage.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  const ns = Math.min(Math.max(scale * factor, 0.08), 3);
+  tx = mx - (mx - tx) * (ns / scale);
+  ty = my - (my - ty) * (ns / scale);
+  scale = ns; applyView();
+}, { passive: false });
+
+/* touch */
+let touches = new Map(), lastDist = 0;
+stage.addEventListener("touchstart", e => { if (panel.contains(e.target)) return; for (const t of e.changedTouches) touches.set(t.identifier, { x: t.clientX, y: t.clientY }); }, { passive: true });
+stage.addEventListener("touchmove", e => {
+  if (panel.contains(e.target)) return;
+  e.preventDefault();
+  const list = [...e.touches];
+  if (list.length === 1) {
+    const p = touches.get(list[0].identifier); if (!p) return;
+    tx += list[0].clientX - p.x; ty += list[0].clientY - p.y;
+    touches.set(list[0].identifier, { x: list[0].clientX, y: list[0].clientY });
+  } else if (list.length === 2) {
+    const d = Math.hypot(list[0].clientX - list[1].clientX, list[0].clientY - list[1].clientY);
+    if (lastDist) scale = Math.min(Math.max(scale * d / lastDist, 0.08), 3);
+    lastDist = d;
+  }
+  applyView();
+}, { passive: false });
+stage.addEventListener("touchend", e => { for (const t of e.changedTouches) touches.delete(t.identifier); if (e.touches.length < 2) lastDist = 0; }, { passive: true });
+
+render();
+fitWidth();
+window.addEventListener("resize", () => {});
+</script>
+</body>
+</html>

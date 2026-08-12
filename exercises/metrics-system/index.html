@@ -1,0 +1,40 @@
+<h1>Metrics System — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a time-series metrics platform that collects, stores, and serves numeric measurements emitted by services and infrastructure.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Clients can emit metrics as timestamped numeric values tagged with dimensions (host, service, region, etc.).</li>
+  <li>The system must support counter, gauge, and histogram metric types.</li>
+  <li>The system must ingest metrics via both push from agents and pull/scrape from targets.</li>
+  <li>Users can query metrics over a time range with filtering and grouping by tags.</li>
+  <li>The system must support aggregation functions such as sum, average, rate, min, max, and percentiles.</li>
+  <li>The system must downsample and roll up older data to coarser resolutions automatically.</li>
+  <li>Users can define alerting rules that evaluate metrics and fire when thresholds are breached.</li>
+  <li>The system must deliver alert notifications to external channels (email, paging, chat).</li>
+  <li>Users can build dashboards composed of multiple metric queries and visualizations.</li>
+  <li>The system must enforce per-metric retention policies.</li>
+  <li>The system must handle late-arriving and out-of-order data points within a bounded window.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Ingest 10M+ data points per second with millions of active time series.</li>
+  <li>Recent-data queries must return within 500 ms at p95 for typical dashboard time ranges.</li>
+  <li>Ingestion availability target of 99.95%; a brief query outage is more tolerable than dropped ingestion.</li>
+  <li>Store raw data at high resolution for 15 days and downsampled data for 13 months.</li>
+  <li>Alert evaluation latency must stay under 1 minute from data arrival to alert firing.</li>
+  <li>The system must scale horizontally as the number of time series and tags grows.</li>
+  <li>Data may be eventually consistent; brief gaps during ingestion spikes are acceptable.</li>
+  <li>Stored metrics must be durable enough that committed data survives single-node failure.</li>
+  <li>Access to metrics and dashboards must be authenticated and scoped per team or tenant.</li>
+  <li>Storage cost per data point must decrease as data ages via compression and downsampling targets.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume metric-emitting agents and client libraries already exist and are instrumented by service owners.</li>
+  <li>Assume identity and tenant management are provided by a central platform.</li>
+  <li>Distributed tracing and log aggregation are out of scope; this system handles numeric metrics only.</li>
+  <li>Long-term archival beyond the stated retention window is excluded.</li>
+  <li>Assume network reachability between agents and ingestion endpoints is already provisioned.</li>
+</ul>

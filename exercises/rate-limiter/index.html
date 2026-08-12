@@ -1,0 +1,37 @@
+<h1>Rate Limiter — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a service that limits how many requests a client can make to an API within a given time window.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>The system must reject or throttle requests from a client once a configured request quota for a time window is exceeded.</li>
+  <li>Operators can define limits per API key, per user, and per client IP address.</li>
+  <li>Operators can configure different limits for different API endpoints or route groups.</li>
+  <li>The system must return a clear response indicating a request was rate-limited, distinct from other errors.</li>
+  <li>Responses must communicate the remaining quota, the applicable limit, and when the quota resets.</li>
+  <li>Operators can configure limits with different granularities (per second, per minute, per hour, per day).</li>
+  <li>The system must allow limit rules to be updated at runtime without restarting dependent services.</li>
+  <li>The system must support tiered limits so that premium clients receive higher quotas than free clients.</li>
+  <li>Operators can define burst allowances above the steady-state rate for short spikes.</li>
+  <li>The system must be usable by multiple independent services sharing the same limiting infrastructure.</li>
+  <li>Operators can view metrics on how often clients are being throttled.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>The rate-limit decision must add no more than 5 ms of latency per request (p99).</li>
+  <li>The system must handle 1 million rate-limit checks per second across the fleet.</li>
+  <li>Availability target of 99.99%; the limiter must not become a single point of failure for the APIs it protects.</li>
+  <li>Limit counters must be accurate enough that clients are not throttled significantly below or above their configured quota.</li>
+  <li>Limits must be enforced consistently across many distributed API server instances.</li>
+  <li>The system must degrade gracefully: if the limiter is unavailable, a configurable fail-open or fail-closed policy applies.</li>
+  <li>Memory and storage footprint per tracked client must remain small enough to track millions of clients cost-effectively.</li>
+  <li>Configuration changes to limits should take effect within seconds across the fleet.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume clients are already authenticated and carry an identifiable API key or user identity.</li>
+  <li>Billing and monetization of quota tiers are out of scope.</li>
+  <li>Assume the limiter runs alongside existing API gateways or services rather than as the primary auth layer.</li>
+  <li>DDoS mitigation at the network layer is excluded; this focuses on application-level request limiting.</li>
+</ul>

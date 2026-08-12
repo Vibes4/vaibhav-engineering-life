@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DSA Practice — Top 100 Google problems</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+
+  <!-- No-flash dark mode (shares the 'theme' key with the main app) -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'dark' || (!t && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+          document.documentElement.classList.add('dark');
+        }
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="practice/practice.css" />
+</head>
+
+<body>
+  <div class="dsa-shell">
+    <!-- Problem list -->
+    <aside class="dsa-list">
+      <div class="dsa-list-head">
+        <h1>🧑‍💻 DSA Practice</h1>
+        <div class="sub">Top 100 Google questions · with LeetCode links</div>
+        <input id="dsa-search" class="dsa-search" placeholder="Search title or tag…" />
+        <div class="sub" style="margin-top:8px">100 problems · ordered by priority — start at the top</div>
+      </div>
+      <div id="dsa-list-items"></div>
+    </aside>
+
+    <!-- Work area -->
+    <main id="dsa-main" class="dsa-main"></main>
+  </div>
+
+  <script src="practice/problems.js"></script>
+  <script src="practice/practice.js"></script>
+</body>
+</html>

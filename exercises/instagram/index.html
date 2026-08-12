@@ -1,0 +1,39 @@
+<h1>Instagram — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a photo- and video-sharing social service where users post media and view a personalized feed of content from accounts they follow.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can upload and publish photos and videos, optionally with captions and location tags.</li>
+  <li>Users can follow and unfollow other accounts.</li>
+  <li>Users can view a personalized home feed of posts from accounts they follow.</li>
+  <li>Users can like and comment on posts.</li>
+  <li>Users can view any user's profile and their published posts.</li>
+  <li>Users can search for accounts and discover content via hashtags or an explore surface.</li>
+  <li>The system must send notifications for follows, likes, comments, and mentions.</li>
+  <li>Users can post ephemeral stories that expire after a set period (e.g., 24 hours).</li>
+  <li>Users can send direct messages to other users.</li>
+  <li>Users can set an account to private so only approved followers see their content.</li>
+  <li>The system must display like counts, comment counts, and follower/following counts.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Scale target: ~1B+ users and hundreds of millions of posts uploaded per day.</li>
+  <li>Read-heavy workload: feed reads vastly outnumber writes (on the order of 100:1 or more).</li>
+  <li>Feed load and media rendering should be fast, with p99 feed latency under ~200 ms.</li>
+  <li>Availability target of 99.99% for feed and media serving.</li>
+  <li>Uploaded media must be stored durably and delivered globally with low latency.</li>
+  <li>Feeds and counts can be eventually consistent; a user must reliably see their own newly created post.</li>
+  <li>The system must handle celebrity accounts with tens of millions of followers (fan-out hot spots).</li>
+  <li>User privacy settings must be enforced consistently across feed, search, and direct access.</li>
+  <li>Cost of media storage and delivery must scale sub-linearly with growth where possible.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume authentication and account management exist.</li>
+  <li>Ads, shopping, and monetization features are out of scope.</li>
+  <li>Live video and Reels-specific ranking are excluded unless stated.</li>
+  <li>Detailed recommendation/ranking model design is out of scope; treat feed ranking as a capability requirement.</li>
+  <li>Content moderation internals are excluded beyond basic reporting/takedown capability.</li>
+</ul>

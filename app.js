@@ -3,14 +3,8 @@
    Also handles the persisted dark-mode toggle. */
 
 const MODULES = {
-  "Quick Recap": {
-    folder: "recap",
-    items: [
-      ["interview-20min", "⚡ 20-Min Interview Recap", "Node, Angular, SQL, Docker, micro…"]
-    ]
-  },
   "JavaScript": {
-    folder: "javascript",
+    folder: "javascript", divider: "Language & Frameworks",
     items: [
       ["types-coercion",       "Types & coercion",       "==, ===, typeof, NaN, falsy"],
       ["scope-hoisting",       "Scope & hoisting",       "var/let/const, TDZ, blocks"],
@@ -74,7 +68,17 @@ const MODULES = {
       ["features",          "Ecosystem & features",    "TypeORM, GraphQL, microservices"]
     ]
   },
-  "MongoDB": {
+  "SQL": {
+    folder: "sql", divider: "Data & Storage",
+    items: [
+      ["basics",            "SQL basics & pooling",   "pools, parameterized queries"],
+      ["joins",             "Joins",                  "inner, left, right, full"],
+      ["indexing",          "Indexing & tuning",      "B-tree, EXPLAIN ANALYZE"],
+      ["transactions-acid", "Transactions & ACID",    "isolation levels, locking"],
+      ["normalization",     "Normalization",          "1NF–3NF, when to denormalize"]
+    ]
+  },
+  "MongoDB (Mongoose)": {
     folder: "mongodb",
     items: [
       ["basics",          "MongoDB + Mongoose",     "schemas, queries, populate"],
@@ -84,217 +88,59 @@ const MODULES = {
       ["transactions",    "Transactions",           "sessions, ACID, write concern"]
     ]
   },
-  "SQL": {
-    folder: "sql",
+  "Datastore Internals": {
+    folder: "mastery",
     items: [
-      ["basics",            "SQL basics & pooling",   "pools, parameterized queries"],
-      ["joins",             "Joins",                  "inner, left, right, full"],
-      ["indexing",          "Indexing & tuning",      "B-tree, EXPLAIN ANALYZE"],
-      ["transactions-acid", "Transactions & ACID",    "isolation levels, locking"],
-      ["normalization",     "Normalization",          "1NF–3NF, when to denormalize"]
+      ["mongodb",       "MongoDB internals",  "replica sets, sharding, WiredTiger, oplog"],
+      ["redis",         "Redis",              "single-thread, persistence, cluster"],
+      ["elasticsearch", "Elasticsearch",      "inverted index, CRUD, pagination types"]
     ]
   },
-  "DSA · Concepts": {
-    folder: "dsa",
+  "Networking": {
+    folder: "mastery", divider: "Networking",
     items: [
-      ["big-o",         "Big-O cheat sheet",     "time & space complexity"],
-      ["arrays",        "Arrays",                "two pointers, sliding window"],
-      ["strings",       "Strings",               "anagrams, substrings"],
-      ["hashmap",       "HashMap / HashSet",     "frequency, lookup, dedupe"],
-      ["linked-list",   "Linked List",           "fast/slow, reverse"],
-      ["stack",         "Stack",                 "parentheses, monotonic"],
-      ["queue",         "Queue",                 "BFS, scheduling"],
-      ["trees",         "Trees",                 "DFS, BFS, traversals"],
-      ["graphs",        "Graphs",                "DFS, BFS, visited set"],
-      ["heap",          "Heap / Priority Queue", "top-K, streaming"],
-      ["binary-search", "Binary Search",         "sorted data, O(log n)"],
-      ["lru-cache",     "LRU Cache",             "HashMap + DLL, O(1)"]
+      ["networking",      "Networking overview",      "TCP/TLS/HTTP, DNS, load balancing"],
+      ["tls",             "TLS / SSL",                "handshake, certs, mTLS, ciphers"],
+      ["dns",             "DNS",                      "resolution, records, anycast, DNSSEC"],
+      ["http",            "HTTP/1.1 · 2 · 3 · QUIC",  "multiplexing, HOL blocking, caching"],
+      ["load-balancing",  "Load Balancing & Proxies", "L4/L7, algorithms, health checks"]
     ]
   },
-  "Arrays": {
-    folder: "dsa-problems/arrays", collapsed: true, divider: "DSA Problems",
+  "Distributed Theory": {
+    folder: "mastery", divider: "Distributed Systems",
     items: [
-      ["two-sum",              "Two Sum",                 "HashMap · O(n)"],
-      ["best-time-stock",      "Best Time to Buy/Sell",   "min-so-far · O(n)"],
-      ["product-except-self",  "Product Except Self",     "prefix/suffix · O(n)"],
-      ["move-zeroes",          "Move Zeroes",             "two pointers · O(n)"],
-      ["merge-intervals",      "Merge Intervals",         "sort+merge · O(n log n)"]
+      ["distributed-systems", "Distributed Systems",  "CAP, consensus, consistency, clocks"],
+      ["concurrency",         "Concurrency & Async",  "event loop, locks, races, CAS"]
     ]
   },
-  "Strings": {
-    folder: "dsa-problems/strings", collapsed: true,
+  "Messaging & Streaming": {
+    folder: "mastery",
     items: [
-      ["valid-anagram",        "Valid Anagram",           "freq count · O(n)"],
-      ["group-anagrams",       "Group Anagrams",          "sorted-key buckets"],
-      ["longest-substring",    "Longest Substring",       "sliding window · O(n)"],
-      ["longest-palindrome",   "Longest Palindrome",      "expand center · O(n²)"]
+      ["kafka",     "Kafka",     "partitions, ISR, consumer groups, lag"],
+      ["rabbitmq",  "RabbitMQ",  "exchanges, acks, DLQ, backpressure"]
     ]
   },
-  "HashMap": {
-    folder: "dsa-problems/hashmap", collapsed: true,
+  "Cloud & Infrastructure": {
+    folder: "mastery", divider: "Cloud & Infrastructure",
     items: [
-      ["two-sum",              "Two Sum",                 "complement map · O(n)"],
-      ["contains-duplicate",   "Contains Duplicate",      "Set · O(n)"],
-      ["valid-anagram",        "Valid Anagram",           "freq map · O(n)"],
-      ["frequency-counter",    "Frequency Counter",       "Map tally · O(n)"]
+      ["cloud",           "Cloud",                     "compute, storage, networking, IAM"],
+      ["cloud-providers", "Cloud: AWS vs Azure vs GCP","service equivalents + unique features"],
+      ["infrastructure",  "Infrastructure",            "containers, IaC, CI/CD, service mesh"],
+      ["kubernetes",      "Kubernetes",                "pods, controllers, scheduling, probes"]
     ]
   },
-  "Linked List": {
-    folder: "dsa-problems/linked-list", collapsed: true,
+  "Reliability, Security & Ops": {
+    folder: "mastery", divider: "Reliability, Security & Ops",
     items: [
-      ["reverse-list",         "Reverse Linked List",     "iterative · O(n)"],
-      ["detect-cycle",         "Detect Cycle",            "Floyd fast/slow"],
-      ["middle-node",          "Middle Node",             "fast/slow pointer"],
-      ["merge-two-lists",      "Merge Two Sorted Lists",  "dummy head"]
+      ["observability",          "Observability",            "metrics, logs, traces, OTel, SLO"],
+      ["rate-limiting",          "Rate Limiting & Resiliency","token bucket, breakers, backoff"],
+      ["auth",                   "Auth · OAuth2 / OIDC / JWT","tokens, flows, sessions, RBAC"],
+      ["performance-engineering","Performance Engineering",  "latency, throughput, profiling, p99"],
+      ["production-scenarios",   "Production Scenarios",     "incidents: RCA, debugging, prevention"]
     ]
   },
-  "Stack": {
-    folder: "dsa-problems/stack", collapsed: true,
-    items: [
-      ["valid-parentheses",    "Valid Parentheses",       "stack match · O(n)"],
-      ["min-stack",            "Min Stack",               "aux min · O(1) ops"],
-      ["next-greater",         "Next Greater Element",    "monotonic stack · O(n)"]
-    ]
-  },
-  "Trees": {
-    folder: "dsa-problems/trees", collapsed: true,
-    items: [
-      ["max-depth",            "Max Depth",               "DFS recursion"],
-      ["level-order",          "Level Order Traversal",   "BFS queue"],
-      ["validate-bst",         "Validate BST",            "min/max bounds"],
-      ["lca",                  "Lowest Common Ancestor",  "recurse & split"]
-    ]
-  },
-  "Graphs": {
-    folder: "dsa-problems/graphs", collapsed: true,
-    items: [
-      ["number-of-islands",    "Number of Islands",       "DFS flood-fill · O(V+E)"],
-      ["clone-graph",          "Clone Graph",             "DFS + visited map"]
-    ]
-  },
-  "Heap": {
-    folder: "dsa-problems/heap", collapsed: true,
-    items: [
-      ["k-largest",            "K Largest Elements",      "min-heap size k"],
-      ["top-k-frequent",       "Top K Frequent",          "bucket sort"]
-    ]
-  },
-  "Binary Search": {
-    folder: "dsa-problems/binary-search", collapsed: true,
-    items: [
-      ["binary-search",        "Binary Search",           "sorted · O(log n)"],
-      ["search-insert",        "Search Insert Position",  "lower bound"],
-      ["first-last-occurrence","First/Last Occurrence",   "bounded search"]
-    ]
-  },
-  "LRU Cache (problem)": {
-    folder: "dsa-problems/lru", collapsed: true,
-    items: [
-      ["lru-cache",            "LRU Cache",               "HashMap + DLL · O(1)"]
-    ]
-  },
-  "Sliding Window": {
-    folder: "dsa-patterns/sliding-window", collapsed: true, divider: "DSA Patterns",
-    items: [
-      ["max-sum-subarray-k",         "Max Sum Subarray of Size K",      "fixed window · O(n)"],
-      ["longest-substring-no-repeat","Longest Substring w/o Repeat",    "dynamic window · O(n)"],
-      ["longest-k-distinct",         "Longest Substring K Distinct",    "window + map · O(n)"],
-      ["min-window-substring",       "Minimum Window Substring",        "shrink window · O(n)"]
-    ]
-  },
-  "Two Pointers": {
-    folder: "dsa-patterns/two-pointers", collapsed: true,
-    items: [
-      ["three-sum",            "3Sum",                       "sort + two pointers · O(n²)"],
-      ["container-most-water", "Container With Most Water",  "two ends · O(n)"],
-      ["valid-palindrome",     "Valid Palindrome",           "converge · O(n)"],
-      ["sort-colors",          "Sort Colors (Dutch flag)",   "3-way partition · O(n)"]
-    ]
-  },
-  "Fast & Slow Pointers": {
-    folder: "dsa-patterns/fast-slow", collapsed: true,
-    items: [
-      ["linked-list-cycle", "Linked List Cycle",   "Floyd · O(n)"],
-      ["cycle-start",       "Start of Cycle",       "Floyd + reset · O(n)"],
-      ["happy-number",      "Happy Number",         "cycle on digit-squares"]
-    ]
-  },
-  "Merge Intervals (pattern)": {
-    folder: "dsa-patterns/merge-intervals", collapsed: true,
-    items: [
-      ["merge-intervals",       "Merge Intervals",       "sort + merge · O(n log n)"],
-      ["insert-interval",       "Insert Interval",       "scan + merge · O(n)"],
-      ["interval-intersection", "Interval Intersection", "two pointers · O(n+m)"]
-    ]
-  },
-  "Cyclic Sort": {
-    folder: "dsa-patterns/cyclic-sort", collapsed: true,
-    items: [
-      ["missing-number",         "Missing Number",          "place i at index i · O(n)"],
-      ["find-duplicates",        "Find All Duplicates",     "cyclic sort · O(n)"],
-      ["first-missing-positive", "First Missing Positive",  "cyclic sort · O(n)"]
-    ]
-  },
-  "Tree BFS": {
-    folder: "dsa-patterns/tree-bfs", collapsed: true,
-    items: [
-      ["level-order",     "Level Order Traversal", "queue · O(n)"],
-      ["zigzag",          "Zigzag Level Order",     "queue + flip · O(n)"],
-      ["right-side-view", "Right Side View",        "last per level · O(n)"]
-    ]
-  },
-  "Backtracking": {
-    folder: "dsa-patterns/backtracking", collapsed: true,
-    items: [
-      ["subsets",         "Subsets",          "include/exclude · O(2ⁿ)"],
-      ["permutations",    "Permutations",     "used set · O(n!)"],
-      ["combination-sum", "Combination Sum",  "choose + recurse"],
-      ["word-search",     "Word Search",      "DFS grid + backtrack"]
-    ]
-  },
-  "Modified Binary Search": {
-    folder: "dsa-patterns/binary-search", collapsed: true,
-    items: [
-      ["rotated-array", "Search in Rotated Array", "O(log n)"],
-      ["find-peak",     "Find Peak Element",        "O(log n)"],
-      ["koko-bananas",  "Koko Eating Bananas",      "binary search on answer"]
-    ]
-  },
-  "Top K Elements": {
-    folder: "dsa-patterns/top-k", collapsed: true,
-    items: [
-      ["kth-largest",     "Kth Largest Element",       "min-heap size k"],
-      ["top-k-frequent",  "Top K Frequent Elements",   "bucket / heap"],
-      ["k-closest-points","K Closest Points to Origin","max-heap size k"]
-    ]
-  },
-  "Dynamic Programming": {
-    folder: "dsa-patterns/dynamic-programming", collapsed: true,
-    items: [
-      ["climbing-stairs",                "Climbing Stairs",            "fib DP · O(n)"],
-      ["house-robber",                   "House Robber",               "DP · O(n)"],
-      ["coin-change",                    "Coin Change",                "unbounded knapsack"],
-      ["longest-increasing-subsequence", "Longest Increasing Subseq",  "DP · O(n²)"]
-    ]
-  },
-  "Monotonic Stack": {
-    folder: "dsa-patterns/monotonic-stack", collapsed: true,
-    items: [
-      ["daily-temperatures", "Daily Temperatures",            "decreasing stack · O(n)"],
-      ["next-greater",       "Next Greater Element",          "monotonic stack · O(n)"],
-      ["largest-rectangle",  "Largest Rectangle in Histogram","stack · O(n)"]
-    ]
-  },
-  "Prefix Sum": {
-    folder: "dsa-patterns/prefix-sum", collapsed: true,
-    items: [
-      ["subarray-sum-k",      "Subarray Sum Equals K",  "prefix + map · O(n)"],
-      ["product-except-self", "Product Except Self",     "prefix/suffix · O(n)"],
-      ["range-sum",           "Range Sum Query",         "prefix array · O(1) query"]
-    ]
-  },
-  "System Design": {
-    folder: "system-design", divider: "System Design",
+  "System Design — Building Blocks": {
+    folder: "system-design", divider: "System Design — Patterns",
     items: [
       ["fundamentals",         "SD fundamentals",      "scalability, CAP, load balancing"],
       ["caching",              "Caching & Redis",      "patterns, eviction, invalidation"],
@@ -305,8 +151,8 @@ const MODULES = {
       ["file-upload",          "File upload service",  "chunking, presigned URLs"]
     ]
   },
-  "How Products Work": {
-    folder: "system-design/case-studies", collapsed: true, divider: "System Design · Case Studies",
+  "Case Studies": {
+    folder: "system-design/case-studies", collapsed: true, divider: "System Design — Case Studies",
     items: [
       ["reddit",              "How Reddit Works",              "hot ranking, votes, read-heavy"],
       ["airbnb",              "How Airbnb Works",              "geo+date search, no double-booking"],
@@ -321,50 +167,35 @@ const MODULES = {
       ["uber-nearby-drivers", "How Uber Finds Drivers",        "geohash/quadtree proximity"],
       ["youtube",             "How YouTube Works",             "transcode ladder, CDN, ABR"],
       ["whatsapp",            "How WhatsApp Works",            "E2E encryption, delivery receipts"],
-      ["airtag",              "How Apple AirTag Works",        "Find My network, rotating keys"]
-    ]
-  },
-  "How Technologies Work": {
-    folder: "system-design/case-studies",
-    items: [
+      ["airtag",              "How Apple AirTag Works",        "Find My network, rotating keys"],
       ["s3",                  "How AWS S3 Works",              "object storage, consistent hashing"],
       ["lambda",              "How AWS Lambda Works",          "serverless, cold starts, scaling"],
       ["chatgpt",             "How LLMs Like ChatGPT Work",    "tokens, autoregression, sampling"]
     ]
   },
-  "Core Topics": {
-    folder: "mastery", divider: "Senior Backend Interview Mastery",
+  "Exercises": {
+    folder: "exercises", collapsed: true, divider: "Practice · Requirements",
     items: [
-      ["mongodb",                "MongoDB",                "replica sets, sharding, WiredTiger, oplog"],
-      ["networking",             "Networking",             "TCP/TLS/HTTP, DNS, load balancing"],
-      ["cloud",                  "Cloud",                  "compute, storage, networking, IAM"],
-      ["cloud-providers",        "Cloud: AWS vs Azure vs GCP","service equivalents + unique features"],
-      ["infrastructure",         "Infrastructure",         "containers, IaC, CI/CD, service mesh"],
-      ["kubernetes",             "Kubernetes",             "pods, controllers, scheduling, probes"],
-      ["redis",                  "Redis",                  "single-thread, persistence, cluster"],
-      ["rabbitmq",               "RabbitMQ",               "exchanges, acks, DLQ, backpressure"],
-      ["kafka",                  "Kafka",                  "partitions, ISR, consumer groups, lag"],
-      ["distributed-systems",    "Distributed Systems",    "CAP, consensus, consistency, clocks"],
-      ["performance-engineering","Performance Engineering","latency, throughput, profiling, p99"],
-      ["production-scenarios",   "Production Scenarios",   "incidents: RCA, debugging, prevention"]
-    ]
-  },
-  "Networking Deep-Dives": {
-    folder: "mastery",
-    items: [
-      ["tls",             "TLS / SSL",                "handshake, certs, mTLS, ciphers"],
-      ["dns",             "DNS",                      "resolution, records, anycast, DNSSEC"],
-      ["http",            "HTTP/1.1 · 2 · 3 · QUIC",  "multiplexing, HOL blocking, caching"],
-      ["load-balancing",  "Load Balancing & Proxies", "L4/L7, algorithms, health checks"]
-    ]
-  },
-  "Reliability & Security": {
-    folder: "mastery",
-    items: [
-      ["observability",   "Observability",                 "metrics, logs, traces, OTel, SLO"],
-      ["rate-limiting",   "Rate Limiting & Resiliency",    "token bucket, breakers, backoff"],
-      ["auth",            "Auth · OAuth2 / OIDC / JWT / mTLS","tokens, flows, sessions, RBAC"],
-      ["concurrency",     "Concurrency & Async",           "event loop, locks, races, CAS"]
+      ["url-shortener",        "URL Shortener",        "FR + NFR spec"],
+      ["whatsapp",             "WhatsApp",             "FR + NFR spec"],
+      ["uber",                 "Uber",                 "FR + NFR spec"],
+      ["youtube",              "YouTube",              "FR + NFR spec"],
+      ["instagram",            "Instagram",            "FR + NFR spec"],
+      ["google-drive",         "Google Drive",         "FR + NFR spec"],
+      ["dropbox",              "Dropbox",              "FR + NFR spec"],
+      ["netflix",              "Netflix",              "FR + NFR spec"],
+      ["amazon-cart",          "Amazon Cart",          "FR + NFR spec"],
+      ["notification-service", "Notification Service", "FR + NFR spec"],
+      ["chat-system",          "Chat System",          "FR + NFR spec"],
+      ["rate-limiter",         "Rate Limiter",         "FR + NFR spec"],
+      ["search-engine",        "Search Engine",        "FR + NFR spec"],
+      ["payment-gateway",      "Payment Gateway",      "FR + NFR spec"],
+      ["ticket-booking",       "Ticket Booking",       "FR + NFR spec"],
+      ["food-delivery",        "Food Delivery",        "FR + NFR spec"],
+      ["news-feed",            "News Feed",            "FR + NFR spec"],
+      ["distributed-cache",    "Distributed Cache",    "FR + NFR spec"],
+      ["metrics-system",       "Metrics System",       "FR + NFR spec"],
+      ["logging-platform",     "Logging Platform",     "FR + NFR spec"]
     ]
   }
 };

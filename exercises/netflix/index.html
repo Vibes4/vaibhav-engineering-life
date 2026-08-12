@@ -1,0 +1,39 @@
+<h1>Netflix — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a global video-on-demand streaming service that lets users browse a catalog and stream movies and TV shows on demand across many device types.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can browse and search a catalog of movies and shows by title, genre, cast, and other attributes.</li>
+  <li>Users can stream video on demand and start playback within a couple of seconds of pressing play.</li>
+  <li>The system must adapt streaming quality to the viewer's available bandwidth and device capability.</li>
+  <li>Users can pause, seek, and resume, including resuming a title from where they left off on any device.</li>
+  <li>The system must provide personalized recommendations and home-page rows per user profile.</li>
+  <li>Users can maintain multiple profiles per account, each with its own history and watchlist.</li>
+  <li>Users can add titles to a watchlist and rate or mark content.</li>
+  <li>The system must support subtitles and multiple audio tracks/languages per title.</li>
+  <li>The system must enforce concurrent-stream limits and content licensing/geographic availability per region.</li>
+  <li>The system must support downloading titles for offline viewing on mobile devices.</li>
+  <li>The system must ingest and transcode newly published titles into multiple renditions before they go live.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support 200M+ subscribers and tens of millions of concurrent viewers at peak.</li>
+  <li>Deliver video with startup latency under ~2 seconds and minimal rebuffering (target buffer ratio well under 1%).</li>
+  <li>Serve traffic globally with low latency regardless of the viewer's region.</li>
+  <li>Availability target of 99.99% for the playback and catalog-browsing paths.</li>
+  <li>Sustain very high egress throughput (petabytes per day) during peak evening hours.</li>
+  <li>Playback experience (browse, recommendations) should feel responsive with UI responses under ~300 ms at p99.</li>
+  <li>Content and user data must be secured with DRM for licensed video and encrypted transport.</li>
+  <li>The system must be read-heavy and elastic to absorb regional peaks and new-release spikes.</li>
+  <li>Delivery cost per streamed hour should be optimized, favoring caching content close to viewers.</li>
+  <li>Viewing history and resume points must be durable and consistent enough to work across devices.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Content production, licensing negotiation, and the recommendation ML model internals are out of scope.</li>
+  <li>Assume billing, subscription tiers, and authentication are handled by existing services.</li>
+  <li>Live/linear broadcast streaming is excluded; scope is on-demand catalog playback.</li>
+  <li>Assume a third-party or owned CDN capacity is available for last-mile delivery.</li>
+</ul>

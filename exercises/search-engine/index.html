@@ -1,0 +1,39 @@
+<h1>Search Engine — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a service that lets users search a large corpus of documents and returns relevant results ranked by relevance.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can submit free-text queries and receive a ranked list of matching documents.</li>
+  <li>The system must return results ordered by relevance to the query.</li>
+  <li>Users can paginate through results beyond the first page.</li>
+  <li>The system must support multi-word queries and match documents containing those terms.</li>
+  <li>The system must provide query auto-complete and suggestions as the user types.</li>
+  <li>The system must handle misspellings and offer "did you mean" corrections.</li>
+  <li>Users can filter and narrow results by attributes such as date, category, or source.</li>
+  <li>The system must display a short snippet for each result with matching terms highlighted.</li>
+  <li>New and updated documents must become searchable within a bounded ingestion delay.</li>
+  <li>The system must support removal of documents so deleted content no longer appears in results.</li>
+  <li>The system must record query and click activity to support relevance measurement.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>The system must index a corpus of at least 1 billion documents.</li>
+  <li>Query latency should be under 200 ms end to end (p99).</li>
+  <li>The system must sustain 100,000 queries per second at peak.</li>
+  <li>Availability target of 99.95% for the query-serving path.</li>
+  <li>Newly ingested documents should be searchable within 60 seconds of arrival.</li>
+  <li>Ranking quality must remain stable, with high-relevance results appearing in the top positions.</li>
+  <li>The system must scale horizontally as the corpus and query volume grow.</li>
+  <li>Index storage and serving costs should remain efficient at billion-document scale.</li>
+  <li>The system must be resilient to node failures without losing searchable coverage.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume documents are primarily text; deep image, audio, and video search are out of scope.</li>
+  <li>Web crawling and document acquisition are assumed to be handled by an upstream pipeline.</li>
+  <li>Personalized ranking per individual user is excluded for this exercise.</li>
+  <li>Ad placement and monetization of results are out of scope.</li>
+  <li>Assume queries are in a single supported language unless otherwise specified.</li>
+</ul>

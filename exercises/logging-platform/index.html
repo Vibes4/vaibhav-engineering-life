@@ -1,0 +1,40 @@
+<h1>Logging Platform — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a centralized logging platform that collects, stores, and lets engineers search log events from many services and hosts.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>The system must ingest structured and unstructured log lines from agents on hosts and containers.</li>
+  <li>The system must parse and enrich logs with metadata such as service, host, environment, and severity.</li>
+  <li>Users can perform full-text and field-based searches across logs within a time range.</li>
+  <li>Users can filter logs by tags, severity level, service, and correlation/trace IDs.</li>
+  <li>The system must stream recent logs in near real time ("live tail") for a selected source.</li>
+  <li>Users can create saved searches and define alerts on log patterns or error-rate thresholds.</li>
+  <li>The system must support retention policies with tiered storage and automatic expiration.</li>
+  <li>Users can aggregate logs into counts and trends grouped by fields over time.</li>
+  <li>The system must handle multi-line events such as stack traces as single records.</li>
+  <li>Administrators can control per-team access to log streams and mask sensitive fields.</li>
+  <li>Users can export or archive query results for offline analysis and compliance.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Ingest 5M+ log events per second, on the order of several terabytes per day at peak.</li>
+  <li>Ingested logs must become searchable within 10 seconds of arrival.</li>
+  <li>Search queries over recent data must return within 2 seconds at p95.</li>
+  <li>Ingestion availability target of 99.95%; the pipeline must buffer and not drop logs during query-tier outages.</li>
+  <li>Retain hot searchable data for 30 days and cold archived data for 1 year.</li>
+  <li>The system must scale horizontally with log volume and number of sources.</li>
+  <li>Logs may be eventually consistent and searchable slightly after ingestion; ordering within a source should be preserved.</li>
+  <li>Sensitive data (PII, secrets, credentials) must be maskable and access must be authenticated and audited.</li>
+  <li>Storage cost must be controlled through compression and movement of older data to cheaper tiers.</li>
+  <li>The system must tolerate bursty traffic spikes of several times the baseline without data loss.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>Assume log-shipping agents are already deployed and configured on all hosts.</li>
+  <li>Assume authentication and team/tenant identity come from a central identity provider.</li>
+  <li>Metrics and distributed tracing systems are out of scope; this platform handles log events.</li>
+  <li>Long-term legal archival beyond the stated retention window is excluded.</li>
+  <li>Application-side log formatting and instrumentation standards are owned by service teams.</li>
+</ul>

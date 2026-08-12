@@ -1,0 +1,39 @@
+<h1>Dropbox — Requirements <span class="tag express">Exercise</span></h1>
+<p>Design brief: Design a file hosting and synchronization service that keeps a designated set of folders identical across a user's devices and the cloud.</p>
+
+<h2>Functional Requirements</h2>
+<ul>
+  <li>Users can place files in a synced folder and have them uploaded to the cloud automatically.</li>
+  <li>The system must detect local file changes (add, modify, rename, delete) and propagate them to the cloud and other devices.</li>
+  <li>The system must download remote changes to each linked device so all devices converge to the same state.</li>
+  <li>Users can link and unlink multiple devices to a single account.</li>
+  <li>Users can share a folder with collaborators who then sync the same folder, with view or edit permissions.</li>
+  <li>Users can create public/private share links to individual files.</li>
+  <li>The system must keep file version history and allow restoring or reverting to earlier versions.</li>
+  <li>Users can recover deleted files within a retention window.</li>
+  <li>The system must support selective sync so a device syncs only chosen folders to save local space.</li>
+  <li>The system must upload and download large files reliably, resuming after interruptions.</li>
+  <li>The system must show sync status per file (syncing, synced, error/conflict) to the user.</li>
+</ul>
+
+<h2>Non-Functional Requirements</h2>
+<ul>
+  <li>Support hundreds of millions of registered users and tens of millions of concurrently connected devices.</li>
+  <li>Handle files up to several GB each, with aggregate storage at hundreds of petabytes growing continuously.</li>
+  <li>A saved change on one device should begin appearing on other online devices within a few seconds.</li>
+  <li>Only changed portions of a file should traverse the network to minimize bandwidth and speed up sync.</li>
+  <li>Durability target of eleven nines with no acknowledged upload ever lost.</li>
+  <li>Availability target of 99.9%+ for the sync and storage backend.</li>
+  <li>Data must be encrypted in transit and at rest, and share permissions strictly enforced.</li>
+  <li>Metadata sync (which files changed) should be lightweight and scale to accounts with millions of files.</li>
+  <li>Concurrent conflicting edits must be preserved (e.g., conflicted copies) rather than silently overwritten.</li>
+  <li>Storage cost should be reduced by avoiding storing identical content redundantly.</li>
+</ul>
+
+<h2>Assumptions &amp; Out of Scope</h2>
+<ul>
+  <li>In-app document editing and previewing beyond basic status is out of scope.</li>
+  <li>Assume account signup, authentication, and payment/subscription handling already exist.</li>
+  <li>Team administration, compliance holds, and advanced admin controls are excluded.</li>
+  <li>Assume clients run a background daemon capable of watching the filesystem for changes.</li>
+</ul>
