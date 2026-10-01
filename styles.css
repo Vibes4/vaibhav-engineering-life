@@ -33,6 +33,7 @@
   --tag-bg: #ddf4e4;  --tag-text: #1a7f37;
   --tag-express-bg: #e7e1ff; --tag-express-text: #6639ba;
   --tag-db-bg: #fff1e0; --tag-db-text: #bc4c00;
+  --tag-react-bg: #d9f2fa; --tag-react-text: #0b6e8a;
 
   --copy-bg: #21262d; --copy-border: #30363d;
   --table-border: #e2e8f0;
@@ -74,6 +75,7 @@ html.dark {
   --tag-bg: #14532d;  --tag-text: #bbf7d0;
   --tag-express-bg: #3b2f63; --tag-express-text: #ddd6fe;
   --tag-db-bg: #4a2c0c; --tag-db-text: #fed7aa;
+  --tag-react-bg: #0e3a4a; --tag-react-text: #7fdbf0;
 
   --copy-bg: #1e293b; --copy-border: #334155;
   --table-border: #334155;
@@ -190,6 +192,7 @@ summary.nav-group-title:hover { color: var(--nav-text); }
 }
 .tag.express { background: var(--tag-express-bg); color: var(--tag-express-text); }
 .tag.db { background: var(--tag-db-bg); color: var(--tag-db-text); }
+.tag.react { background: var(--tag-react-bg); color: var(--tag-react-text); }
 
 code:not(pre code) {
   background: var(--inline-bg); padding: 1.5px 6px; border-radius: 5px;
@@ -274,3 +277,44 @@ pre { background: var(--code-bg); color: var(--code-text); padding: 16px; overfl
 .mermaid svg { max-width: 100%; height: auto; }
 /* Before render, show the source as a dim monospace block rather than raw text flash */
 .mermaid:not([data-processed]) { color: var(--muted); font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; white-space: pre; text-align: left; }
+
+/* ---------- Interview question sheets (interviews/*) ----------
+   Bare <details> inside a concept accordion = one question. The .acc-body
+   wrapper is built by app.js, so these rules live outside .interview. */
+details.qa {
+  border-left: 3px solid var(--border-soft);
+  border-radius: 0 6px 6px 0;
+  padding: 2px 0 2px 14px;
+  margin: 9px 0;
+  transition: border-color .15s ease;
+}
+details.qa[open] { border-left-color: var(--accent); background: var(--interview-bg); }
+details.qa > summary {
+  cursor: pointer; list-style: none;
+  font-weight: 600; font-size: 14.5px; color: var(--heading);
+  padding: 5px 8px 5px 0; display: flex; gap: 9px; align-items: baseline;
+}
+details.qa > summary::-webkit-details-marker { display: none; }
+details.qa > summary::before {
+  content: "›"; color: var(--muted); font-size: 16px; line-height: 1;
+  transition: transform .15s ease; flex: 0 0 auto;
+}
+details.qa[open] > summary::before { transform: rotate(90deg); color: var(--accent); }
+details.qa > summary:hover { color: var(--accent); }
+details.qa > :not(summary) { font-size: 14px; padding-right: 6px; }
+details.qa > p:last-child { margin-bottom: 10px; }
+
+/* "asked as" / difficulty chips inside a question summary */
+.qa-chip {
+  flex: 0 0 auto; font-size: 10px; font-weight: 700; letter-spacing: .3px;
+  text-transform: uppercase; padding: 1px 6px; border-radius: 4px;
+  background: var(--tag-express-bg); color: var(--tag-express-text);
+}
+.qa-chip.must { background: var(--callout-warn-bg); color: var(--callout-warn-border); }
+.qa-chip.deep { background: var(--tag-db-bg); color: var(--tag-db-text); }
+
+/* Question-sheet tables: full width, left-aligned headers, tighter type */
+table.sheet { width: 100%; border-collapse: collapse; margin: 12px 0; }
+table.sheet th { text-align: left !important; font-size: 13px; background: var(--interview-bg); }
+table.sheet td { font-size: 13.5px; vertical-align: top; line-height: 1.55; }
+table.sheet td:first-child { font-weight: 600; color: var(--heading); }

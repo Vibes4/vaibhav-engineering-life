@@ -1,0 +1,102 @@
+<h1>State &amp; useState <span class="tag react">React</span></h1>
+<p><strong>State is memory that survives a re-render.</strong> A plain variable inside a component is recreated on every render, so it can never remember anything. <code>useState</code> asks React to keep a value in a slot attached to this component instance, hand it back on the next render, and — crucially — <em>schedule a re-render</em> whenever you replace it.</p>
+<p>Everything confusing about React state comes from one fact: <strong>the value you hold in a render never changes during that render</strong>. It is a snapshot. Understanding that explains batching, stale closures, and why mutation silently does nothing.</p>
+
+<h2>The API, and lazy initialization</h2>
+<p><code>const [value, setValue] = useState(initial)</code> returns the current value plus a setter. On the first render <code>initial</code> is stored; on every render after, the argument is <strong>ignored</strong> and the stored value is returned.</p>
+<pre><code>const [count, setCount] = useState(0);
+const [user,  setUser]  = useState({ name: 'Ada', tags: [] });</code></pre>
+<p>If computing the initial value is expensive, pass a <strong>function</strong> instead of a value. React calls it once, on mount, rather than on every render:</p>
+<pre><code>// ❌ parse() runs on EVERY render, its result thrown away after the first
+const [rows, setRows] = useState(parse(hugeCsv));
+
+// ✅ lazy initializer — called once
+const [rows, setRows] = useState(() =&gt; parse(hugeCsv));</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> <code>useState(() =&gt; fn)</code> is also how you store a <em>function</em> in state — otherwise React would call it as an initializer. Same trap applies to <code>setState(fn)</code>, which is read as a functional update.</div>
+
+<h2>Updates are asynchronous, and batched</h2>
+<p><code>setCount(1)</code> does not assign to <code>count</code>. It enqueues an update and asks React to re-render. The <code>count</code> variable in the current scope keeps its old value until the component runs again:</p>
+<pre><code>function handleClick() {
+  console.log(count);   // 0
+  setCount(count + 1);
+  console.log(count);   // still 0 — this render's snapshot never changes
+}</code></pre>
+<p>React 18 batches <strong>every</strong> update in the same tick into a single re-render — inside event handlers, and also in promises, <code>setTimeout</code>, and native handlers, which React 17 did not batch. Three setters in one handler produce one render, not three.</p>
+<pre class="mermaid">
+flowchart LR
+  E["Event handler runs"] --> Q["Updates pushed to queue"]
+  Q --> B["React batches the tick"]
+  B --> R["ONE re-render"]
+  R --> C["Commit to the DOM"]
+</pre>
+<div class="callout"><strong>Escape hatch:</strong> <code>flushSync(() =&gt; setX(1))</code> from <code>react-dom</code> forces a synchronous render. It exists for measuring the DOM immediately after an update, and it costs you the batching optimization — use it rarely.</div>
+
+<h2>Functional updates: <code>setX(prev =&gt; next)</code></h2>
+<p>Because the snapshot is frozen, calling the setter twice with a computed value applies the same computation twice to the same stale base:</p>
+<pre><code>setCount(count + 1);   // queues "replace with 1"
+setCount(count + 1);   // queues "replace with 1"  → final value 1, not 2</code></pre>
+<p>Pass a function and React feeds each update the result of the previous one in the queue:</p>
+<pre><code>setCount(c =&gt; c + 1);  // queues "add 1"
+setCount(c =&gt; c + 1);  // queues "add 1"          → final value 2</code></pre>
+<div class="callout tip"><strong>Senior tip:</strong> Use the functional form whenever the next value depends on the previous one, and always inside <code>setInterval</code>, event listeners, or any callback that outlives the render it was created in. It is the standard cure for a stale-closure bug and it lets you drop the value from a <code>useCallback</code> dependency array.</div>
+
+<h2>Immutability: why mutation does nothing</h2>
+<p>After an update React compares old and new with <code>Object.is</code>. Mutating an object keeps the same reference, so React concludes nothing changed and <strong>bails out of re-rendering</strong>. This is not a style preference — it is how change is detected.</p>
+<pre><code>// ❌ same reference → no re-render, and memo/deps comparisons also miss it
+user.tags.push('admin');
+setUser(user);
+
+// ✅ new references along the changed path
+setUser({ ...user, tags: [...user.tags, 'admin'] });</code></pre>
+<table>
+  <thead><tr><th>Operation</th><th>❌ Mutating</th><th>✅ Immutable</th></tr></thead>
+  <tbody>
+    <tr><td>Add to array</td><td><code>arr.push(x)</code></td><td><code>[...arr, x]</code></td></tr>
+    <tr><td>Remove by id</td><td><code>arr.splice(i, 1)</code></td><td><code>arr.filter(a =&gt; a.id !== id)</code></td></tr>
+    <tr><td>Update one item</td><td><code>arr[i].done = true</code></td><td><code>arr.map(a =&gt; a.id === id ? { ...a, done: true } : a)</code></td></tr>
+    <tr><td>Sort</td><td><code>arr.sort()</code></td><td><code>[...arr].sort()</code> or <code>arr.toSorted()</code></td></tr>
+    <tr><td>Nested field</td><td><code>s.a.b.c = 1</code></td><td><code>{ ...s, a: { ...s.a, b: { ...s.a.b, c: 1 } } }</code></td></tr>
+  </tbody>
+</table>
+<p>Deeply nested spreads are a smell. Either flatten the state, or use Immer (<code>useImmer</code>), which lets you write mutating code against a draft and produces a correctly copied new object.</p>
+<div class="callout warn"><strong>Bail-out subtlety:</strong> setting the <em>same primitive</em> also skips the re-render, but React may still render the component once more before deciding to stop. Never rely on the setter as a side-effect trigger.</div>
+
+<h2>Where state should live</h2>
+<ul>
+  <li><strong>Colocate first.</strong> Put state in the component that uses it. Local state is the cheapest state.</li>
+  <li><strong>Lift only when shared.</strong> When two siblings need the same value, move it to their closest common parent and pass the value down and a callback up. That parent becomes the single source of truth.</li>
+  <li><strong>Don't lift too far.</strong> State parked at the root re-renders the whole tree. Push it back down as soon as only one branch needs it.</li>
+  <li><strong>Not everything belongs in state.</strong> Server data belongs in a data-fetching cache (React Query, SWR, RSC); URL state belongs in the URL; values that never trigger a render belong in <code>useRef</code>.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> "Lifting state up" and "the URL is state" answer most architecture questions. A filter, a tab, a page number and an open modal are usually better in the query string than in <code>useState</code> — they survive reload, back-button and sharing for free.</div>
+
+<h2>Derived state is not state</h2>
+<p>If a value can be computed from existing props or state, compute it during render. Storing it duplicates the source of truth and the copies drift apart:</p>
+<pre><code>// ❌ two sources of truth, kept in sync by hand (and an extra render)
+const [items, setItems] = useState([]);
+const [total, setTotal] = useState(0);
+useEffect(() =&gt; setTotal(items.reduce(sum, 0)), [items]);
+
+// ✅ one source of truth
+const [items, setItems] = useState([]);
+const total = items.reduce(sum, 0);            // wrap in useMemo only if profiling says so</code></pre>
+<p>The same applies to props: copying a prop into state on mount freezes it, so later prop changes are ignored. If you genuinely need a "reset when the id changes", pass <code>key={id}</code> to remount the component instead — that is the idiomatic reset.</p>
+
+<h2>Structuring state: many <code>useState</code> or one object?</h2>
+<ul>
+  <li><strong>Separate variables</strong> when the fields change independently — the common, readable default.</li>
+  <li><strong>One object</strong> when fields always change together (a form, a coordinate pair). Remember that the setter <em>replaces</em> rather than merges, unlike class <code>this.setState</code>: always spread the old object.</li>
+  <li><strong>Avoid contradictory state.</strong> <code>isLoading</code> + <code>isError</code> + <code>isSuccess</code> as three booleans allows impossible combinations. One <code>status</code> string ('idle' | 'loading' | 'error' | 'success') cannot be inconsistent.</li>
+  <li><strong>Reach for <code>useReducer</code></strong> when several fields update together, when the next state depends on an action's meaning rather than a value, or when you want the transition logic testable outside the component.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why does <code>count</code> still log the old value right after <code>setCount</code>?</summary><p>State setters do not assign; they enqueue an update and schedule a re-render. The <code>count</code> binding belongs to the current render's snapshot and is immutable for that render. The new value appears in the next render.</p></details>
+  <details><summary>What is the difference between <code>setX(x + 1)</code> and <code>setX(v =&gt; v + 1)</code>?</summary><p>The first captures the value from the current render, so two calls in one handler both compute from the same stale base and the second overwrites the first. The functional form receives the latest queued value, so updates compose. Use it whenever the next value depends on the previous one.</p></details>
+  <details><summary>What changed about batching in React 18?</summary><p>Automatic batching was extended beyond React event handlers to promises, timeouts and native handlers, so all updates in a tick produce a single re-render. <code>flushSync</code> opts out when you need a synchronous DOM update.</p></details>
+  <details><summary>Why does pushing to an array in state not re-render?</summary><p>React compares with <code>Object.is</code>. Mutation preserves the reference, so the comparison says nothing changed and React bails out. The same reference also defeats <code>React.memo</code>, <code>useMemo</code> and dependency arrays. Create a new array instead.</p></details>
+  <details><summary>When should a value be state at all?</summary><p>Only if it changes over time, is used in rendering, and cannot be computed from existing props or state. Derived values are computed during render, non-rendering values go in a ref, server data belongs in a fetching cache, and navigational state belongs in the URL.</p></details>
+  <details><summary>How do you reset a component's state when a prop changes?</summary><p>Give it a <code>key</code> tied to that prop. Changing the key unmounts the old instance and mounts a fresh one with initial state — cleaner than syncing props into state inside an effect.</p></details>
+  <details><summary>useState or useReducer?</summary><p><code>useState</code> for independent, simple values. <code>useReducer</code> when several fields change together, when transitions are driven by named actions, or when you want to unit-test the transition function separately from the component.</p></details>
+</div>

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Services — Production E-Commerce Architecture Designer</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <!-- No-flash dark mode (shares the 'theme' key with the main app) -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'dark' || (!t && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+          document.documentElement.classList.add('dark');
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="aws/aws.css" />
+</head>
+<body>
+<div class="aws-app">
+  <header class="aws-top">
+    <a class="back" href="index.html">← <span>Back to app</span></a>
+    <button class="icon-btn" id="menu-toggle" title="Toggle service menu">☰</button>
+    <h1>☁️ <span class="t">AWS Services</span> <span class="badge">E-COMMERCE REFERENCE</span></h1>
+    <nav class="tabs" id="tabs">
+      <button data-view="architecture">🗺️ Architecture</button>
+      <button data-view="networking">🕸️ Networking</button>
+      <button data-view="iam">🔑 IAM</button>
+      <button data-view="flow">🚦 Request Flow</button>
+      <button data-view="ecommerce">🛒 E-Commerce Map</button>
+      <button data-view="comparisons">⚖️ Comparisons</button>
+      <button data-view="failures">💥 Failures</button>
+      <button data-view="security">🛡️ Security &amp; Score</button>
+      <button data-view="catalog">📚 Catalog</button>
+    </nav>
+    <div class="top-tools">
+      <div class="search-wrap">
+        <input id="aws-search" placeholder="Search AWS services… (e.g. RDS, NAT)" autocomplete="off" />
+        <div id="search-results"></div>
+      </div>
+      <button class="toggle" id="beginner-toggle" title="Beginner mode: explain everything in simple language"><span class="knob"></span>👶 <span class="lbl">Beginner mode</span></button>
+      <button class="icon-btn" id="theme-toggle" title="Toggle dark mode">🌙</button>
+    </div>
+  </header>
+
+  <div class="aws-body">
+    <aside id="aws-menu">
+      <div class="menu-head">AWS Services <button id="menu-collapse">collapse all</button></div>
+      <div id="menu-cats"></div>
+      <div class="menu-tools">
+        <label>Modes</label>
+        <button class="wide" id="deps-toggle">🌳 Show dependencies — off</button>
+        <label>Architecture path mode</label>
+        <select id="path-select"><option value="">— pick a question —</option></select>
+        <label>Traffic types (click to hide/show)</label>
+        <div class="legend" id="legend"></div>
+      </div>
+    </aside>
+
+    <main id="aws-main">
+      <!-- ARCHITECTURE -->
+      <section class="view active" id="view-architecture">
+        <div class="canvas-bar">
+          <div class="seg" id="layout-seg"><button data-layout="production" class="active">🏭 Production</button><button data-layout="beginner">👶 Beginner</button></div>
+          <button class="icon-btn" id="btn-diff" title="What does Production add?">➕ What production adds</button>
+          <span class="sp"></span>
+          <span class="hint">click a node or arrow · drag to pan · scroll to zoom · Esc clears</span>
+        </div>
+        <div id="stage">
+          <svg id="canvas-svg"></svg>
+          <div class="zoom-ctl"><button id="zoom-in" title="Zoom in">+</button><button id="zoom-out" title="Zoom out">−</button><button id="zoom-fit" title="Fit to screen">⛶</button></div>
+          <div class="stage-hint" id="stage-hint">Production e-commerce reference architecture · 2 AZs · click anything</div>
+          <div class="path-bar" id="path-bar"></div>
+        </div>
+      </section>
+      <section class="view scroll" id="view-networking"></section>
+      <section class="view scroll" id="view-iam"></section>
+      <section class="view scroll" id="view-flow"></section>
+      <section class="view scroll" id="view-ecommerce"></section>
+      <section class="view scroll" id="view-comparisons"></section>
+      <section class="view scroll" id="view-failures"></section>
+      <section class="view scroll" id="view-security"></section>
+      <section class="view scroll" id="view-catalog"></section>
+
+      <!-- DETAILS DRAWER -->
+      <aside id="aws-panel">
+        <div class="panel-head" id="panel-head"><button class="close">✕</button></div>
+        <div class="panel-body" id="panel-body"></div>
+      </aside>
+    </main>
+  </div>
+</div>
+
+<!-- data (structured, UI-independent) -->
+<script src="aws/data/services/compute.js"></script>
+<script src="aws/data/services/identity.js"></script>
+<script src="aws/data/services/networking-vpc.js"></script>
+<script src="aws/data/services/networking-edge.js"></script>
+<script src="aws/data/services/integration.js"></script>
+<script src="aws/data/services/database.js"></script>
+<script src="aws/data/services/data-monitoring.js"></script>
+<script src="aws/data/connections.js"></script>
+<script src="aws/data/architecture.js"></script>
+<script src="aws/data/layout.js"></script>
+<script src="aws/data/comparisons.js"></script>
+<script src="aws/data/paths.js"></script>
+<script src="aws/data/scenarios.js"></script>
+<script src="aws/data/ecommerce.js"></script>
+<!-- engine + UI -->
+<script src="aws/canvas.js"></script>
+<script src="aws/panel.js"></script>
+<script src="aws/views.js"></script>
+<script src="aws/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<h1>Forms &amp; Events <span class="tag react">React</span></h1>
+<p><strong>React does not attach a listener to every element you write <code>onClick</code> on.</strong> It attaches a small set of listeners to the root container you passed to <code>createRoot</code> and uses delegation, then hands your handler a <em>SyntheticEvent</em> — a normalized, cross-browser wrapper around the native event.</p>
+<p>Forms are where that event system meets state. The whole design question is one line: <strong>who owns the value — React or the DOM?</strong> Controlled inputs make React the source of truth (predictable, but every keystroke is a render). Uncontrolled inputs leave the value in the DOM and read it with a ref (fast, but you cannot derive UI from it).</p>
+
+<h2>The synthetic event system</h2>
+<ul>
+  <li><strong>Normalization.</strong> <code>SyntheticEvent</code> smooths over browser differences and gives a consistent API: <code>type</code>, <code>target</code>, <code>currentTarget</code>, <code>preventDefault()</code>, <code>stopPropagation()</code>. The real event is always available as <code>e.nativeEvent</code>.</li>
+  <li><strong>Delegation to the root container.</strong> Since React 17, listeners are attached to the container passed to <code>createRoot(container)</code> — <em>not</em> to <code>document</code>, as React 16 did. This is what makes multiple React versions, and React embedded inside a non-React page, coexist safely.</li>
+  <li><strong>Event pooling is gone.</strong> React 16 reused event objects and required <code>e.persist()</code> to read an event asynchronously. That was <strong>removed in React 17</strong>. Reading <code>e.target.value</code> inside a <code>setTimeout</code> or a promise is fine today, and repeating the <code>e.persist()</code> advice as current is a dated-knowledge tell in an interview.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> attaching a native listener with <code>document.addEventListener</code> and calling <code>stopPropagation()</code> there will kill React handlers, because React's listener sits on the root container — <em>below</em> <code>document</code> in the bubble path. Conversely, <code>e.stopPropagation()</code> in a React handler cannot stop a listener already on <code>document</code>, since React's delegated listener has not finished bubbling yet.</div>
+
+<h2>Handlers: naming, arguments, phases</h2>
+<pre><code>// camelCase, and you pass the FUNCTION, not a call
+&lt;button onClick={handleClick}&gt;         // ✅
+&lt;button onClick={handleClick()}&gt;       // ❌ runs during render
+
+// passing arguments: wrap in an arrow, or bind the data to the element
+&lt;button onClick={() =&gt; remove(item.id)}&gt;
+&lt;button data-id={item.id} onClick={(e) =&gt; remove(e.currentTarget.dataset.id)}&gt;</code></pre>
+<ul>
+  <li><code>e.preventDefault()</code> stops the browser's default action (form submit navigating, link following, checkbox toggling). Returning <code>false</code> from a React handler does <strong>nothing</strong> — that is a jQuery habit.</li>
+  <li><code>e.stopPropagation()</code> stops the event travelling further along the React tree. Use it for a click inside a dropdown that must not reach the "click outside to close" handler.</li>
+  <li>Every handler has a capture twin: <code>onClickCapture</code>, <code>onFocusCapture</code>. Capture runs <strong>top-down</strong> before the target, bubble runs <strong>bottom-up</strong> after. Capture is the right phase for an analytics or "close everything" handler that must run before a child can cancel it.</li>
+  <li><strong>Ordering with native listeners:</strong> a native listener attached to an inner element runs before React's, because React's listener is on the root container and only fires once the event bubbles up to it. <code>onFocus</code>/<code>onBlur</code> in React actually use native <code>focusin</code>/<code>focusout</code>, so unlike the raw DOM events, they bubble.</li>
+</ul>
+<pre class="mermaid">
+flowchart TD
+  A["Native event fires at the target"] --> B["Capture: root down to target"]
+  B --> C["Target handlers"]
+  C --> D["Bubble: target up to root container"]
+  D --> E["React's delegated listener"]
+  E --> F["React replays capture then bubble on the React tree"]
+</pre>
+
+<h2>Controlled inputs</h2>
+<p>A controlled input has both <code>value</code> and <code>onChange</code>. React state is the single source of truth; the DOM only ever displays what state says.</p>
+<pre><code>const [email, setEmail] = useState('');
+
+&lt;input
+  value={email}
+  onChange={(e) =&gt; setEmail(e.target.value)}
+/&gt;</code></pre>
+<p>You get this for free: live validation, formatting/masking as the user types, disabling submit until valid, mirroring the value elsewhere, and resetting the form by setting state. Note that React's <code>onChange</code> is really the native <code>input</code> event — it fires on every keystroke, not on blur like the DOM's <code>change</code>.</p>
+<div class="callout warn"><strong>The read-only bug:</strong> passing <code>value</code> without <code>onChange</code> makes the input impossible to type in — React re-renders it back to the state value on every keystroke — and logs "You provided a <code>value</code> prop to a form field without an <code>onChange</code> handler." If you genuinely want display-only, use <code>readOnly</code>; if you want an initial value the user can edit, you wanted <code>defaultValue</code>. Also never do <code>value={user.name ?? undefined}</code> — an input flipping between controlled and uncontrolled warns and loses state; use <code>value={user.name ?? ''}</code>.</div>
+
+<h2>Uncontrolled inputs, and when they are right</h2>
+<pre><code>const emailRef = useRef(null);
+
+function onSubmit(e) {
+  e.preventDefault();
+  send(emailRef.current.value);        // read from the DOM, once
+}
+
+&lt;input ref={emailRef} defaultValue="a@b.com" name="email" /&gt;</code></pre>
+<ul>
+  <li><strong>File inputs must be uncontrolled.</strong> <code>&lt;input type="file"&gt;</code> is read-only for security — you cannot set its value from JS.</li>
+  <li><strong>Integrating a non-React widget</strong> (a legacy date picker, a rich-text editor) that owns its own DOM.</li>
+  <li><strong>Very large forms</strong> where a keystroke re-rendering 80 fields is measurable.</li>
+  <li><strong>Simple "read on submit" forms</strong> — you can even skip refs entirely and use <code>new FormData(e.currentTarget)</code>, which is why <code>name</code> attributes still matter.</li>
+</ul>
+<table>
+  <thead><tr><th></th><th>Controlled</th><th>Uncontrolled</th></tr></thead>
+  <tbody>
+    <tr><td>Source of truth</td><td>React state</td><td>The DOM node</td></tr>
+    <tr><td>Read the value</td><td>Any time, during render</td><td>Only via a ref / FormData, on demand</td></tr>
+    <tr><td>Re-renders while typing</td><td>One per keystroke</td><td>Zero</td></tr>
+    <tr><td>Instant validation, masking, derived UI</td><td>Natural</td><td>Awkward</td></tr>
+    <tr><td>Best for</td><td>Interactive forms, search-as-you-type</td><td>File inputs, huge forms, third-party widgets</td></tr>
+  </tbody>
+</table>
+
+<h2>Performance, and why react-hook-form exists</h2>
+<p>A controlled form re-renders the component that owns the state on every keystroke. With a handful of inputs that is invisible. With dozens of fields, or heavy children, or an expensive validation running in render, typing gets laggy.</p>
+<p>Fixes, cheapest first:</p>
+<ol>
+  <li><strong>Push state down.</strong> Put the state in the smallest component that owns the field, so a keystroke re-renders one field, not the page.</li>
+  <li><strong>Memoize siblings.</strong> <code>React.memo</code> on expensive children plus stable handler identities via <code>useCallback</code>.</li>
+  <li><strong>Debounce the expensive consequence</strong> (the search request, the validation), never the input's own <code>value</code> — debouncing the displayed value makes typing feel broken.</li>
+  <li><strong>Go uncontrolled with subscriptions</strong> — which is exactly <code>react-hook-form</code>: it registers inputs uncontrolled via refs and lets components subscribe to just the slices they render (this field's error, <code>isDirty</code>). Formik, by contrast, is controlled-by-default and re-renders the form on every keystroke, which is the main reason RHF displaced it.</li>
+</ol>
+<div class="callout tip"><strong>Senior tip:</strong> "Controlled vs uncontrolled" is not a purity contest. Controlled is the default because it is predictable; you switch to uncontrolled when a profiler shows typing cost, or when the DOM genuinely owns the value.</div>
+
+<h2>Validation and submit as a state machine</h2>
+<p>Three booleans (<code>isSubmitting</code>, <code>isError</code>, <code>isSuccess</code>) permit impossible combinations. One <code>status</code> field cannot lie:</p>
+<pre><code>const initial = { values: { email: '' }, errors: {}, touched: {}, status: 'editing' };
+// status: 'editing' | 'validating' | 'submitting' | 'error' | 'success'
+
+function reducer(state, action) {
+  switch (action.type) {
+    case 'change':  return { ...state, values: { ...state.values, [action.name]: action.value },
+                             errors: { ...state.errors, [action.name]: undefined }, status: 'editing' };
+    case 'blur':    return { ...state, touched: { ...state.touched, [action.name]: true },
+                             errors: { ...state.errors, ...validateField(state.values, action.name) } };
+    case 'submit':  return { ...state, status: 'submitting' };
+    case 'invalid': return { ...state, errors: action.errors, status: 'error' };
+    case 'success': return { ...state, status: 'success' };
+    default: return state;
+  }
+}</code></pre>
+<p><strong>When to validate:</strong> on <em>blur</em> for first feedback (validating on every keystroke shouts "invalid email" at someone who has typed one character); on <em>change</em> only <em>after</em> a field has been touched or a submit has failed, so corrections clear the error live; and always again on <em>submit</em>, which is the only moment you may show errors for fields never visited. Server-side validation is non-negotiable regardless.</p>
+
+<h2>Native form semantics and accessibility</h2>
+<pre><code>&lt;form onSubmit={handleSubmit} noValidate&gt;
+  &lt;label htmlFor="email"&gt;Email&lt;/label&gt;
+  &lt;input
+    id="email" name="email" type="email"
+    aria-invalid={!!errors.email}
+    aria-describedby={errors.email ? 'email-error' : undefined}
+    ref={emailRef}
+  /&gt;
+  {errors.email &amp;&amp; &lt;p id="email-error" role="alert"&gt;{errors.email}&lt;/p&gt;}
+  &lt;button type="submit" disabled={status === 'submitting'}&gt;Save&lt;/button&gt;
+&lt;/form&gt;</code></pre>
+<ul>
+  <li>Use a real <code>&lt;form&gt;</code> with <code>onSubmit</code>, not a <code>&lt;div&gt;</code> with a click handler — you get Enter-to-submit, browser autofill, password managers and mobile "Go" keys for free. Call <code>e.preventDefault()</code>.</li>
+  <li>A <code>&lt;button&gt;</code> inside a form defaults to <code>type="submit"</code>. Any button that is not submitting needs <code>type="button"</code> — forgetting this is a classic accidental-submit bug.</li>
+  <li>Associate every label with <code>htmlFor</code>/<code>id</code> (or wrap the input). A placeholder is not a label.</li>
+  <li>On a failed submit, <strong>move focus to the first invalid field</strong> (<code>ref.current.focus()</code>) and announce errors with <code>role="alert"</code>. Never rely on colour alone.</li>
+  <li>Disable the submit button while submitting to prevent double submission, and keep entered values on failure — never clear the form.</li>
+</ul>
+<div class="callout"><strong>React 19:</strong> adds form Actions — <code>&lt;form action={fn}&gt;</code>, <code>useActionState</code>, <code>useFormStatus</code> and <code>useOptimistic</code> — which fold pending/error state into the form primitive itself. Useful to name, but the controlled/uncontrolled trade-off underneath is unchanged.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is a SyntheticEvent, and where are React's listeners attached?</summary><p>A cross-browser wrapper around the native event with a normalized API (<code>e.nativeEvent</code> gives you the original). Since React 17 the delegated listeners live on the root container passed to <code>createRoot</code>, not on <code>document</code>, so multiple React roots or versions can coexist on a page.</p></details>
+  <details><summary>Do you still need <code>e.persist()</code>?</summary><p>No. Event pooling was removed in React 17, so the event object is no longer reused and you can read its properties asynchronously. <code>e.persist()</code> still exists as a no-op for compatibility; recommending it as current practice signals pre-17 knowledge.</p></details>
+  <details><summary>Controlled vs uncontrolled — which and why?</summary><p>Controlled means <code>value</code> + <code>onChange</code> with React state as the source of truth: predictable and needed for live validation, masking or derived UI, at the cost of a render per keystroke. Uncontrolled leaves the value in the DOM and reads it via a ref or FormData: no renders, but you cannot derive UI from it. Use uncontrolled for file inputs, third-party widgets and very large forms.</p></details>
+  <details><summary>Why did my input stop accepting typing?</summary><p>You passed <code>value</code> without <code>onChange</code>, so React re-renders it back to the same state value after every keystroke. Add the handler, or use <code>defaultValue</code> for an uncontrolled initial value, or <code>readOnly</code> if display-only is the intent.</p></details>
+  <details><summary>How do you keep a big controlled form fast?</summary><p>Move state down so a keystroke renders one field, memoize expensive siblings with stable callbacks, debounce the expensive consequence rather than the displayed value, and if that is not enough switch to an uncontrolled + subscription library like react-hook-form.</p></details>
+  <details><summary>When should validation run?</summary><p>On blur for first feedback, on change only once a field is touched or a submit has failed, and always on submit — plus on the server. Model it with a single <code>status</code> field rather than several booleans so impossible states are unrepresentable.</p></details>
+  <details><summary>What does capture phase give you that bubbling does not?</summary><p><code>onClickCapture</code> runs top-down before the target's handler, so a parent can act before any child has a chance to call <code>stopPropagation()</code>. That is the correct phase for analytics, global "close all overlays", or intercepting clicks in a container you do not control.</p></details>
+</div>

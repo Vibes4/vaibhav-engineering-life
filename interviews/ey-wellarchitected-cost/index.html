@@ -1,0 +1,76 @@
+<h1>Well-Architected, Security &amp; Cost <span class="tag db">EY Sheet 09</span></h1>
+<p>The JD explicitly asks for "<em>well-architected cloud solutions following AWS best practices</em>" and "<em>adherence to security, compliance, and cost-optimization principles</em>", with cost/scalability/resiliency called out as a medium-weighted competency. In a consulting firm this is not decoration — cost conversations with clients are a real part of the job, and an engineer who can find 30% of an AWS bill is commercially valuable. Expect at least one cost question.</p>
+<div class="callout tip"><strong>The line that wins this section:</strong> "I treat cost as a non-functional requirement with the same status as latency. Every design I propose has a rough monthly number attached and names the top three line items, because on a client engagement an architecture nobody can afford to run is not a good architecture."</div>
+
+<h2>The Well-Architected Framework</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Name the six pillars and one concrete lever for each.</summary>
+<table class="sheet">
+  <tr><th>Pillar</th><th>What it asks</th><th>A concrete lever</th></tr>
+  <tr><td><strong>Operational Excellence</strong></td><td>Can you run and improve this?</td><td>Everything in IaC, runbooks for every alarm, game days, blameless post-mortems with tracked actions.</td></tr>
+  <tr><td><strong>Security</strong></td><td>Can you protect data and systems?</td><td>Least-privilege IAM with no long-lived keys, encryption at rest and in transit, GuardDuty + CloudTrail across all accounts.</td></tr>
+  <tr><td><strong>Reliability</strong></td><td>Does it recover from failure?</td><td>Multi-AZ by default, health checks that actually check the app, and <em>tested</em> backup restores — an untested backup is a hope.</td></tr>
+  <tr><td><strong>Performance Efficiency</strong></td><td>Are you using the right resources?</td><td>Right-sized instance families, caching at the correct layer, async where the latency budget permits, Graviton where the workload supports it.</td></tr>
+  <tr><td><strong>Cost Optimization</strong></td><td>Are you paying only for value?</td><td>Savings Plans on the baseline, Spot for interruptible work, S3 lifecycle tiering, and killing idle NAT Gateways and unattached EBS/EIPs.</td></tr>
+  <tr><td><strong>Sustainability</strong></td><td>Are you minimising environmental impact?</td><td>Graviton (better performance per watt), right-sizing to cut waste, lifecycle policies so you're not storing data nobody reads.</td></tr>
+</table>
+<p>The framing to close on: "The point isn't reciting them. It's that I evaluate a design against all six and then name the trade-off I'm <em>consciously</em> accepting — for example, running single-AZ in a dev account is a deliberate reliability sacrifice for cost, and that's fine as long as it's a decision rather than an accident."</p></details>
+
+<details class="qa"><summary>Design for a 4-hour RTO and a 15-minute RPO across regions.</summary>
+<p>Decode the requirement first: <strong>RPO 15 minutes</strong> = maximum acceptable data loss, so replication must be continuous and asynchronous; <strong>RTO 4 hours</strong> = maximum acceptable time to recover, which is generous enough that I don't need active-active.</p>
+<p>That points at a <strong>warm standby</strong>: a scaled-down but running stack in the DR region, defined by the same IaC as production so it can't drift. Data: Aurora Global Database (sub-second replica lag) or DynamoDB global tables, S3 Cross-Region Replication for objects, plus regular snapshots copied cross-region. Failover: Route 53 health checks with a failover routing policy, or a documented manual runbook — with a 4-hour RTO, a human-in-the-loop decision is acceptable and often safer than automatic failover, which can flap.</p>
+<p>What I'd insist on: <strong>test it on a schedule.</strong> A DR plan that has never been executed is a document, not a capability, and the failure is always something unglamorous — an IAM role that doesn't exist in the DR region, a hard-coded endpoint, a certificate that was never issued there. I'd also state the cheaper and more expensive alternatives so the client can choose: backup-and-restore (hours to days RTO, cheapest), pilot light, warm standby, active-active (near-zero RTO/RPO, roughly double cost plus conflict-resolution complexity).</p></details>
+
+<h2>Security</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Explain the shared responsibility model — and where teams get it wrong.</summary>
+<p>AWS secures <strong>of</strong> the cloud: physical data centres, hardware, the hypervisor, and the internals of managed services. You secure <strong>in</strong> the cloud: your IAM policies, your data and its encryption, your network configuration, your OS patching on EC2, and your application code.</p>
+<p>The line moves as you go up the stack. On EC2 you own the guest OS, patching and everything above. On RDS, AWS patches the engine but you own the credentials, the security group, the encryption choice and the backup policy. On Lambda you own essentially code and IAM only.</p>
+<p>Where teams get it wrong: assuming "managed" means "secure". S3 has never had a breach of its own — every headline S3 leak was a customer misconfiguring access. Likewise, RDS being managed doesn't stop you putting it in a public subnet with a wide-open security group. The other common gap is patching: an EC2 fleet running an AMI from 18 months ago is your responsibility, not AWS's, and it's the most common real finding in an audit.</p></details>
+
+<details class="qa"><summary>How do you secure a multi-account AWS estate?</summary>
+<ul>
+<li><strong>AWS Organizations with Control Tower</strong> — separate accounts per environment and per workload; the account boundary is the strongest isolation AWS provides.</li>
+<li><strong>SCPs as guardrails</strong> — deny disabling CloudTrail/GuardDuty/Config, deny regions outside the operating footprint, deny making S3 public, deny root user actions.</li>
+<li><strong>Centralised logging</strong> — CloudTrail (organisation trail), VPC flow logs and application logs shipped to a dedicated log-archive account that workload accounts cannot write over. If an attacker can delete the logs, you have no incident response.</li>
+<li><strong>Detection</strong> — GuardDuty for threat detection, Security Hub to aggregate findings across accounts against CIS/AWS benchmarks, AWS Config for continuous compliance rules, IAM Access Analyzer for unintended external access.</li>
+<li><strong>Identity</strong> — IAM Identity Center (SSO) federated to the corporate IdP, MFA enforced, permission sets per role, and zero IAM users.</li>
+<li><strong>Data</strong> — KMS with customer-managed keys where audit matters, encryption enforced by policy rather than by convention, TLS everywhere including internally, and secrets in Secrets Manager with rotation.</li>
+<li><strong>Network</strong> — private subnets by default, VPC endpoints so service traffic never touches the internet, WAF and Shield at the edge.</li>
+</ul>
+<p>And the operational point: preventive controls (SCPs, policies) beat detective controls, because a detection you don't act on within hours is just a record of the breach.</p></details>
+
+<details class="qa"><summary>Which OWASP risks would you actively design against in a Node API?</summary>
+<p><strong>Broken access control</strong> — the top risk and the one frameworks don't solve for you. Authorisation must be checked on the <em>object</em>, not just the route: a user with a valid token requesting <code>/orders/999</code> must be checked for ownership, or you have an IDOR. I'd enforce this in a policy layer, not scattered through handlers.</p>
+<p><strong>Injection</strong> — parameterised queries always, never string-concatenated SQL; for NoSQL, validate that a field expected to be a string isn't an object (the classic Mongo <code>{"$ne": null}</code> auth bypass).</p>
+<p><strong>Cryptographic failures</strong> — TLS enforced, secrets never in code, passwords with bcrypt/argon2 and never a fast hash like SHA-256.</p>
+<p><strong>Security misconfiguration</strong> — helmet for headers, CORS with an explicit origin allow-list rather than a reflected origin, stack traces never returned to clients, default credentials removed.</p>
+<p><strong>SSRF</strong> — worth calling out on AWS specifically: a server-side fetch of a user-supplied URL that hits <code>169.254.169.254</code> can steal instance credentials. Allow-list outbound destinations and enforce IMDSv2.</p>
+<p><strong>Vulnerable components</strong> — dependency scanning in CI and a patching SLA, since this is how most real compromises start. Plus rate limiting and payload size caps, because unbounded request bodies and unthrottled endpoints are a denial-of-service vector that no scanner will flag.</p></details>
+
+<h2>Cost optimization</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>A client's AWS bill doubled. How do you investigate and fix it?</summary>
+<p><strong>Find it before theorising.</strong> Cost Explorer grouped by service, then by usage type, comparing this month to last — that usually identifies the line item in five minutes. Cost Anomaly Detection would ideally have flagged it already. If tagging is in place, group by team or application to attribute it; if tagging <em>isn't</em> in place, that's finding number one.</p>
+<p><strong>The usual suspects, in the order I'd check:</strong></p>
+<ul>
+<li><strong>Data transfer</strong> — internet egress at ~$0.09/GB, cross-AZ traffic (chatty services spread across AZs, or a single NAT Gateway pulling traffic across AZs), and NAT Gateway processing charges. This is the most commonly underestimated cost on AWS.</li>
+<li><strong>Idle and orphaned resources</strong> — unattached EBS volumes, old snapshots, unassociated Elastic IPs, load balancers with no targets, dev environments running nights and weekends, over-provisioned RDS instances left from a load test.</li>
+<li><strong>Logs</strong> — CloudWatch Logs ingestion and retention with no expiry set is a genuinely common six-figure surprise; so is DEBUG logging left on in production.</li>
+<li><strong>S3</strong> — no lifecycle policy, versioning enabled with no expiry on non-current versions (so you store every version forever), and incomplete multipart uploads nobody can see.</li>
+<li><strong>Right-sizing</strong> — Compute Optimizer will show instances running at 5% CPU.</li>
+<li><strong>Commitment coverage</strong> — running the steady baseline entirely on On-Demand.</li>
+</ul>
+<p><strong>Then fix the structure, not just the symptom:</strong> enforce tagging so cost is attributable, set budgets and anomaly alerts per team, put log retention policies and S3 lifecycle rules in the IaC modules so new services inherit them by default, schedule non-production shutdown, and buy Savings Plans for the measured baseline. The durable fix is making the cheap thing the default, because relying on engineers to remember is how you end up here again in six months.</p></details>
+
+<details class="qa"><summary><span class="qa-chip deep">Depth probe</span>When is Lambda more expensive than a container?</summary>
+<p>Lambda bills per request plus GB-seconds of duration; Fargate bills per vCPU-second and GB-second for as long as the task runs. So Lambda wins when utilisation is low and loses when it's high — the crossover is roughly where sustained utilisation reaches somewhere around a third to a half of a container's capacity, though the honest answer is "it depends on duration and memory, so I'd model it".</p>
+<p>Concretely, Lambda gets expensive when: requests are high-volume <em>and</em> steady (you're paying per-invocation for traffic that never stops); functions are long-running (you pay for the whole duration including time spent waiting on a downstream, which is wasted money for an I/O-bound function); or you've turned on provisioned concurrency broadly, at which point you're paying for always-on capacity with Lambda's pricing model, which is the worst of both.</p>
+<p>The second-order costs people forget: API Gateway REST API charges per million requests on top, and a chatty Lambda architecture generates a lot of CloudWatch Logs. I'd also point out that the cost comparison isn't only infrastructure — Lambda's operational cost is near zero, and an engineer-week of container operations is worth a lot of GB-seconds. On a small team that often dominates the arithmetic.</p></details>
+
+<details class="qa"><summary>Name five cost levers you'd apply in the first month on a new engagement.</summary>
+<ol>
+<li><strong>Turn on the basics</strong> — Cost Explorer, Budgets with alerts, Cost Anomaly Detection, and a tagging policy enforced by SCP or Config. You can't optimise what you can't attribute.</li>
+<li><strong>Kill waste</strong> — unattached volumes, old snapshots, idle load balancers, orphaned Elastic IPs, forgotten dev stacks. This is usually the fastest double-digit percentage win and needs no architectural change.</li>
+<li><strong>Set retention everywhere</strong> — CloudWatch Logs retention (the default is "never expire"), S3 lifecycle rules including non-current versions and incomplete multipart uploads.</li>
+<li><strong>Fix the network</strong> — VPC gateway endpoints for S3 and DynamoDB to bypass NAT processing charges, and check whether cross-AZ chatter can be reduced.</li>
+<li><strong>Commit to the baseline</strong> — measure the steady-state floor over a few weeks, then buy Compute Savings Plans for it; move interruptible workloads (CI runners, batch) to Spot; schedule non-production environments off outside working hours, which alone is roughly a 65% saving on those accounts.</li>
+</ol>
+<p>And the sixth, which is the consulting answer: <strong>report the savings in currency, monthly, to the client.</strong> Optimisation that isn't measured and communicated doesn't get sponsored the second time.</p></details>

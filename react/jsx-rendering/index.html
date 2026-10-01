@@ -1,0 +1,125 @@
+<h1>JSX &amp; Rendering <span class="tag react">React</span></h1>
+<p><strong>JSX is not HTML and not a template language — it is syntax sugar for a function call.</strong> A build step (Babel, SWC, TypeScript, esbuild) rewrites every tag into a call that returns a plain, immutable JavaScript object describing what should be on screen. React reads those objects; the browser never sees JSX.</p>
+<p>Almost every JSX confusion — why <code>class</code> is <code>className</code>, why <code>{0 &amp;&amp; ...}</code> prints a zero, why keys exist — dissolves once you can see the object the tag compiles to.</p>
+
+<h2>What JSX compiles to</h2>
+<p>The classic transform produced <code>React.createElement</code>, which is why <code>React</code> had to be in scope in every file:</p>
+<pre><code>&lt;button className="primary" onClick={save}&gt;Save&lt;/button&gt;
+
+// classic transform
+React.createElement('button', { className: 'primary', onClick: save }, 'Save');</code></pre>
+<p>Since React 17 the <strong>automatic runtime</strong> is the default. The compiler injects an import for you, so no <code>import React</code> is needed just for JSX:</p>
+<pre><code>import { jsx as _jsx } from 'react/jsx-runtime';
+_jsx('button', { className: 'primary', onClick: save, children: 'Save' });</code></pre>
+<p>Note the shape difference: in the automatic runtime <strong><code>children</code> is a normal prop</strong>, and <code>key</code> is passed separately (<code>_jsx(type, props, key)</code>) because it is metadata for the reconciler, not data for the component.</p>
+<p>Lowercase tags become strings (<code>'button'</code> → a host element); capitalised tags become a reference to the function itself (<code>Button</code> → the component). That is why <strong>components must be capitalised</strong> — a lowercase <code>&lt;button /&gt;</code> would be sent to the DOM as an unknown tag.</p>
+<div class="callout"><strong>Note:</strong> Because JSX is just expressions, <code>&lt;A /&gt;</code> is a value. You can store it in a variable, put it in an array, return it from a ternary, or pass it as a prop — that last one is the whole basis of the slots pattern.</div>
+
+<h2>Elements are descriptions, not DOM nodes</h2>
+<p>A React element is roughly this frozen object:</p>
+<pre><code>{
+  $$typeof: Symbol(react.element),   // guards against JSON-injection XSS
+  type: 'button',                    // string = host tag, function = component
+  key: null,
+  props: { className: 'primary', children: 'Save' },
+  ref: null
+}</code></pre>
+<p>Creating one is cheap and does nothing: no DOM is touched, no component function is called. React calls the component later, during render, and reconciles the result. Keep three words distinct:</p>
+<table>
+  <thead><tr><th>Term</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Component</strong></td><td>The function itself: <code>function Button(props) { ... }</code></td></tr>
+    <tr><td><strong>Element</strong></td><td>A description of one usage: <code>&lt;Button label="Save" /&gt;</code> → a plain object</td></tr>
+    <tr><td><strong>Instance</strong></td><td>The mounted fiber React keeps in the tree, holding state, hooks and DOM refs. You never touch it in function components.</td></tr>
+  </tbody>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> Elements are immutable. You cannot mutate <code>element.props</code> to change a rendered UI — you describe a new element instead. (<code>React.cloneElement</code> exists for the rare case of injecting props into <code>children</code>, and is a smell in most new code.)</div>
+
+<h2>Expressions and attribute rules</h2>
+<p><code>{}</code> embeds any JavaScript <em>expression</em> (not statements — no <code>if</code>, no <code>for</code>). Doubled braces are just an object literal inside an expression slot:</p>
+<pre><code>&lt;div style={{ marginTop: 8, backgroundColor: 'red' }} /&gt;   // object, camelCase, numbers → px</code></pre>
+<table>
+  <thead><tr><th>HTML</th><th>JSX</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>class</code></td><td><code>className</code></td><td><code>class</code> is a JS reserved word</td></tr>
+    <tr><td><code>for</code></td><td><code>htmlFor</code></td><td>same reason</td></tr>
+    <tr><td><code>onclick="..."</code></td><td><code>onClick={fn}</code></td><td>camelCase, and a real function, not a string</td></tr>
+    <tr><td><code>style="color:red"</code></td><td><code>style={{ color: 'red' }}</code></td><td>object with camelCased CSS properties</td></tr>
+    <tr><td><code>tabindex</code></td><td><code>tabIndex</code></td><td>DOM property naming</td></tr>
+    <tr><td>—</td><td><code>data-*</code>, <code>aria-*</code></td><td>the exceptions: stay dashed and lowercase</td></tr>
+  </tbody>
+</table>
+<p>Events are attached through React's <strong>synthetic event</strong> layer, delegated at the root container (since React 17 — not <code>document</code>). You get a cross-browser wrapper with the standard API; call <code>e.preventDefault()</code> explicitly, since returning <code>false</code> does nothing.</p>
+
+<h2>Conditional rendering, and the <code>0</code> bug</h2>
+<pre><code>{isLoggedIn ? &lt;Dashboard /&gt; : &lt;Login /&gt;}      {/* either/or */}
+{error &amp;&amp; &lt;Banner text={error} /&gt;}            {/* render or nothing */}
+if (!user) return null;                        {/* early return, cleanest for whole-component cases */}</code></pre>
+<p>React renders <code>null</code>, <code>undefined</code>, <code>true</code> and <code>false</code> as <strong>nothing</strong>. It renders numbers and strings as text. Those two rules collide in the most famous JSX bug:</p>
+<pre><code>// ❌ when items is empty, `items.length` is 0 — a NUMBER, not false.
+// `0 &amp;&amp; x` evaluates to 0, and React happily prints "0" on the page.
+{items.length &amp;&amp; &lt;List items={items} /&gt;}
+
+// ✅ coerce to a real boolean, or use a ternary
+{items.length &gt; 0 &amp;&amp; &lt;List items={items} /&gt;}
+{items.length ? &lt;List items={items} /&gt; : null}</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> The same trap bites with empty strings in some engines and with <code>NaN</code>. Rule of thumb: the left side of <code>&amp;&amp;</code> in JSX must be a boolean, never a length, count or id.</div>
+
+<h2>Lists and the meaning of <code>key</code></h2>
+<p>You render a list by mapping data to elements. <code>key</code> is not a prop the component receives — it is a hint to the reconciler about <strong>identity across renders</strong>:</p>
+<pre><code>{todos.map(todo =&gt; &lt;TodoRow key={todo.id} todo={todo} /&gt;)}</code></pre>
+<p>Without keys React matches children <strong>by position</strong>. With keys it matches by key, so a reordered or spliced list moves existing instances instead of rewriting their contents.</p>
+<h3>Why the array index is usually wrong</h3>
+<p>The state React preserves lives on the <em>instance</em>, matched by key. With <code>key={index}</code>, deleting the first row does not delete an instance — every row shifts up one key, so React thinks row 0's <em>props changed</em> and keeps row 0's local state:</p>
+<pre><code>// rows: [{id:'a'}, {id:'b'}, {id:'c'}], each with its own &lt;input&gt; text
+// user types "hello" into row a, then deletes row a
+
+key={index}  → keys 0,1,2 become 0,1. React reuses instance#0 for b.
+               b now shows "hello" — a's DOM state attached to the wrong row.
+key={id}     → keys a,b,c become b,c. React UNMOUNTS a and moves b, c.
+               State follows the data. Correct.</code></pre>
+<ul>
+  <li>Keys must be <strong>stable</strong> (same item ⇒ same key across renders), <strong>unique among siblings</strong> (not globally), and derived from the <strong>data</strong>, not the render.</li>
+  <li>Never use <code>Math.random()</code> or <code>Date.now()</code> — a new key every render remounts everything, destroying state, focus and DOM.</li>
+  <li>The index <em>is</em> acceptable when the list is static, never reordered, never filtered, and its items hold no state or DOM focus.</li>
+  <li>To force a remount deliberately, change the key: <code>&lt;Form key={userId} /&gt;</code> resets all its state when the user changes.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> "Keys tell React which item is which; the index tells React which slot is which. They only agree while the list never changes shape." Run <code>index.js</code> in this folder to see the wrong-row state migration printed as patch operations.</div>
+
+<h2>Fragments, whitespace and text rules</h2>
+<p>A component returns one node. <code>&lt;&gt;...&lt;/&gt;</code> (shorthand for <code>&lt;React.Fragment&gt;</code>) groups children without adding a wrapper <code>div</code> — essential inside flex/grid layouts, tables and lists where a stray element breaks CSS or HTML validity.</p>
+<pre><code>// the shorthand cannot take a key; use the long form inside a map
+{rows.map(r =&gt; (
+  &lt;React.Fragment key={r.id}&gt;
+    &lt;dt&gt;{r.term}&lt;/dt&gt;
+    &lt;dd&gt;{r.def}&lt;/dd&gt;
+  &lt;/React.Fragment&gt;
+))}</code></pre>
+<ul>
+  <li><strong>Rendered:</strong> strings, numbers, arrays of elements.</li>
+  <li><strong>Rendered as nothing:</strong> <code>null</code>, <code>undefined</code>, <code>true</code>, <code>false</code>, empty arrays.</li>
+  <li><strong>Throws:</strong> a plain object as a child ("Objects are not valid as a React child") — the usual cause is forgetting <code>.name</code>, or accidentally rendering a Promise.</li>
+  <li><strong>Whitespace:</strong> JSX trims leading/trailing whitespace on a line and collapses blank lines. To force a space between two elements use <code>{' '}</code> or <code>&amp;nbsp;</code>.</li>
+</ul>
+
+<h2>Escaping and <code>dangerouslySetInnerHTML</code></h2>
+<p>React escapes every string it renders before inserting it, so <code>{'&lt;img src=x onerror=alert(1)&gt;'}</code> shows up as visible text, never as markup. That default is why XSS is rare in React apps.</p>
+<p>The one deliberate hole is verbose on purpose:</p>
+<pre><code>&lt;div dangerouslySetInnerHTML={{ __html: userHtml }} /&gt;</code></pre>
+<ul>
+  <li>It bypasses escaping entirely — any <code>&lt;script&gt;</code>, <code>onerror</code> or <code>javascript:</code> URL in <code>userHtml</code> executes with your origin's privileges.</li>
+  <li>Only ever pass HTML you sanitised server-side or with DOMPurify, and only when you truly need rich text (a CMS body, sanitised markdown).</li>
+  <li>Children and <code>dangerouslySetInnerHTML</code> are mutually exclusive on the same element.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> Escaping is not React's only XSS surface. <code>&lt;a href={userUrl}&gt;</code> still allows <code>javascript:</code> (React 16+ warns, but validate the protocol yourself), and spreading unvalidated objects into props can inject event handlers. <code>$$typeof</code> being a Symbol is what stops server JSON from being mistaken for an element.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What does JSX compile to, and what changed in React 17?</summary><p>Each tag becomes a function call returning a plain object. Classically <code>React.createElement(type, props, ...children)</code>, which required <code>React</code> in scope. The automatic runtime introduced in 17 compiles to <code>_jsx(type, props, key)</code> imported from <code>react/jsx-runtime</code>, with <code>children</code> as a normal prop, so the import is no longer needed.</p></details>
+  <details><summary>Difference between an element, a component and an instance?</summary><p>The component is the function. An element is an immutable plain object describing one usage of it (<code>{type, props, key}</code>) — creating it does nothing. The instance is the mounted fiber React keeps internally, holding hook state and DOM references.</p></details>
+  <details><summary>Why does <code>{items.length &amp;&amp; &lt;List /&gt;}</code> print a 0?</summary><p><code>&amp;&amp;</code> returns its left operand when falsy, so an empty array yields the number <code>0</code>. React renders <code>false</code>/<code>null</code>/<code>undefined</code> as nothing but renders numbers as text. Use <code>items.length &gt; 0 &amp;&amp; ...</code> or a ternary.</p></details>
+  <details><summary>What is <code>key</code> for, and why not the array index?</summary><p>It gives each child a stable identity so the reconciler can match elements across renders by identity instead of position, moving instances rather than rewriting them. With an index key, inserting or deleting shifts every subsequent key, so React reuses the wrong instance and its state, focus and DOM stay with the wrong row.</p></details>
+  <details><summary>Does <code>key</code> arrive as a prop?</summary><p>No. It is stripped by React and consumed by the reconciler (in the automatic runtime it is a separate argument to <code>_jsx</code>). If a child needs the id, pass it again explicitly as its own prop.</p></details>
+  <details><summary>When are Fragments required?</summary><p>Whenever you need to return multiple siblings without a wrapper element: table rows inside a <code>tbody</code>, <code>dt</code>/<code>dd</code> pairs, and direct children of a flex or grid container where an extra <code>div</code> would break layout. Use the long <code>&lt;React.Fragment key=...&gt;</code> form inside a map, since <code>&lt;&gt;</code> takes no key.</p></details>
+  <details><summary>How does React protect against XSS, and how do you defeat it?</summary><p>Every rendered string is escaped, so injected markup becomes text; the <code>$$typeof</code> Symbol on elements also prevents raw JSON from being treated as an element. You defeat it with <code>dangerouslySetInnerHTML</code>, which must only receive sanitised HTML (DOMPurify or server-side sanitisation), and by putting unvalidated user URLs into <code>href</code>/<code>src</code>.</p></details>
+</div>

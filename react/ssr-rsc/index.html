@@ -1,0 +1,173 @@
+<h1>SSR, Hydration &amp; Server Components <span class="tag react">React</span></h1>
+<p><strong>Client-side rendering ships an empty <code>&lt;div id="root"&gt;</code> and asks the browser to build the page from scratch.</strong> Everything on this page is an answer to the cost of that: send HTML first (SSR), send it at build time (SSG), stream it in pieces (streaming SSR), or stop sending the component's JavaScript altogether (React Server Components).</p>
+<p>The through-line is <em>where</em> a component runs and <em>what</em> the client has to download before the page works. Get that straight and the rest — hydration mismatches, <code>'use client'</code>, Server Actions — follows.</p>
+
+<h2>The four rendering strategies</h2>
+<table>
+  <thead><tr><th></th><th>CSR</th><th>SSR</th><th>SSG</th><th>ISR <em>(Next.js)</em></th></tr></thead>
+  <tbody>
+    <tr><td>HTML built</td><td>In the browser</td><td>Per request, on the server</td><td>At build time</td><td>At build, then regenerated in the background</td></tr>
+    <tr><td>TTFB</td><td>Fastest (static shell)</td><td>Slowest — waits for data</td><td>Fastest (CDN)</td><td>Fastest (CDN)</td></tr>
+    <tr><td>FCP / LCP</td><td>Worst — JS must download, parse, run, fetch</td><td>Good — content in the first response</td><td>Best</td><td>Best</td></tr>
+    <tr><td>SEO / link previews</td><td>Unreliable</td><td>Strong</td><td>Strong</td><td>Strong</td></tr>
+    <tr><td>Data freshness</td><td>Always live</td><td>Always live</td><td>Frozen until the next build</td><td>Stale up to the revalidate window</td></tr>
+    <tr><td>Server cost</td><td>None (static hosting)</td><td>Highest — render per request</td><td>None</td><td>Low</td></tr>
+    <tr><td>Personalisation</td><td>Trivial</td><td>Trivial</td><td>Impossible without client patching</td><td>Same as SSG</td></tr>
+  </tbody>
+</table>
+<p>They are not exclusive: a real app renders the marketing pages statically, the product pages with ISR, the account area with SSR, and the internal dashboard as pure CSR. Pick per route, not per app.</p>
+<div class="callout"><strong>Note:</strong> SSG and ISR are <em>framework</em> features (Next.js, Remix/React Router framework mode, Astro, Gatsby), not React APIs. React itself gives you <code>renderToPipeableStream</code>, <code>renderToReadableStream</code>, <code>renderToString</code> and <code>hydrateRoot</code>; everything else is build-time orchestration on top.</div>
+
+<h2>Hydration: HTML first, then React takes over</h2>
+<p>SSR sends a fully-formed HTML document. The user sees content immediately — but it is inert: no <code>onClick</code>, no state. <strong>Hydration</strong> is the client pass where React runs the same component tree, builds its fiber tree, and <em>adopts</em> the existing DOM nodes instead of creating new ones, attaching event listeners as it goes.</p>
+<pre><code>// server
+import { renderToPipeableStream } from 'react-dom/server';
+// client
+import { hydrateRoot } from 'react-dom/client';
+hydrateRoot(document.getElementById('root'), &lt;App /&gt;);   // NOT createRoot().render()</code></pre>
+<pre class="mermaid">
+flowchart LR
+  S["Server renders HTML"] --> N["Browser paints content - not interactive"]
+  N --> J["JS bundle downloads"]
+  J --> H["hydrateRoot walks the tree"]
+  H --> I["Listeners attached - page is interactive"]
+</pre>
+<p>The gap between "paints" and "interactive" is the <strong>uncanny valley</strong> of SSR: the page looks ready and ignores clicks. That gap is why the size of your client bundle still matters even with perfect SSR — and it is the problem streaming and RSC attack from two different angles.</p>
+
+<h2>Hydration mismatches</h2>
+<p>Hydration assumes the client's first render produces <em>the same tree the server produced</em>. When it does not, React warns and (since 18) discards the mismatched subtree and re-renders it on the client — losing the SSR benefit exactly where it went wrong. The usual culprits are all forms of non-determinism:</p>
+<ul>
+  <li><code>Date.now()</code>, <code>new Date()</code> rendered directly — the server's clock is never the client's.</li>
+  <li><code>Math.random()</code>, <code>crypto.randomUUID()</code>, or a non-deterministic id generator (use <code>useId</code>, which is SSR-safe by design).</li>
+  <li><strong>Locale and timezone formatting</strong> — <code>toLocaleDateString()</code> on a UTC server vs a user in Mumbai renders different text.</li>
+  <li><code>window</code>, <code>localStorage</code>, <code>navigator</code>, <code>matchMedia</code> read during render — undefined on the server, so the branches differ.</li>
+  <li><strong>Invalid HTML nesting</strong> — a <code>&lt;div&gt;</code> inside a <code>&lt;p&gt;</code>, or a <code>&lt;p&gt;</code> inside a <code>&lt;p&gt;</code>. The browser silently repairs the markup, so the DOM no longer matches what React sent.</li>
+  <li><strong>Browser extensions</strong> injecting attributes or nodes into the body (Grammarly, password managers, translation tools) — a real and famously confusing cause.</li>
+</ul>
+<pre><code>// ❌ different on server and client
+&lt;p&gt;Rendered at {new Date().toLocaleTimeString()}&lt;/p&gt;
+
+// ✅ render nothing time-dependent until after hydration
+const [now, setNow] = useState(null);
+useEffect(() =&gt; setNow(new Date()), []);       // effects run only on the client
+return &lt;p&gt;{now ? now.toLocaleTimeString() : '—'}&lt;/p&gt;;
+
+// ✅ deliberate, one-node-deep escape hatch
+&lt;time dateTime={iso} suppressHydrationWarning&gt;{formatted}&lt;/time&gt;</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> <code>suppressHydrationWarning</code> silences the warning for <em>that element's</em> text/attributes only — it does not fix the mismatch, and it does not apply to children deeper in the tree. It is right for a timestamp you know differs, and wrong as a way to make a warning go away. React 19 improved the diagnostics: you get a diff of server vs client output instead of a generic message.</div>
+
+<h2>Streaming SSR and selective hydration</h2>
+<p>Classic <code>renderToString</code> is all-or-nothing: one slow query holds the entire HTML response hostage, so TTFB equals your slowest data dependency. <code>renderToPipeableStream</code> (Node) and <code>renderToReadableStream</code> (Web streams / edge) instead flush HTML as it becomes ready, using <code>&lt;Suspense&gt;</code> as the boundary marker.</p>
+<pre><code>&lt;Layout&gt;
+  &lt;Nav /&gt;                                    {/* fast — flushed immediately */}
+  &lt;Suspense fallback={&lt;ReviewsSkeleton /&gt;}&gt;
+    &lt;Reviews /&gt;                              {/* slow — streamed in later */}
+  &lt;/Suspense&gt;
+&lt;/Layout&gt;
+
+const { pipe, abort } = renderToPipeableStream(&lt;App /&gt;, {
+  bootstrapScripts: ['/main.js'],
+  onShellReady()  { res.status(200).setHeader('Content-Type', 'text/html'); pipe(res); },
+  onShellError()  { res.status(500).send('&lt;h1&gt;Server error&lt;/h1&gt;'); },
+});</code></pre>
+<ol>
+  <li>React renders down to the first <code>&lt;Suspense&gt;</code> boundary and flushes that <strong>shell</strong>, with the fallback in place. The user has pixels.</li>
+  <li>When <code>Reviews</code>'s data resolves, React streams an extra HTML chunk plus a tiny inline script that swaps it in place of the fallback — no client render needed.</li>
+  <li><strong>Selective hydration:</strong> boundaries hydrate independently as their code arrives, and React <em>prioritises the boundary the user just clicked</em> — it records the event, hydrates that subtree first, and replays the event. Slow parts of the page no longer block interactivity elsewhere.</li>
+</ol>
+<div class="callout tip"><strong>Senior tip:</strong> Every <code>&lt;Suspense&gt;</code> boundary is simultaneously a streaming flush point, a hydration unit and an error/loading boundary. Place them where the page has a natural "this part can arrive late" seam — a comments list, a recommendation rail — not around the primary content.</div>
+
+<h2>React Server Components</h2>
+<p>RSC is a different axis from SSR. SSR renders your <em>client</em> components to HTML once, then ships their JS anyway so they can hydrate. A Server Component runs <strong>only</strong> on the server and its code is <strong>never sent to the browser at all</strong> — the client receives a serialized description of the rendered output (the RSC payload), not the component.</p>
+<pre><code>// app/posts/page.jsx  — a Server Component (the default in the Next.js App Router)
+import db from '@/lib/db';
+import fs from 'node:fs/promises';
+
+export default async function Posts({ searchParams }) {
+  const posts = await db.post.findMany({ take: 20 });   // direct DB access, no API route
+  const banner = await fs.readFile('./banner.md', 'utf8');
+  return (
+    &lt;section&gt;
+      &lt;Markdown source={banner} /&gt;      {/* the markdown lib stays on the server */}
+      {posts.map((p) =&gt; &lt;Post key={p.id} {...p} /&gt;)}
+    &lt;/section&gt;
+  );
+}</code></pre>
+<table>
+  <thead><tr><th></th><th>Server Component</th><th>Client Component</th></tr></thead>
+  <tbody>
+    <tr><td>JS shipped to browser</td><td><strong>Zero</strong></td><td>Component + all its imports</td></tr>
+    <tr><td><code>async</code> / <code>await</code> in the body</td><td>Yes</td><td>No</td></tr>
+    <tr><td>DB, filesystem, secrets, private env</td><td>Yes</td><td>Never</td></tr>
+    <tr><td><code>useState</code>, <code>useReducer</code>, <code>useEffect</code></td><td><strong>No</strong></td><td>Yes</td></tr>
+    <tr><td><code>onClick</code> and other handlers</td><td><strong>No</strong></td><td>Yes</td></tr>
+    <tr><td>Browser APIs, <code>window</code></td><td>No</td><td>Yes</td></tr>
+    <tr><td>Re-renders on state change</td><td>No — renders once per request</td><td>Yes</td></tr>
+  </tbody>
+</table>
+<p>The wins: heavy dependencies (markdown renderers, syntax highlighters, date libraries, ORMs) stop counting against the bundle; data fetching happens next to the database with no waterfall and no public API surface; secrets stay server-side by construction. The cost: no interactivity, and today RSC needs a framework/bundler integration to work — you cannot bolt it onto a plain Vite SPA.</p>
+
+<h2>The <code>'use client'</code> boundary and composition</h2>
+<p><code>'use client'</code> at the top of a file marks the <strong>boundary</strong> where the server tree hands off to the browser. The critical rule: <em>everything that file imports becomes client code too</em>, transitively. One <code>'use client'</code> at the top of your layout drags the whole app into the bundle.</p>
+<pre><code>'use client';                       // must be the first line of the file
+import { useState } from 'react';
+export function Accordion({ title, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    &lt;div&gt;
+      &lt;button onClick={() =&gt; setOpen(o =&gt; !o)}&gt;{title}&lt;/button&gt;
+      {open &amp;&amp; children}            {/* children may be SERVER-rendered content */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+<p><strong>Composition is the escape hatch.</strong> A client component cannot <em>import</em> a server component, but it can render one passed in as <code>children</code> (or any prop) — because the parent server component already rendered it to a payload before handing it over:</p>
+<pre><code>// app/page.jsx — Server Component
+export default async function Page() {
+  const doc = await db.doc.find();
+  return (
+    &lt;Accordion title="Details"&gt;
+      &lt;ServerRenderedDoc doc={doc} /&gt;   {/* stays on the server, zero JS shipped */}
+    &lt;/Accordion&gt;
+  );
+}</code></pre>
+<ul>
+  <li>Props crossing the boundary must be <strong>serializable</strong>: no functions, no class instances, no <code>Date</code>-in-a-Map exotica. (Server Actions are the one exception — a function reference that serializes to an endpoint id.)</li>
+  <li>Push <code>'use client'</code> as far down as possible: make the button interactive, not the page.</li>
+  <li>A client component still gets server-rendered to HTML for the initial load — "client" means "also runs in the browser", not "not rendered on the server".</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> Server Components are not "SSR with a new name". SSR is about producing HTML; RSC is about which components' <em>code</em> ever reaches the browser. A page can be SSR'd with zero server components, or use RSC in a framework that also streams SSR — which is what Next.js App Router does.</div>
+
+<h2>Server Actions (<code>'use server'</code>)</h2>
+<p>If Server Components solved reading, Server Actions solve writing. An <code>async</code> function marked <code>'use server'</code> can be passed to a form or called from a client component; React serializes the call to an HTTP request, runs the function on the server, and revalidates the affected data — no hand-written API route, no <code>fetch</code>, no client-side request state.</p>
+<pre><code>'use server';                                   // file-level, or first line inside the function
+export async function addComment(formData) {
+  const text = formData.get('text');
+  await db.comment.create({ data: { text } });
+  revalidatePath('/posts');                     // Next.js-specific cache invalidation
+}
+
+// used directly as a form action — works before JS loads
+&lt;form action={addComment}&gt;
+  &lt;input name="text" /&gt;&lt;button&gt;Post&lt;/button&gt;
+&lt;/form&gt;</code></pre>
+<p>React 19 ships the client-side half: <code>useActionState</code> (pending/result/error state for an action), <code>useFormStatus</code> (a child can read whether its parent form is submitting), and <code>useOptimistic</code> (show the comment instantly, roll back if the action fails). Security note: a Server Action is a <strong>public HTTP endpoint</strong>. Authenticate and validate inside every one of them — the fact that it is only called from an admin page proves nothing.</p>
+
+<h2>Where Next.js fits, and when plain CSR still wins</h2>
+<p>The Next.js App Router is the mainstream production home for all of the above, and it is worth naming which parts are React and which are Next:</p>
+<ul>
+  <li><strong>React:</strong> Server Components, <code>'use client'</code>/<code>'use server'</code>, <code>&lt;Suspense&gt;</code>, streaming renderers, <code>hydrateRoot</code>, <code>useActionState</code>/<code>useOptimistic</code>.</li>
+  <li><strong>Next.js:</strong> file-system routing, server components by default, <code>loading.js</code>/<code>error.js</code> (which compile to Suspense and error boundaries), <code>generateStaticParams</code>, ISR and <code>revalidatePath</code>/<code>revalidateTag</code>, the extended <code>fetch</code> cache, middleware and edge runtime.</li>
+</ul>
+<p>Other RSC-capable stacks exist (React Router v7 framework mode, Waku, and Vite's RSC plugin), but the bundler integration is unavoidable: RSC needs a build that can split the module graph into server and client halves and a runtime that can serialize the tree.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Plain CSR is still the correct answer for an app behind a login where every page is user-specific and no crawler will ever see it — an internal admin console, an analytics dashboard, a trading terminal. SEO is irrelevant, the shell caches on a CDN forever, there is no server render to pay for, and you skip hydration, RSC boundary rules and the whole class of mismatch bugs. Choose SSR/RSC because the content is public, large, or first-paint-critical — not because it is the newest thing.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is hydration, and what causes a hydration mismatch?</summary><p>Hydration is the client pass where React re-renders the tree that the server already turned into HTML, adopts the existing DOM nodes instead of recreating them, and attaches event listeners. A mismatch happens when the client's first render differs from the server output — <code>Date.now()</code>, <code>Math.random()</code>, locale/timezone formatting, reading <code>window</code>/<code>localStorage</code> during render, invalid HTML nesting the browser repairs, or extensions injecting DOM. React warns and re-renders the affected subtree on the client, wasting the SSR work.</p></details>
+  <details><summary>How do you fix a value that is genuinely different on server and client?</summary><p>Render a stable placeholder on the first pass and set the real value in <code>useEffect</code>, which only runs on the client — so both server and first client render agree. For a single node you know will differ (a formatted timestamp) <code>suppressHydrationWarning</code> is the sanctioned escape hatch, but it only covers that element's own text/attributes, not its subtree, and it silences rather than fixes.</p></details>
+  <details><summary>What does streaming SSR give you that <code>renderToString</code> does not?</summary><p><code>renderToString</code> blocks the whole response on the slowest data dependency. <code>renderToPipeableStream</code> flushes the shell as soon as it is ready and streams each <code>&lt;Suspense&gt;</code> boundary's HTML when its data resolves, so first paint is decoupled from slow data. It also enables selective hydration: boundaries hydrate independently, and React prioritises the one the user interacted with, replaying the recorded event.</p></details>
+  <details><summary>How are Server Components different from SSR?</summary><p>SSR renders client components to HTML for the first response, then still ships their JavaScript so they can hydrate. A Server Component runs only on the server and its code is never sent — the client receives a serialized render output. So SSR improves first paint; RSC removes bundle weight and lets components read the database or filesystem directly. They compose: the Next.js App Router streams SSR of an RSC tree.</p></details>
+  <details><summary>What can a Server Component not do?</summary><p>No <code>useState</code>/<code>useReducer</code>/<code>useEffect</code>, no event handlers, no browser APIs, no re-rendering in response to interaction — it runs once per request. Anything interactive goes below a <code>'use client'</code> boundary. In exchange it can be <code>async</code> and <code>await</code> data directly in its body.</p></details>
+  <details><summary>What does <code>'use client'</code> actually do, and why does its placement matter?</summary><p>It marks the boundary between the server tree and the client bundle. Everything the file imports becomes client code transitively, so a <code>'use client'</code> high in the tree pulls the whole app into the bundle. Push it to the smallest interactive leaf. A client component cannot import a server component, but it can render one passed as <code>children</code>, since the server rendered it before handing it over — and props crossing the boundary must be serializable.</p></details>
+  <details><summary>When would you deliberately choose plain CSR today?</summary><p>An authenticated, highly interactive app no crawler will ever see — an internal dashboard or admin console. SEO and first-paint-for-strangers are non-issues, the shell is a CDN-cached static file, there is no per-request server cost, and you avoid hydration mismatches and RSC boundary constraints entirely. Reach for SSR/SSG/RSC when content is public, large, or first-paint-critical.</p></details>
+</div>

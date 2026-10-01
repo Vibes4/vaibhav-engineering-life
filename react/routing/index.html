@@ -1,0 +1,196 @@
+<h1>Routing (React Router) <span class="tag react">React</span></h1>
+<p><strong>Client-side routing is a trick played on the browser.</strong> Instead of letting a link trigger a full document request, the router intercepts the click, calls <code>history.pushState</code> to change the address bar, and re-renders a different component subtree. No network round-trip, no white flash, no lost JavaScript state — but also no server involvement, which is where every routing bug comes from.</p>
+<p>React itself has no router. React Router is the de-facto library; v6 unified the API around <code>&lt;Routes&gt;</code>/<code>&lt;Route&gt;</code> and relative nested routes, and v6.4+/v7 added the <strong>data router</strong> (<code>createBrowserRouter</code>, <code>loader</code>, <code>action</code>) which moves fetching out of effects and into the route definition.</p>
+
+<h2>How client-side routing actually works</h2>
+<p>Three pieces, and that is the whole idea:</p>
+<ul>
+  <li><strong>The History API</strong> — <code>history.pushState(state, '', '/users/7')</code> changes the URL and adds a history entry <em>without</em> requesting anything. <code>replaceState</code> does the same without adding an entry.</li>
+  <li><strong>The <code>popstate</code> event</strong> — fired when the user presses Back/Forward. The router listens and re-matches. (Note <code>pushState</code> itself does <em>not</em> fire <code>popstate</code>, so the router updates its own state directly on navigation.)</li>
+  <li><strong>Matching + rendering</strong> — the router compares the current pathname against its route table, picks the best match, extracts params, and renders that element.</li>
+</ul>
+<pre class="mermaid">
+flowchart LR
+  C["Click on Link"] --> P["preventDefault"]
+  P --> H["history pushState"]
+  H --> S["Router state updates"]
+  S --> M["Match pathname to route table"]
+  M --> R["Render matched element"]
+</pre>
+<h3>The 404-on-refresh bug</h3>
+<p>The browser only knows about client routes <em>after</em> your JS runs. If a user hard-loads or refreshes <code>/users/7</code>, the browser asks the server for <code>/users/7</code> — a path that does not exist on disk — and gets a 404. The fix is a <strong>history fallback</strong>: the server must return <code>index.html</code> for any request that is not a real static file.</p>
+<pre><code># nginx
+location / { try_files $uri $uri/ /index.html; }
+
+# Express
+app.use(express.static('dist'));
+app.get('*', (req, res) =&gt; res.sendFile(path.join(dist, 'index.html')));</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> "works in dev, 404 in prod" is almost always this. Vite/CRA dev servers do the fallback for you; S3, nginx and Apache do not until you configure it. On S3 + CloudFront you set the error document to <code>index.html</code>.</div>
+
+<h2>The core API: BrowserRouter, Routes, Route, Link</h2>
+<pre><code>import { BrowserRouter, Routes, Route, Link, NavLink } from 'react-router-dom';
+
+&lt;BrowserRouter&gt;
+  &lt;nav&gt;
+    &lt;Link to="/"&gt;Home&lt;/Link&gt;
+    &lt;NavLink to="/users" className={({ isActive }) =&gt; isActive ? 'on' : ''}&gt;Users&lt;/NavLink&gt;
+  &lt;/nav&gt;
+  &lt;Routes&gt;
+    &lt;Route path="/" element={&lt;Home /&gt;} /&gt;
+    &lt;Route path="/users/:id" element={&lt;User /&gt;} /&gt;
+    &lt;Route path="*" element={&lt;NotFound /&gt;} /&gt;
+  &lt;/Routes&gt;
+&lt;/BrowserRouter&gt;</code></pre>
+<table>
+  <thead><tr><th>Element</th><th>What it does</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><code>&lt;Link to&gt;</code></td><td>Renders an <code>&lt;a&gt;</code> but intercepts the click and pushes history</td><td>Any in-app navigation</td></tr>
+    <tr><td><code>&lt;NavLink to&gt;</code></td><td>A Link that exposes <code>isActive</code>/<code>isPending</code> to <code>className</code>, <code>style</code> or children</td><td>Nav bars, tabs, sidebars</td></tr>
+    <tr><td><code>&lt;a href&gt;</code></td><td>Full document navigation: unmounts everything, re-downloads and re-boots the app</td><td>External links, or a deliberate hard reload</td></tr>
+  </tbody>
+</table>
+<p>Using <code>&lt;a href="/users"&gt;</code> for an internal link is the classic mistake: it throws away all in-memory state, refetches the bundle, and turns a 5&nbsp;ms transition into a 1&nbsp;s reload. <code>&lt;NavLink end&gt;</code> is worth knowing — without it, <code>/</code> is "active" on every page, because matching is prefix-based by default.</p>
+<div class="callout"><strong>Note:</strong> <code>&lt;Routes&gt;</code> renders <em>only the best match</em>, not every match — unlike React Router v5's <code>&lt;Switch&gt;</code>+<code>&lt;Route&gt;</code>, where order in the file decided the winner. In v6 ranking is computed from the patterns themselves, so file order no longer matters.</div>
+
+<h2>Nested routes, layouts and <code>&lt;Outlet /&gt;</code></h2>
+<p>Nesting is v6's headline feature: a URL maps to a <em>chain</em> of components, not one. Each parent renders shared chrome and drops <code>&lt;Outlet /&gt;</code> where the child goes.</p>
+<pre><code>&lt;Routes&gt;
+  &lt;Route path="/" element={&lt;RootLayout /&gt;}&gt;          {/* layout route */}
+    &lt;Route index element={&lt;Home /&gt;} /&gt;                {/* renders at "/" */}
+    &lt;Route path="dashboard" element={&lt;DashLayout /&gt;}&gt;
+      &lt;Route index element={&lt;Overview /&gt;} /&gt;          {/* "/dashboard" */}
+      &lt;Route path="reports/:reportId" element={&lt;Report /&gt;} /&gt;
+    &lt;/Route&gt;
+  &lt;/Route&gt;
+&lt;/Routes&gt;
+
+function DashLayout() {
+  return (
+    &lt;div className="dash"&gt;
+      &lt;Sidebar /&gt;
+      &lt;Outlet /&gt;      {/* the matched child route renders here */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+<ul>
+  <li><strong>Child paths are relative.</strong> <code>path="reports/:reportId"</code> under <code>dashboard</code> means <code>/dashboard/reports/:reportId</code>. Relative <code>&lt;Link to="reports/1"&gt;</code> resolves against the current route too.</li>
+  <li><strong>Index route</strong> (<code>&lt;Route index&gt;</code>) is the default child — what fills the Outlet when the URL matches the parent exactly.</li>
+  <li><strong>Layout route</strong> = a <code>&lt;Route&gt;</code> with an <code>element</code> but no <code>path</code>. It adds shared UI (or a guard) to a group of routes without adding a URL segment.</li>
+  <li>Because parents stay mounted across child navigations, their state and scroll position survive — that is why a sidebar's open/closed state does not reset.</li>
+</ul>
+
+<h2>Dynamic segments, search params and the URL as state</h2>
+<pre><code>// /users/:id/posts/:postId  →  { id: '7', postId: '42' }
+const { id, postId } = useParams();          // ALWAYS strings, always possibly undefined
+
+const [searchParams, setSearchParams] = useSearchParams();
+const page  = Number(searchParams.get('page') ?? 1);
+const query = searchParams.get('q') ?? '';
+setSearchParams((prev) =&gt; { prev.set('page', String(page + 1)); return prev; },
+                { replace: true });          // replace: don't spam the Back button</code></pre>
+<p><code>useSearchParams</code> returns a real <code>URLSearchParams</code> object plus a setter that behaves like a state setter. The argument for putting filters, pagination, sort order, open tab and search text there instead of in <code>useState</code>:</p>
+<ul>
+  <li><strong>Shareable</strong> — pasting the URL into Slack reproduces exactly what you were looking at.</li>
+  <li><strong>Reload-proof and back-button-correct</strong> — the browser already persists it, for free.</li>
+  <li><strong>Single source of truth</strong> — no syncing effect between local state and the address bar.</li>
+  <li><strong>Server-renderable</strong> — an SSR pass can read the query string and render the right page immediately.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> Keep <em>navigational</em> state in the URL, <em>ephemeral</em> state local (a hover, a half-typed character, whether a tooltip is open). And remember every param is a string: <code>id === 7</code> is always false, and unvalidated params flow straight into your fetch URLs.</div>
+
+<h3>Programmatic navigation: <code>useNavigate</code> and <code>useLocation</code></h3>
+<pre><code>const navigate = useNavigate();
+await save(form);
+navigate(`/users/${user.id}`);                 // push
+navigate('/login', { replace: true });         // replace — user can't Back into a dead page
+navigate(-1);                                  // history.back()
+navigate('/checkout', { state: { from: 'cart' } });   // opaque state, not in the URL
+
+const location = useLocation();  // { pathname, search, hash, state, key }</code></pre>
+<p>Prefer a <code>&lt;Link&gt;</code> when the thing is a link — it gets middle-click, right-click "open in new tab", and correct semantics for screen readers for free. Use <code>useNavigate</code> for navigation that follows an action: after a form submit, after login, on a timeout. <code>location.key</code> changes on every navigation, which makes it a handy <code>key</code> or effect dependency for "re-run when the user navigated here again".</p>
+
+<h2>Ranking, splat routes and 404s</h2>
+<p>v6 scores every route pattern and renders the highest scorer, so declaration order is irrelevant. Roughly: a <strong>static segment beats a dynamic <code>:param</code>, which beats a splat <code>*</code></strong>, and more matched segments beat fewer.</p>
+<pre><code>&lt;Route path="/users/*"      element={&lt;UserFiles /&gt;} /&gt;   {/* lowest */}
+&lt;Route path="/users/:id"    element={&lt;User /&gt;} /&gt;
+&lt;Route path="/users/new"    element={&lt;NewUser /&gt;} /&gt;     {/* wins for /users/new */}
+&lt;Route path="*"             element={&lt;NotFound /&gt;} /&gt;    {/* catch-all 404 */}</code></pre>
+<p>So <code>/users/new</code> renders <code>NewUser</code> even though <code>/users/:id</code> also matches — no more ordering <code>&lt;Switch&gt;</code> children by hand. A trailing <code>*</code> captures the rest of the path, available as <code>useParams()['*']</code> — used for file browsers, docs trees, and mounting a nested router. A bare <code>path="*"</code> at the top level is your 404 page. <em>The runnable script for this page implements exactly this ranking algorithm.</em></p>
+
+<h2>Protected routes and lazy route-level code splitting</h2>
+<h3>Guarding, and remembering where they were going</h3>
+<pre><code>function RequireAuth() {
+  const user = useAuth();
+  const location = useLocation();
+  if (user === undefined) return &lt;Spinner /&gt;;              // still checking — don't bounce yet
+  if (!user) return &lt;Navigate to="/login" replace state={{ from: location }} /&gt;;
+  return &lt;Outlet /&gt;;                                       // layout route: guards a whole group
+}
+
+// after a successful login
+const from = location.state?.from?.pathname ?? '/';
+navigate(from, { replace: true });</code></pre>
+<p>Two details interviewers look for: <code>replace</code> (so Back does not bounce the user between login and the guarded page), and stashing <code>location</code> in navigation state so you can return them to the page they actually wanted. And the honest one — <strong>a client-side guard is UX, not security</strong>. The API must authorize every request independently; anyone can edit the JS bundle.</p>
+<h3>Lazy routes</h3>
+<pre><code>const Reports = React.lazy(() =&gt; import('./Reports'));
+
+&lt;Route path="reports" element={
+  &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;&lt;Reports /&gt;&lt;/Suspense&gt;
+} /&gt;</code></pre>
+<p>Route boundaries are the best code-splitting seams you get: a user who never opens the admin section never downloads it. Put the <code>&lt;Suspense&gt;</code> at the layout level to avoid a flash per route, and prefetch on link hover for the big ones. (Data routers offer a route-level <code>lazy</code> option that also splits the route's <code>loader</code> and <code>action</code>, not just its component.)</p>
+
+<h2>Data routers: loaders, actions and errorElement</h2>
+<p>Fetch-in-<code>useEffect</code> creates a <strong>waterfall</strong>: render the route → mount → effect fires → request starts. Nested routes stack the waterfalls, so a three-deep layout does three sequential round-trips after paint. A data router hoists fetching into the route definition, so it can start every level's request <em>in parallel, before rendering</em>.</p>
+<pre><code>const router = createBrowserRouter([
+  { path: '/', element: &lt;Root /&gt;, errorElement: &lt;RootError /&gt;, children: [
+      { index: true, element: &lt;Home /&gt; },
+      { path: 'users/:id',
+        loader: async ({ params, request }) =&gt; {
+          const res = await fetch(`/api/users/${params.id}`, { signal: request.signal });
+          if (!res.ok) throw new Response('Not found', { status: 404 });
+          return res.json();
+        },
+        action: async ({ request }) =&gt; {          // handles &lt;Form method="post"&gt;
+          const data = await request.formData();
+          return updateUser(data);
+        },
+        element: &lt;User /&gt;,
+        errorElement: &lt;UserError /&gt;,
+      },
+  ]},
+]);
+
+function User() {
+  const user = useLoaderData();       // already resolved before this rendered
+  const nav = useNavigation();        // 'idle' | 'loading' | 'submitting' — global pending UI
+  ...
+}
+&lt;RouterProvider router={router} /&gt;</code></pre>
+<ul>
+  <li><code>errorElement</code> catches thrown errors <em>and</em> thrown <code>Response</code>s from that route's loader/action/render, and bubbles to the nearest ancestor — proper per-route error boundaries, read via <code>useRouteError</code>.</li>
+  <li>After an <code>action</code>, loaders on the page automatically revalidate — no manual cache invalidation.</li>
+  <li><code>&lt;Form&gt;</code> + <code>action</code> gives progressive-enhancement-shaped mutations; <code>useFetcher</code> does the same without navigating.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> loaders replace fetch-on-mount, not a cache. They re-run on every navigation to the route. For dedup, background refetch and stale-while-revalidate you still want React Query/SWR, or the framework-mode caching in React Router v7 / Remix.</div>
+
+<h2>Scroll restoration, and hash vs browser history</h2>
+<p>The browser restores scroll on real navigations; SPAs must do it themselves, because the document never changed. React Router ships <code>&lt;ScrollRestoration /&gt;</code> (data routers) — drop it once in the root layout and it saves/restores scroll per history entry. Without it, users navigate to a new page already scrolled halfway down.</p>
+<table>
+  <thead><tr><th>Router</th><th>URL</th><th>Needs server config</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><code>BrowserRouter</code> / <code>createBrowserRouter</code></td><td><code>/users/7</code></td><td>Yes — history fallback</td><td>Default. Clean URLs, SEO-friendly, SSR-compatible.</td></tr>
+    <tr><td><code>HashRouter</code> / <code>createHashRouter</code></td><td><code>/#/users/7</code></td><td>No — the fragment never reaches the server</td><td>Static hosts you cannot configure, <code>file://</code>, Electron, an app embedded under a path you do not control.</td></tr>
+    <tr><td><code>MemoryRouter</code> / <code>createMemoryRouter</code></td><td>None (in memory)</td><td>N/A</td><td>Tests, React Native, Storybook.</td></tr>
+  </tbody>
+</table>
+<p>Hash routing's cost: search engines and analytics treat the fragment poorly, the server can never see the route (so no SSR and no per-route caching), and the URLs look dated. Use it only when you genuinely cannot control the server.</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why does a deep link 404 after deploying an SPA, and how do you fix it?</summary><p>Client routes only exist once the JS runs. A hard load of <code>/users/7</code> asks the server for a file that does not exist. Configure a history fallback so any non-asset request returns <code>index.html</code> (<code>try_files ... /index.html</code> in nginx, a catch-all route in Express, the error-document trick on S3/CloudFront). The router then matches the path on the client.</p></details>
+  <details><summary>What is wrong with using <code>&lt;a href="/users"&gt;</code> inside the app?</summary><p>It performs a full document navigation: the app unmounts, the bundle is re-downloaded and re-executed, and all in-memory state is lost. <code>&lt;Link&gt;</code> renders the same anchor but calls <code>preventDefault</code> and pushes onto the History API, so only the matched subtree re-renders. Keep real anchors for external links.</p></details>
+  <details><summary>How does React Router decide which route wins when several match?</summary><p>v6 ranks patterns by specificity rather than declaration order: more matched segments score higher, and within a segment a static literal beats a dynamic <code>:param</code>, which beats a splat <code>*</code>. So <code>/users/new</code> beats <code>/users/:id</code> regardless of the order you wrote them in.</p></details>
+  <details><summary>What is <code>&lt;Outlet /&gt;</code> and what problem do nested routes solve?</summary><p>A URL maps to a chain of matched routes, not one component. Each parent renders persistent layout chrome and places <code>&lt;Outlet /&gt;</code> where its matched child should go. Parents stay mounted across child navigations, so sidebars, tabs and their state survive; an <code>index</code> route supplies the default child.</p></details>
+  <details><summary>Why prefer <code>useSearchParams</code> over <code>useState</code> for filters and pagination?</summary><p>The URL is already shareable, bookmarkable, reload-proof and integrated with the back button, and it can be read on the server for SSR. Keeping it in local state duplicates the source of truth and needs a syncing effect. Keep only ephemeral UI state local.</p></details>
+  <details><summary>How do you implement a protected route, and what does it not give you?</summary><p>A layout route whose element checks auth, renders a spinner while the check is pending, and otherwise returns either <code>&lt;Outlet /&gt;</code> or <code>&lt;Navigate to="/login" replace state={{ from: location }} /&gt;</code>; after login you navigate back to <code>state.from</code>. It is UX only — the bundle is public, so the API must authorize every request itself.</p></details>
+  <details><summary>What do route loaders buy you over fetching in <code>useEffect</code>?</summary><p>They remove the render → mount → effect → fetch waterfall, and nested loaders run in parallel instead of stacking one round-trip per level. The route renders with data already available (<code>useLoaderData</code>), errors and thrown Responses land in that route's <code>errorElement</code>, and loaders revalidate automatically after an <code>action</code>. They are not a cache — pair with React Query if you need dedup and stale-while-revalidate.</p></details>
+</div>

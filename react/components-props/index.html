@@ -1,0 +1,132 @@
+<h1>Components &amp; Props <span class="tag react">React</span></h1>
+<p><strong>A component is a function from props to a description of UI.</strong> That is the entire contract — and the reason React scales: if a component is a pure function, you can reason about it, test it, memoize it, render it on a server, replay it, and render it twice without consequence.</p>
+<p>Props are that function's arguments. They are <em>read-only</em>, they flow strictly downward, and the discipline around them (purity, composition, no mutation) is what separates a codebase that stays debuggable from one that does not.</p>
+
+<h2>Props are read-only arguments</h2>
+<pre><code>function Greeting({ name, greeting = 'Hello' }) {
+  return &lt;h1&gt;{greeting}, {name}!&lt;/h1&gt;;
+}
+&lt;Greeting name="Ada" /&gt;   // → Greeting({ name: 'Ada' })</code></pre>
+<p>A component <strong>must never write to its props</strong>. React does not deep-freeze the props object, so mutation silently "works" and then fails in ways that are hard to trace:</p>
+<pre><code>function Row({ user }) {
+  user.name = user.name.toUpperCase();   // ❌ mutates the PARENT's object
+  return &lt;td&gt;{user.name}&lt;/td&gt;;
+}</code></pre>
+<ul>
+  <li>The parent's state object now differs from what the parent last set, so the parent's own render output changes without any <code>setState</code>.</li>
+  <li>The reference did not change, so <code>React.memo</code>, <code>useMemo</code> and dependency arrays all conclude "nothing changed" and skip work.</li>
+  <li>Rendering twice (StrictMode, concurrent re-render, a replayed render) applies the transformation twice — <code>ADA</code> then <code>ADA</code>, but a <code>count + 1</code> becomes <code>count + 2</code>.</li>
+</ul>
+<p>The correct shape is: derive a local value during render, and to change data, call a callback the owner passed down.</p>
+<div class="callout"><strong>Note:</strong> "One-way data flow" is enforced by convention, not by the runtime. React tells you nothing when you break it — which is exactly why interviewers ask about it.</div>
+
+<h2><code>children</code> and composition</h2>
+<p><code>children</code> is just a prop whose value happens to be whatever you nested between the tags. It can be an element, a string, an array — or a function.</p>
+<pre><code>function Card({ title, children, footer }) {
+  return (
+    &lt;section className="card"&gt;
+      &lt;h3&gt;{title}&lt;/h3&gt;
+      &lt;div className="body"&gt;{children}&lt;/div&gt;
+      {footer &amp;&amp; &lt;footer&gt;{footer}&lt;/footer&gt;}
+    &lt;/section&gt;
+  );
+}
+
+&lt;Card title="Billing" footer={&lt;SaveButton /&gt;}&gt;
+  &lt;InvoiceTable rows={rows} /&gt;
+&lt;/Card&gt;</code></pre>
+<p>Two things worth naming: <strong>multiple slots</strong> (any prop can take an element, so <code>footer</code>, <code>icon</code>, <code>header</code> are all "children" by another name), and the fact that <code>Card</code> knows nothing about <code>InvoiceTable</code>. It renders a hole.</p>
+<h3>Slots kill prop drilling</h3>
+<p>Prop drilling usually appears because a middle component <em>creates</em> the deep child and therefore must be handed its data. If the top component creates the element and passes it down as <code>children</code>, the middle layer never sees the data at all:</p>
+<pre><code>// ❌ Layout must accept `user` only to forward it two levels
+&lt;Layout user={user} /&gt;
+
+// ✅ Layout accepts an opaque child; `user` never enters Layout's props
+&lt;Layout&gt;&lt;Sidebar&gt;&lt;Profile user={user} /&gt;&lt;/Sidebar&gt;&lt;/Layout&gt;</code></pre>
+<div class="callout tip"><strong>Senior tip:</strong> Reach for composition <em>before</em> Context. "Lift the element, not the data" removes most drilling with zero runtime cost and no re-render fan-out, whereas Context re-renders every consumer on every value change.</div>
+
+<h2>Composition over inheritance</h2>
+<p>React has <strong>no component inheritance</strong> and the docs recommend against simulating it. There is no <code>extends BaseButton</code> pattern that works well, because a subclass has to know its parent's render internals to override them — the classic fragile-base-class problem.</p>
+<table>
+  <thead><tr><th>You want…</th><th>Inheritance answer</th><th>React answer</th></tr></thead>
+  <tbody>
+    <tr><td>A variant of a component</td><td>Subclass and override</td><td>Props (<code>variant="danger"</code>)</td></tr>
+    <tr><td>A shell with variable content</td><td>Template method</td><td><code>children</code> / slot props</td></tr>
+    <tr><td>Shared behaviour</td><td>Base-class methods</td><td>A custom hook</td></tr>
+    <tr><td>A specialised component</td><td>Subclass</td><td>A component that renders the generic one with fixed props</td></tr>
+  </tbody>
+</table>
+<pre><code>// "specialisation" in React is just a function calling another function
+const DangerButton = (props) =&gt; &lt;Button {...props} variant="danger" /&gt;;</code></pre>
+<div class="callout"><strong>Note:</strong> Shared <em>logic</em> goes in a custom hook; shared <em>markup</em> goes in a component; shared <em>structure</em> goes in <code>children</code>. Those three cover everything inheritance was used for, without the coupling.</div>
+
+<h2>Defaults, spreading, and prop APIs</h2>
+<pre><code>// ✅ destructuring defaults — the modern way
+function Button({ variant = 'primary', size = 'md', disabled = false, ...rest }) {
+  return &lt;button className={`btn ${variant} ${size}`} disabled={disabled} {...rest} /&gt;;
+}</code></pre>
+<p><code>Button.defaultProps</code> is <strong>deprecated for function components</strong> (React 18.3 warns; React 19 removed support) — it still exists for classes. Use default values in the parameter destructuring.</p>
+<h3>Spreading <code>{...rest}</code>: when it helps and when it hurts</h3>
+<ul>
+  <li><strong>Good:</strong> leaf wrappers over a DOM element, where forwarding <code>aria-*</code>, <code>data-*</code>, <code>type</code>, <code>onFocus</code> etc. is the point. Spread <em>before</em> your own props if the caller must not override them, <em>after</em> if they should be able to.</li>
+  <li><strong>Bad:</strong> <code>&lt;Child {...props} /&gt;</code> through several layers. The component's real API becomes invisible, TypeScript stops helping, dead props travel forever, and typos land in the DOM as unknown-attribute warnings.</li>
+  <li><strong>Order matters:</strong> <code>&lt;input {...rest} value={v} /&gt;</code> means <code>value</code> always wins; swapping them lets a caller silently break the component.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> Spreading an object built inline (<code>{...{ style: {...} }}</code>) or passing an inline object/array/arrow prop creates a new reference every render, defeating <code>React.memo</code> on the child. That is a real cost only when the child is expensive or the list is long — measure before you memoize.</div>
+
+<h2>Presentational vs container components</h2>
+<p>The 2015 split (a "container" fetches and holds state, a "presentational" component only takes props and renders) was a workaround for class components having no way to share stateful logic. <strong>Hooks made the split largely obsolete</strong> — Dan Abramov, who popularised the pattern, has said so.</p>
+<p>What survives is the useful half:</p>
+<ul>
+  <li>Keep components that touch the network or global state <strong>shallow and few</strong>; a custom hook (<code>useInvoices()</code>) is the modern "container".</li>
+  <li>Keep pure, prop-driven components for anything you want to reuse, storybook, or snapshot-test.</li>
+  <li>Do not create a wrapper file per component out of ceremony. Split when a component has two reasons to change, not because a pattern says so.</li>
+</ul>
+
+<h2>Purity, and what StrictMode catches</h2>
+<p>React requires render to be <strong>pure</strong>: given the same props and state it must return the same JSX, and it must not touch anything outside its own scope while rendering.</p>
+<p>Forbidden during render: mutating props, state, or module-level variables; writing to the DOM; calling <code>fetch</code>; starting timers; <code>Math.random()</code>/<code>Date.now()</code> where the value is compared across renders; calling a setter of another component.</p>
+<pre><code>let renderCount = 0;                 // ❌ module-level mutation
+
+function Item({ item }) {
+  renderCount++;                     // ❌ side effect during render
+  item.seen = true;                  // ❌ mutating a prop
+  return &lt;li&gt;{item.title} ({renderCount})&lt;/li&gt;;
+}</code></pre>
+<p>In development, <code>&lt;StrictMode&gt;</code> deliberately <strong>calls your component function twice</strong> and double-invokes effects (mount → unmount → mount). A pure component produces identical output both times and nobody notices; an impure one changes on the second call, which is the point — it surfaces the bug on your machine instead of in production, where concurrent rendering can render, discard, and re-render a component at any time.</p>
+<div class="callout warn"><strong>Gotcha:</strong> StrictMode's double render happens in development only, and React deliberately suppresses duplicate <code>console.log</code>s in the doubled pass, so people conclude "it only rendered once". Run <code>index.js</code> in this folder to see exactly how an impure component diverges between call 1 and call 2.</div>
+
+<h2>Typing props, naming, and when to split</h2>
+<pre><code>type Variant = 'primary' | 'danger';
+
+interface ButtonProps extends React.ComponentPropsWithoutRef&lt;'button'&gt; {
+  variant?: Variant;               // optional with a default
+  loading?: boolean;
+  children: React.ReactNode;       // required content
+  onConfirm?: (id: string) =&gt; void;
+}
+
+export function Button({ variant = 'primary', loading = false, children, ...rest }: ButtonProps) { … }</code></pre>
+<ul>
+  <li>Extend <code>ComponentPropsWithoutRef&lt;'button'&gt;</code> so every native attribute is typed for free — better than redeclaring <code>onClick</code> by hand.</li>
+  <li><code>React.ReactNode</code> for anything renderable; <code>React.ReactElement</code> only when you truly require a single element.</li>
+  <li>Prefer a union of literals over <code>string</code>; the compiler then enforces your design system.</li>
+  <li><code>React.FC</code> is out of favour: it adds an implicit <code>children</code> (removed in React 18 types) and complicates generics. Type the props parameter instead.</li>
+</ul>
+<h3>Conventions and splitting</h3>
+<ul>
+  <li>PascalCase components, camelCase props, <code>on*</code> for callbacks the child calls, <code>handle*</code> for the parent's implementation, <code>is/has</code> for booleans.</li>
+  <li>One exported component per file, file named after it; colocate its sub-parts, hook, and test in the same folder.</li>
+  <li><strong>Split when:</strong> a chunk of JSX gets its own name in conversation, a piece needs independent state, or a subtree re-renders far more often than its siblings. <strong>Do not split</strong> merely because a file crossed a line count — a 200-line component with one job beats five files with one job between them.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why are props read-only?</summary><p>A component is a function of its props; mutating them makes render impure, so the same inputs stop producing the same output. Practically, the parent's data changes behind its back, the reference stays identical so memoization and dependency arrays miss it, and a second render (StrictMode or a concurrent re-render) applies the change twice.</p></details>
+  <details><summary>How do you avoid prop drilling without Context?</summary><p>Composition: let the component that owns the data create the deep element and pass it down as <code>children</code> or a slot prop. The intermediate layers accept an opaque node and never learn about the data. No re-render fan-out, and the component API stays honest.</p></details>
+  <details><summary>Why does React favour composition over inheritance?</summary><p>Inheritance couples a child to its parent's internals and offers nothing React needs: variants are props, variable content is <code>children</code>, shared logic is a custom hook, and specialisation is a component that renders the generic one with fixed props. There is no supported inheritance mechanism for components.</p></details>
+  <details><summary>What does StrictMode actually do, and why?</summary><p>In development only, it double-invokes component functions, initialisers and updaters, and mounts → unmounts → remounts each component so effects run twice. This surfaces impure render logic and missing effect cleanup on your machine, because concurrent React may render a component and throw the result away at any time.</p></details>
+  <details><summary>Is <code>defaultProps</code> still the way to set defaults?</summary><p>No. It is deprecated for function components (warned in 18.3, removed in 19) and remains only for classes. Use destructuring defaults in the parameter list, which is also better for TypeScript inference.</p></details>
+  <details><summary>What are the downsides of <code>{...rest}</code> spreading?</summary><p>It hides the component's real API, weakens type checking, lets unknown props reach the DOM as warnings, and can silently override your own props depending on spread order. It is right for thin wrappers over a DOM element that should forward native attributes, and wrong as a way to pass data through several layers.</p></details>
+  <details><summary>Are presentational/container components still relevant?</summary><p>Mostly not — the split existed because classes could not share stateful logic. Custom hooks do that now. The surviving guidance is to keep data-fetching shallow (in hooks) and keep reusable UI pure and prop-driven, rather than mechanically creating a container per component.</p></details>
+</div>

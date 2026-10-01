@@ -1,0 +1,137 @@
+<h1>Advanced Hooks <span class="tag react">React</span></h1>
+<p><strong>Beyond <code>useState</code> and <code>useEffect</code> sits a second tier of hooks that exist for specific, narrow problems:</strong> action-driven state transitions, measuring the DOM before paint, exposing an imperative handle, generating SSR-safe ids, keeping the UI responsive during expensive updates, and subscribing to state that lives outside React.</p>
+<p>Each one has a precise reason to exist. Knowing <em>which problem</em> each solves — and when the plain hook is the right answer instead — is what separates a senior answer from a list of API names.</p>
+
+<h2><code>useReducer</code>: state transitions as data</h2>
+<pre><code>const [state, dispatch] = useReducer(reducer, initialArg, init?);
+// reducer: (state, action) =&gt; newState        — a pure function
+dispatch({ type: 'added', text });             // describe WHAT HAPPENED, not what to set</code></pre>
+<p>The optional third argument is a lazy initializer: React calls <code>init(initialArg)</code> once on mount, the same pattern as <code>useState(() =&gt; …)</code>.</p>
+<h3>When it beats <code>useState</code></h3>
+<ul>
+  <li><strong>Several fields change together.</strong> One <code>dispatch({ type: 'submitFailed', error })</code> replaces three coordinated setters that could interleave inconsistently.</li>
+  <li><strong>The next state depends on the meaning of an event</strong>, not just a value — form wizards, undo/redo, drag state, anything shaped like a state machine.</li>
+  <li><strong>You want the logic testable.</strong> A reducer is a pure function; you can unit-test every transition with no component, no renderer, no DOM.</li>
+  <li><strong>Deeply nested update logic</strong> is easier to read collected in one <code>switch</code> than scattered across handlers.</li>
+</ul>
+<h3>Rules</h3>
+<ul>
+  <li><strong>Reducers must be pure:</strong> same <code>(state, action)</code> in, same new state out. No fetches, no timers, no mutation, no <code>Math.random()</code> or <code>Date.now()</code> — put those in the action payload. (StrictMode double-invokes reducers in development to surface impurity.)</li>
+  <li><strong>Return a new object</strong> when something changed; returning the identical reference makes React bail out of the re-render.</li>
+  <li><strong>Actions describe events</strong>, past tense, from the user's point of view: <code>'added_todo'</code>, not <code>'setTodos'</code>.</li>
+  <li><strong><code>dispatch</code> has a stable identity</strong> for the component's lifetime — it never needs to be in a dependency array, and it is safe to pass down through context without breaking memoized children.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> <code>useReducer</code> + <code>useContext</code> is the standard dependency-free "global state" pattern: put <code>state</code> in one context and <code>dispatch</code> in another, so components that only dispatch never re-render when state changes.</div>
+
+<h2><code>useLayoutEffect</code> vs <code>useEffect</code></h2>
+<table>
+  <thead><tr><th></th><th><code>useEffect</code></th><th><code>useLayoutEffect</code></th></tr></thead>
+  <tbody>
+    <tr><td>Runs</td><td>After paint</td><td>After DOM mutation, <strong>before</strong> paint</td></tr>
+    <tr><td>Blocks paint</td><td>No</td><td>Yes — synchronous</td></tr>
+    <tr><td>Use for</td><td>Everything (default)</td><td>Measuring or mutating layout to avoid a visible flicker</td></tr>
+  </tbody>
+</table>
+<pre><code>useLayoutEffect(() =&gt; {
+  const { height } = ref.current.getBoundingClientRect();
+  setTooltipTop(height &gt; space ? top - height : top);   // reposition before the user sees it
+}, [content]);</code></pre>
+<p>With <code>useEffect</code> the tooltip would paint in the wrong place for one frame and then jump. With <code>useLayoutEffect</code> React runs the measurement and the resulting re-render before the browser paints, so only the corrected position is ever shown.</p>
+<div class="callout warn"><strong>Gotcha:</strong> it blocks painting, so heavy work here freezes the frame. And it does <strong>not run during server rendering</strong> — there is no layout on the server — which produces the familiar "useLayoutEffect does nothing on the server" warning. Default to <code>useEffect</code>; reach for the layout variant only when you have an actual flicker.</div>
+
+<h2><code>forwardRef</code> and <code>useImperativeHandle</code></h2>
+<p>Refs are not props in React 18: passing <code>ref</code> to a function component does nothing unless the component is wrapped in <code>forwardRef</code>. <code>useImperativeHandle</code> then lets you decide <em>what</em> the ref exposes, instead of handing out the raw DOM node.</p>
+<pre><code>const Modal = forwardRef(function Modal(props, ref) {
+  const dialog = useRef(null);
+  useImperativeHandle(ref, () =&gt; ({
+    open:  () =&gt; dialog.current.showModal(),
+    close: () =&gt; dialog.current.close(),
+  }), []);                            // deps: recreate the handle only if these change
+  return &lt;dialog ref={dialog}&gt;{props.children}&lt;/dialog&gt;;
+});
+
+// parent
+modalRef.current.open();              // a narrow, intentional API — no innerHTML access
+</code></pre>
+<div class="callout"><strong>React 19:</strong> <code>ref</code> is a normal prop for function components, so <code>function Modal({ ref })</code> works and <code>forwardRef</code> is no longer needed (it stays supported, and is deprecated going forward). <code>useImperativeHandle</code> is unchanged and still the way to expose a curated handle.</div>
+<p>Use it sparingly. Imperative handles are for things declarative props cannot express: <code>focus()</code>, <code>scrollIntoView()</code>, <code>play()</code>, opening a native dialog. Anything that is really state should be a prop.</p>
+
+<h2><code>useId</code></h2>
+<pre><code>const id = useId();
+&lt;label htmlFor={id}&gt;Email&lt;/label&gt;
+&lt;input id={id} /&gt;</code></pre>
+<p>Generates an identifier that is <strong>stable between the server-rendered HTML and the client hydration</strong>, which a counter or <code>Math.random()</code> is not — a mismatch there breaks hydration. One call can supply several ids by suffixing: <code>{`${id}-email`}</code>, <code>{`${id}-name`}</code>.</p>
+<p><code>useId</code> is <em>not</em> for list keys. Keys must come from the data's own identity so React can match items across renders; a per-component id tells React nothing about which row is which.</p>
+
+<h2>Concurrent hooks: <code>useTransition</code> and <code>useDeferredValue</code></h2>
+<p>React 18's concurrent renderer can prepare a render <em>in the background</em> and interrupt it when something more urgent arrives. These two hooks are how you mark work as interruptible.</p>
+<pre><code>const [isPending, startTransition] = useTransition();
+
+function onChange(e) {
+  setQuery(e.target.value);                       // urgent: the input must feel instant
+  startTransition(() =&gt; setResults(filter(e.target.value)));   // non-urgent: interruptible
+}
+{isPending &amp;&amp; &lt;Spinner /&gt;}</code></pre>
+<p>Without a transition, one keystroke triggers one blocking render of a 10,000-row list, and the caret lags behind the typing. With it, the input updates immediately and the list render is thrown away and restarted as each new key arrives.</p>
+<pre><code>const deferredQuery = useDeferredValue(query);    // lags one render behind
+const results = useMemo(() =&gt; filter(deferredQuery), [deferredQuery]);</code></pre>
+<table>
+  <thead><tr><th><code>useTransition</code></th><th><code>useDeferredValue</code></th></tr></thead>
+  <tbody>
+    <tr><td>You control the state update that causes the work</td><td>You only receive the value (e.g. a prop)</td></tr>
+    <tr><td>Wrap the <code>setState</code> call</td><td>Wrap the value</td></tr>
+    <tr><td>Gives you <code>isPending</code></td><td>Compare <code>value !== deferredValue</code> for a stale hint</td></tr>
+  </tbody>
+</table>
+<pre class="mermaid">
+flowchart TD
+  K["Keystroke arrives"] --> U["Urgent: input value updates and paints"]
+  K --> T["Transition: filtered list renders in background"]
+  T --> N["Next keystroke interrupts and discards it"]
+  N --> F["Only the final render commits"]
+</pre>
+<p>Two limits worth knowing: updates inside <code>startTransition</code> must be synchronous, and transitions do not help a controlled input — never wrap the input's own value update, or the field itself will lag.</p>
+
+<h2><code>useSyncExternalStore</code> and tearing</h2>
+<pre><code>const value = useSyncExternalStore(
+  subscribe,          // (onStoreChange) =&gt; unsubscribe
+  getSnapshot,        // () =&gt; current value, must be cached/immutable
+  getServerSnapshot?, // optional, for SSR/hydration
+);</code></pre>
+<p><strong>Tearing</strong> is the concurrent-rendering hazard this hook exists to prevent: because React can pause a render mid-tree, an external store that mutates during that pause can be read with one value by the components rendered before the pause and a different value by those rendered after. The single committed frame then shows two inconsistent values for the same piece of state — the UI is "torn".</p>
+<p>State inside React cannot tear, because React renders from a consistent snapshot. Anything outside — a Redux store, a Zustand store, <code>window.matchMedia</code>, <code>navigator.onLine</code>, a raw event emitter — can. <code>useSyncExternalStore</code> forces those reads to be consistent within a commit and re-renders synchronously if the store changed underneath.</p>
+<pre><code>function useOnlineStatus() {
+  return useSyncExternalStore(
+    (cb) =&gt; {
+      window.addEventListener('online', cb);
+      window.addEventListener('offline', cb);
+      return () =&gt; {
+        window.removeEventListener('online', cb);
+        window.removeEventListener('offline', cb);
+      };
+    },
+    () =&gt; navigator.onLine,     // client snapshot
+    () =&gt; true,                 // server snapshot
+  );
+}</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> <code>getSnapshot</code> must return a cached value. Returning a fresh object or array each call means <code>Object.is</code> always reports a change and React throws "The result of getSnapshot should be cached to avoid an infinite loop."</div>
+<p>You rarely call this directly — it is the integration point library authors use. Redux, Zustand and Jotai already build on it, which is how they became concurrent-safe.</p>
+
+<h2>React 19 additions (clearly labelled)</h2>
+<ul>
+  <li><strong><code>use(promiseOrContext)</code></strong> — reads a promise or a context. Unlike other hooks it <em>may</em> be called conditionally and inside loops. With a promise it suspends the component until the promise resolves, integrating with Suspense and error boundaries.</li>
+  <li><strong><code>useOptimistic(state, updateFn)</code></strong> — shows an optimistic value while an async action is in flight, and automatically reverts to the real state when it settles.</li>
+  <li><strong><code>useActionState(action, initialState)</code></strong> — wraps a form action, returning <code>[state, formAction, isPending]</code>; pairs with <code>&lt;form action={formAction}&gt;</code> and Server Actions.</li>
+</ul>
+<p>Also in 19: <code>ref</code> as a regular prop, ref callbacks that can return a cleanup function, and the React Compiler (separate, opt-in) which auto-memoizes and removes most manual <code>useMemo</code>/<code>useCallback</code>.</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>When would you choose <code>useReducer</code> over <code>useState</code>?</summary><p>When several fields change together, when transitions are driven by named events rather than raw values (state-machine-shaped state), or when you want the transition logic unit-testable outside the component. A reducer is a pure function, so every transition can be tested with no renderer at all. <code>dispatch</code> also has a stable identity, which keeps memoized children and dependency arrays clean.</p></details>
+  <details><summary>Why must a reducer be pure?</summary><p>React may call it more than once for the same action — StrictMode double-invokes it in development, and concurrent rendering can replay work. Side effects would then run twice or produce different results. Keep fetches, timers, randomness and timestamps out; pass them in on the action payload.</p></details>
+  <details><summary><code>useEffect</code> or <code>useLayoutEffect</code>?</summary><p><code>useEffect</code> by default: it runs after paint and never blocks the frame. <code>useLayoutEffect</code> runs synchronously after DOM mutation but before paint, so use it only to measure or adjust layout when otherwise the user would see a flicker. It blocks painting and does not run during server rendering.</p></details>
+  <details><summary>What is tearing, and how does <code>useSyncExternalStore</code> prevent it?</summary><p>Concurrent rendering can pause mid-tree. If an external store mutates during that pause, components rendered before and after read different values and one committed frame shows inconsistent state. <code>useSyncExternalStore</code> subscribes and reads through a cached snapshot, forcing a consistent read within a commit and re-rendering synchronously if the store changed. React's own state cannot tear.</p></details>
+  <details><summary><code>useTransition</code> vs <code>useDeferredValue</code>?</summary><p>Same mechanism, different entry point. Use <code>useTransition</code> when you own the state update — wrap the <code>setState</code> in <code>startTransition</code> and use <code>isPending</code> for a spinner. Use <code>useDeferredValue</code> when you only have the value, typically a prop: it renders with the old value first and re-renders with the new one at low priority.</p></details>
+  <details><summary>Why not just use a counter for element ids?</summary><p>Server and client would generate different sequences and hydration would mismatch. <code>useId</code> derives an id from the component's position in the tree, so it is identical on both. It must not be used for list keys, which need to come from the data's identity.</p></details>
+  <details><summary>How do you expose an imperative API from a child component?</summary><p><code>useImperativeHandle</code> defines exactly what the parent's ref receives — <code>{ open, close }</code> rather than the DOM node — keeping the surface narrow. In React 18 the component must be wrapped in <code>forwardRef</code>; in React 19 <code>ref</code> is a normal prop so <code>forwardRef</code> is unnecessary.</p></details>
+</div>

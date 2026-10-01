@@ -3,6 +3,23 @@
    Also handles the persisted dark-mode toggle. */
 
 const MODULES = {
+  "EY GDS — Cloud Native (AWS)": {
+    folder: "interviews", divider: "Interviews",
+    items: [
+      ["ey-playbook",              "① Interview playbook",        "round structure, answer shape, opening script"],
+      ["ey-aws-compute-storage",   "② AWS: Compute & Storage",    "EC2 · EKS · Lambda · S3 · ASG · Spot"],
+      ["ey-aws-data",              "③ AWS: RDS & DynamoDB",       "Multi-AZ, replicas, partition keys, GSI"],
+      ["ey-aws-network-security",  "④ AWS: VPC, IAM & Security",  "subnets, SG vs NACL, roles, secrets"],
+      ["ey-aws-integration",       "⑤ AWS: API GW, SQS, SNS",     "event-driven, idempotency, DLQ, saga"],
+      ["ey-nodejs",                "⑥ Node.js & TypeScript",      "event loop, streams, errors, memory, TS"],
+      ["ey-microservices",         "⑦ Microservices & APIs",      "boundaries, REST design, resiliency, observability"],
+      ["ey-iac-cicd",              "⑧ IaC, CI/CD & Testing",      "Terraform vs CFN, state, drift, pipelines"],
+      ["ey-wellarchitected-cost",  "⑨ Well-Architected & Cost",   "6 pillars, DR, security, cost levers"],
+      ["ey-scenarios",             "⑩ Scenario & Design round",   "order system, debug slow API, migration"],
+      ["ey-behavioural",           "⑪ Behavioural & HR",          "STAR stories, why EY, managerial round"],
+      ["ey-rapid-fire",            "⑫ 60-min rapid revision",     "one-liner drill — read this last"]
+    ]
+  },
   "JavaScript": {
     folder: "javascript", divider: "Language & Frameworks",
     items: [
@@ -66,6 +83,27 @@ const MODULES = {
       ["request-lifecycle", "Lifecycle features",      "middleware, guards, pipes, interceptors"],
       ["exception-filters", "Exception filters",       "centralized error handling"],
       ["features",          "Ecosystem & features",    "TypeORM, GraphQL, microservices"]
+    ]
+  },
+  "React": {
+    folder: "react",
+    items: [
+      ["overview",             "React overview",          "declarative UI, VDOM, why React"],
+      ["jsx-rendering",        "JSX & rendering",         "elements, lists, keys, conditionals"],
+      ["components-props",     "Components & props",      "composition, purity, one-way data"],
+      ["state",                "State & useState",        "batching, immutability, snapshots"],
+      ["effects",              "useEffect & lifecycle",   "deps, cleanup, StrictMode"],
+      ["hooks",                "Hooks: rules, refs, memo","call order, useRef, useMemo, custom"],
+      ["advanced-hooks",       "Advanced hooks",          "useReducer, transitions, external stores"],
+      ["context-state",        "Context & state mgmt",    "prop drilling, Redux vs Zustand vs Query"],
+      ["forms-events",         "Forms & events",          "controlled vs uncontrolled, synthetic"],
+      ["data-fetching",        "Data fetching",           "race conditions, caching, React Query"],
+      ["performance",          "Performance & re-renders","memo, profiling, virtualization"],
+      ["reconciliation-fiber", "Reconciliation & Fiber",  "diffing, keys, render vs commit"],
+      ["patterns",             "Component patterns",      "error boundaries, portals, HOC, hooks"],
+      ["routing",              "Routing (React Router)",  "nested routes, params, loaders"],
+      ["testing",              "Testing React",           "RTL queries, user-event, MSW"],
+      ["ssr-rsc",              "SSR, hydration & RSC",    "CSR/SSR/SSG, streaming, server components"]
     ]
   },
   "SQL": {
@@ -173,6 +211,58 @@ const MODULES = {
       ["chatgpt",             "How LLMs Like ChatGPT Work",    "tokens, autoregression, sampling"]
     ]
   },
+  "AWS — Compute & Containers": {
+    link: "aws.html#service/", divider: "AWS Services", collapsed: true,
+    items: [
+      ["ec2",    "EC2",    "virtual machines · ASG · instance roles"],
+      ["ecs",    "ECS",    "containers on Fargate behind the ALB"],
+      ["lambda", "Lambda", "serverless functions · event handlers"],
+      ["ecr",    "ECR",    "private container image registry"]
+    ]
+  },
+  "AWS — Identity & Security": {
+    link: "aws.html#service/", collapsed: true,
+    items: [
+      ["iam",             "IAM",             "users · groups · roles · policies"],
+      ["security-groups", "Security Groups", "stateful firewall · SG chain"],
+      ["authorization",   "Authorization",   "end-user AuthN/AuthZ · JWT · Cognito"],
+      ["nacl",            "NACL",            "stateless subnet firewall"]
+    ]
+  },
+  "AWS — Networking": {
+    link: "aws.html#service/", collapsed: true,
+    items: [
+      ["vpc",          "VPC",                 "your isolated network"],
+      ["cidr",         "CIDR",                "/16, /24, IP planning"],
+      ["subnets",      "Subnets",             "public · private app · private DB"],
+      ["route-tables", "Route Tables",        "0.0.0.0/0 → IGW / NAT"],
+      ["igw",          "Internet Gateway",    "VPC ↔ internet door"],
+      ["nat-gateway",  "NAT Gateway",         "outbound-only internet for private subnets"],
+      ["alb",          "ALB",                 "Layer 7 load balancer"],
+      ["nlb",          "NLB",                 "Layer 4 load balancer · static IPs"],
+      ["api-gateway",  "API Gateway",         "managed API front door → Lambda"],
+      ["cloudfront",   "CloudFront / CDN",    "global edge cache + TLS + WAF"]
+    ]
+  },
+  "AWS — Integration & Scaling": {
+    link: "aws.html#service/", collapsed: true,
+    items: [
+      ["step-functions", "Step Functions", "workflows · sagas · retries"],
+      ["sqs",            "SQS",            "queues · DLQ · workers"],
+      ["sns",            "SNS",            "pub/sub · fan-out · notifications"],
+      ["eventbridge",    "EventBridge",    "event bus · rules · targets"],
+      ["auto-scaling",   "Auto Scaling",   "ECS service scaling · EC2 ASG"]
+    ]
+  },
+  "AWS — Data, Storage & Monitoring": {
+    link: "aws.html#service/", collapsed: true,
+    items: [
+      ["rds",        "RDS",        "managed PostgreSQL/MySQL · Multi-AZ"],
+      ["dynamodb",   "DynamoDB",   "serverless key/value · carts · sessions"],
+      ["s3",         "S3",         "object storage · static site · images"],
+      ["cloudwatch", "CloudWatch", "metrics · logs · alarms · dashboards"]
+    ]
+  },
   "Exercises": {
     folder: "exercises", collapsed: true, divider: "Practice · Requirements",
     items: [
@@ -208,12 +298,19 @@ const search  = document.getElementById("search");
 const flat = {};
 const keyOf = (folder, slug) => `${folder}::${slug}`;
 
-function renderItems(parent, { folder, items }) {
+function renderItems(parent, { folder, items, link }) {
   items.forEach(([slug, name, blurb]) => {
-    const key = keyOf(folder, slug);
-    flat[key] = { folder, slug, name, blurb };
     const a = document.createElement("a");
     a.className = "nav-item";
+    if (link) {
+      // External page (e.g. the AWS Services designer): plain link, no in-page loading.
+      a.href = link + slug;
+      a.innerHTML = `${name}<small>${blurb}</small>`;
+      parent.appendChild(a);
+      return;
+    }
+    const key = keyOf(folder, slug);
+    flat[key] = { folder, slug, name, blurb };
     a.dataset.key = key;
     a.href = "#" + key;
     a.innerHTML = `${name}<small>${blurb}</small>`;

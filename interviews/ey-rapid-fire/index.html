@@ -1,0 +1,104 @@
+<h1>60-Minute Rapid Revision <span class="tag express">EY Sheet 12</span></h1>
+<p>Read this last, on the morning of the interview. One-line answers only — enough to trigger recall of the full answer from the other sheets. If a line here doesn't immediately unpack into 60 seconds of speech, that's the sheet you go back to.</p>
+<div class="callout tip"><strong>Drill method:</strong> read the question, say the answer <em>out loud</em> before reading the answer column, then check. Silent reading creates recognition, not recall — and in the interview you need recall. Twenty minutes of this beats two hours of re-reading.</div>
+
+<h2>AWS — one-liners</h2>
+<table class="sheet">
+  <tr><th>Question</th><th>Answer in one line</th></tr>
+  <tr><td>Lambda vs Fargate vs EC2</td><td>Spiky/event-driven → Lambda; steady always-on → Fargate; OS control or licensing → EC2.</td></tr>
+  <tr><td>Lambda hard limits</td><td>15-min timeout, 10 GB memory, 512 MB–10 GB ephemeral <code>/tmp</code>, 6 MB sync payload, 1,000 default concurrency.</td></tr>
+  <tr><td>Cold start fix</td><td>Smaller bundle, init at module scope, more memory (= more CPU), provisioned concurrency for known peaks.</td></tr>
+  <tr><td>Reserved vs provisioned concurrency</td><td>Reserved = guaranteed <em>and capped</em> slice of account limit; provisioned = pre-warmed environments, no cold start.</td></tr>
+  <tr><td>Lambda + RDS problem</td><td>Connection exhaustion → RDS Proxy, reserved concurrency, connection at module scope.</td></tr>
+  <tr><td>SQS vs SNS</td><td>SQS = one message, one consumer, pull, durable. SNS = one message, all subscribers, push, no retention.</td></tr>
+  <tr><td>Best fan-out pattern</td><td>SNS/EventBridge → one SQS queue per consumer → workers. Broadcast plus per-consumer durability and DLQ.</td></tr>
+  <tr><td>EventBridge vs SNS</td><td>EventBridge adds content-based routing rules, schema registry, SaaS/AWS event sources, scheduling.</td></tr>
+  <tr><td>Kinesis vs SQS</td><td>Kinesis = ordered, replayable, multiple independent consumers with their own offsets. SQS = delete-on-process, no replay.</td></tr>
+  <tr><td>Visibility timeout</td><td>How long a received message is hidden. Shorter than processing time → duplicate concurrent processing.</td></tr>
+  <tr><td>DLQ</td><td>Queue for messages failing <code>maxReceiveCount</code> times. <strong>Always alarm on depth &gt; 0.</strong></td></tr>
+  <tr><td>Exactly-once</td><td>Doesn't exist. At-least-once delivery + idempotent consumers via a conditional write to a dedup store.</td></tr>
+  <tr><td>Dual-write problem</td><td>DB write + publish aren't atomic → transactional outbox, or DynamoDB Streams as the outbox.</td></tr>
+  <tr><td>SG vs NACL</td><td>SG = stateful, ENI-level, allow-only. NACL = stateless, subnet-level, allow <em>and</em> deny; must open ephemeral ports.</td></tr>
+  <tr><td>Public vs private subnet</td><td>Public = route <code>0.0.0.0/0 → IGW</code>. Private = route to NAT Gateway. Isolated = no internet route at all.</td></tr>
+  <tr><td>NAT Gateway risk</td><td>One per AZ or an AZ failure kills egress everywhere; costs hourly + per-GB processing. Use VPC endpoints for S3/DynamoDB.</td></tr>
+  <tr><td>Peering vs TGW vs PrivateLink</td><td>Peering = 1:1, non-transitive. TGW = hub-and-spoke for an estate. PrivateLink = one service, overlapping CIDRs OK.</td></tr>
+  <tr><td>How EC2 gets credentials</td><td>Instance profile → role → IMDSv2 at 169.254.169.254 → short-lived STS creds, auto-rotated by the SDK.</td></tr>
+  <tr><td>IAM evaluation</td><td>Explicit deny wins → SCP ceiling → identity + resource policy → permission boundary → session policy → default deny.</td></tr>
+  <tr><td>Trust vs permission policy</td><td>Trust = <em>who</em> can assume the role. Permission = <em>what</em> the session can do.</td></tr>
+  <tr><td>Multi-AZ vs read replica</td><td>Multi-AZ = availability, synchronous, standby <strong>not readable</strong>. Replica = read scaling, asynchronous, has lag.</td></tr>
+  <tr><td>Aurora difference</td><td>Shared distributed storage, 6 copies / 3 AZs, quorum writes; replicas share storage so lag is milliseconds.</td></tr>
+  <tr><td>DynamoDB hot partition</td><td>Low-cardinality or time-based key concentrates traffic → higher-cardinality key or write sharding with a suffix.</td></tr>
+  <tr><td>LSI vs GSI</td><td>LSI = same PK, different SK, create-time only, strongly consistent. GSI = different PK, add anytime, eventually consistent.</td></tr>
+  <tr><td>GSI gotcha</td><td>A throttled GSI can throttle writes to the base table. Project only the attributes you need.</td></tr>
+  <tr><td>S3 consistency</td><td>Strong read-after-write for all ops since Dec 2020. Still no multi-object atomicity.</td></tr>
+  <tr><td>Big browser upload</td><td>Pre-signed multipart URLs → direct to S3 → S3 event → SQS → worker. Never proxy the bytes.</td></tr>
+  <tr><td>S3 hidden cost</td><td>Incomplete multipart uploads and non-current versions. Lifecycle rules for both.</td></tr>
+  <tr><td>API Gateway REST vs HTTP</td><td>HTTP API = cheaper, faster, default. REST API = mapping templates, API keys, usage plans, WAF, caching, request validation.</td></tr>
+  <tr><td>Step Functions</td><td>Managed orchestration: retries with backoff, catch branches, Map/Parallel, and a visible per-execution history.</td></tr>
+  <tr><td>Saga</td><td>Local transactions with semantic compensations. Compensations must be idempotent; do irreversible steps last.</td></tr>
+  <tr><td>Six W-A pillars</td><td>Operational Excellence, Security, Reliability, Performance Efficiency, Cost Optimization, Sustainability.</td></tr>
+  <tr><td>Shared responsibility</td><td>AWS secures <em>of</em> the cloud; you secure <em>in</em> the cloud. The line moves right as you go IaaS → serverless.</td></tr>
+  <tr><td>Top surprise costs</td><td>Egress + NAT processing, cross-AZ transfer, CloudWatch Logs with no retention, idle/orphaned resources, S3 versions.</td></tr>
+</table>
+
+<h2>Node.js &amp; TypeScript — one-liners</h2>
+<table class="sheet">
+  <tr><th>Question</th><th>Answer in one line</th></tr>
+  <tr><td>Event loop phases</td><td>timers → pending → idle/prepare → <strong>poll</strong> → check (<code>setImmediate</code>) → close. Microtasks drain between every one.</td></tr>
+  <tr><td>Microtask order</td><td><code>process.nextTick</code> queue drains fully, then the promise queue — after every callback and every phase.</td></tr>
+  <tr><td>libuv thread pool</td><td>Default 4 threads. Used by fs, DNS <code>getaddrinfo</code>, and some crypto — <em>not</em> by network sockets.</td></tr>
+  <tr><td>Why blocking matters</td><td>A 200 ms sync call stalls every concurrent request on that process, not just its own.</td></tr>
+  <tr><td>CPU-bound work</td><td>Queue it to a worker; or worker threads with a pool; or chunk with <code>setImmediate</code>. Cluster raises throughput but doesn't unblock a single slow request.</td></tr>
+  <tr><td>Backpressure</td><td><code>write()</code> returns false past <code>highWaterMark</code> → wait for <code>'drain'</code>. Use <code>pipeline()</code>, which also propagates errors and cleans up.</td></tr>
+  <tr><td>Operational vs programmer error</td><td>Operational = handle (retry, 4xx/5xx). Programmer = log and crash; the process state is untrustworthy.</td></tr>
+  <tr><td>unhandledRejection</td><td>Log with context, then exit. Let the orchestrator restart a clean process.</td></tr>
+  <tr><td>Memory leak suspects</td><td>Unbounded Map/cache, per-request listeners on a long-lived emitter, missing backpressure, timers holding objects.</td></tr>
+  <tr><td>Leak diagnosis</td><td>Two heap snapshots under load, diff by retained size, follow the retainer path.</td></tr>
+  <tr><td>TypeScript's limit</td><td>Types are erased at runtime — validate every boundary with zod/io-ts and derive the type from the schema.</td></tr>
+  <tr><td>unknown vs any</td><td><code>any</code> disables checking and spreads; <code>unknown</code> forces you to narrow before use.</td></tr>
+  <tr><td>never</td><td>Bottom type — used for exhaustiveness checks so a new union member becomes a compile error.</td></tr>
+  <tr><td>AsyncLocalStorage</td><td>Propagates request context (correlation ID, tenant) through async calls without threading a parameter everywhere.</td></tr>
+  <tr><td>Resilient HTTP call</td><td>Timeout + backoff with jitter + idempotency + circuit breaker + bulkhead + keep-alive agent.</td></tr>
+</table>
+
+<h2>Architecture &amp; delivery — one-liners</h2>
+<table class="sheet">
+  <tr><th>Question</th><th>Answer in one line</th></tr>
+  <tr><td>Service boundary test</td><td>Can it deploy without coordinating a release with another team? If not, it's one service.</td></tr>
+  <tr><td>Distributed monolith</td><td>Services split by technical layer or sharing a database — all the cost of distribution, none of the independence.</td></tr>
+  <tr><td>Strangler fig</td><td>Proxy seam in front of the monolith → extract one capability → shift traffic gradually → <strong>delete the old code</strong>.</td></tr>
+  <tr><td>7 Rs</td><td>Retire, Retain, Rehost, Relocate, Replatform, Repurchase, Refactor.</td></tr>
+  <tr><td>Zero-downtime schema change</td><td>Expand → migrate (dual-write + backfill) → contract. Never rename in place.</td></tr>
+  <tr><td>Cascading failure defences</td><td>Timeouts, circuit breakers, bulkheads, backoff with jitter + retry budget, load shedding, graceful degradation.</td></tr>
+  <tr><td>Observability signals</td><td>Metrics (RED/USE), structured logs with correlation IDs, distributed traces. Alert on percentiles, never averages.</td></tr>
+  <tr><td>Liveness vs readiness</td><td>Liveness = is the process alive. Readiness = can it serve traffic yet. Both, or deploys drop requests.</td></tr>
+  <tr><td>Graceful shutdown</td><td>On SIGTERM: stop accepting, drain in-flight, deregister from the target group, exit.</td></tr>
+  <tr><td>Blue/green vs canary</td><td>Blue/green = instant rollback, double cost. Canary = best risk control, needs trustworthy metrics + auto-rollback.</td></tr>
+  <tr><td>Cache stampede</td><td>Hot key expires, everything misses at once → single-flight lock or probabilistic early expiry.</td></tr>
+  <tr><td>Terraform state</td><td>Config → real resource IDs. Contains plaintext secrets; needs encryption, locking, versioning; split by blast radius.</td></tr>
+  <tr><td>Drift</td><td>Reality ≠ code. Detect with scheduled <code>plan</code>; back-port emergency console fixes into code rather than reverting blindly.</td></tr>
+  <tr><td>Pipeline principle</td><td>Build once, promote the same artifact through every environment. Never rebuild per environment.</td></tr>
+  <tr><td>CI credentials</td><td>OIDC federation → short-lived STS role per environment. No long-lived access keys in CI.</td></tr>
+  <tr><td>Idempotency key</td><td>Client-supplied key stored with the response; a retry replays the stored response instead of re-executing.</td></tr>
+  <tr><td>Cursor vs offset pagination</td><td>Offset scans and discards rows and shifts under inserts; cursor/keyset is stable and constant-time.</td></tr>
+</table>
+
+<h2>The five sentences to have ready verbatim</h2>
+<div class="callout tip">
+<p><strong>1. Opening.</strong> "I'm a backend engineer with ~N years, primarily Node.js and TypeScript on AWS, currently owning &lt;services&gt; end-to-end including the pipeline and the alarms."</p>
+<p><strong>2. Choosing compute.</strong> "I pick by traffic shape and operational appetite: spiky and event-driven → Lambda, steady always-on → Fargate, OS control or licensing → EC2."</p>
+<p><strong>3. Event-driven.</strong> "Everything is at-least-once, so consumers are idempotent by design — conditional write to a dedup store before the side effect, and the side effect and the dedup record in the same transaction."</p>
+<p><strong>4. Opening a design question.</strong> "Before I design anything — what's the scale, and what's the latency requirement? And is this greenfield or fitting into an existing estate?"</p>
+<p><strong>5. When you don't know.</strong> "I haven't run that in production. My working assumption would be X, and I'd verify by checking Y — is that the direction you're thinking?"</p>
+</div>
+
+<h2>Final checks, 30 minutes before</h2>
+<ul>
+<li>Chrome open, not incognito. Camera, mic and screen share tested.</li>
+<li>JD open on a second screen. This sheet and your three stories on one page beside you.</li>
+<li>Your compensation number and notice period written down.</li>
+<li>Two questions to ask them, written down.</li>
+<li>Pen and paper for the design question.</li>
+<li>Water. Phone on silent. Hotspot ready as a network fallback.</li>
+</ul>
+<div class="callout warn"><strong>Last thing:</strong> the round is won on structure, not on knowing more services. Clarify before designing, name the trade-off, quantify where you can, and say "I don't know" cleanly when you don't. That profile passes senior rounds even with gaps; encyclopaedic knowledge delivered as a list does not.</div>

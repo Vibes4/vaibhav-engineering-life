@@ -1,0 +1,174 @@
+<h1>Testing React <span class="tag react">React</span></h1>
+<p><strong>The one rule:</strong> "The more your tests resemble the way your software is used, the more confidence they can give you" — Kent C. Dodds. React Testing Library exists to make the easy path the user-facing path: it deliberately gives you no API for reading state, props, or a component's internals, because a test that asserts on those breaks the moment you refactor, without the app ever having been broken.</p>
+<p>Concretely: find elements the way a user or a screen reader would (by role and accessible name), interact with them the way a user does (real event sequences), and assert on what is visible on screen. Everything below follows from that.</p>
+
+<h2>Philosophy: test behaviour, not implementation</h2>
+<p>Enzyme let you call <code>wrapper.instance().setState()</code> and assert <code>wrapper.state('count') === 1</code>. Two problems: renaming <code>count</code> to <code>total</code> fails the test although nothing broke (a <em>false negative</em>), and the test passes even when the number never reaches the screen (a <em>false positive</em>). RTL removes both by removing the access.</p>
+<pre><code>import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+
+test('adds an item to the list', async () =&gt; {
+  const user = userEvent.setup();
+  render(&lt;TodoApp /&gt;);
+
+  await user.type(screen.getByRole('textbox', { name: /new todo/i }), 'Buy milk');
+  await user.click(screen.getByRole('button', { name: /add/i }));
+
+  expect(await screen.findByText('Buy milk')).toBeInTheDocument();
+});</code></pre>
+<p>Nothing in that test knows whether <code>TodoApp</code> uses <code>useState</code>, <code>useReducer</code>, Redux or a server action. Rewrite the internals entirely and the test still passes — which is the entire point.</p>
+<div class="callout"><strong>Note:</strong> <code>render</code> mounts into a real DOM (jsdom, or a browser with Vitest's browser mode). <code>screen</code> is just queries bound to <code>document.body</code> — prefer it over destructuring the return value of <code>render</code>, so tests do not silently miss content rendered in a portal.</div>
+
+<h2>Query priority — and why it doubles as an accessibility audit</h2>
+<p>RTL orders its queries by how closely they mirror how a user finds things. Go down the list only when the one above genuinely does not apply:</p>
+<table>
+  <thead><tr><th>#</th><th>Query</th><th>Finds</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>getByRole(role, { name })</code></td><td>Element by ARIA role + accessible name</td><td><strong>The default.</strong> Covers buttons, links, textboxes, headings, checkboxes, dialogs.</td></tr>
+    <tr><td>2</td><td><code>getByLabelText</code></td><td>Form field by its <code>&lt;label&gt;</code></td><td>How a user fills in a form.</td></tr>
+    <tr><td>3</td><td><code>getByPlaceholderText</code></td><td>Input by placeholder</td><td>Only when there is genuinely no label (there usually should be one).</td></tr>
+    <tr><td>4</td><td><code>getByText</code></td><td>Non-interactive text</td><td>Paragraphs, list items, error messages.</td></tr>
+    <tr><td>5</td><td><code>getByDisplayValue</code></td><td>Input by its current value</td><td>Prefilled forms.</td></tr>
+    <tr><td>6</td><td><code>getByAltText</code> / <code>getByTitle</code></td><td>Images, iframes</td><td>Semantic-ish fallbacks.</td></tr>
+    <tr><td>7</td><td><code>getByTestId</code></td><td><code>data-testid</code></td><td><strong>Last resort.</strong> Invisible to users and to assistive tech.</td></tr>
+  </tbody>
+</table>
+<p>The accessibility payoff is real: if you cannot reach a control with <code>getByRole('button', { name: /save/i })</code>, a screen-reader user cannot reach it either. A <code>&lt;div onClick&gt;</code> has no role and no name; an icon-only button with no <code>aria-label</code> has a role but no name. Fixing the test fixes the app.</p>
+<pre><code>// ❌ couples the test to markup and hides a real a11y bug
+screen.getByTestId('submit-btn');
+
+// ✅ fails loudly until the button is actually a labelled button
+screen.getByRole('button', { name: /submit order/i });
+
+screen.getByRole('heading', { level: 2, name: /orders/i });
+screen.getByRole('checkbox', { name: /remember me/i, checked: true });
+screen.getByRole('textbox', { name: /email/i });</code></pre>
+<div class="callout tip"><strong>Senior tip:</strong> When a query fails, RTL prints the DOM — and <code>screen.logTestingPlaygroundURL()</code> or <code>getRoles(container)</code> tells you what roles actually exist. <code>data-testid</code> is not forbidden; it is the right tool for a chart canvas or a wrapper with no semantics. It is just never the <em>first</em> tool.</div>
+
+<h2>getBy vs queryBy vs findBy (and the <code>All</code> variants)</h2>
+<table>
+  <thead><tr><th>Prefix</th><th>Not found</th><th>Found</th><th>Async?</th><th>Use for</th></tr></thead>
+  <tbody>
+    <tr><td><code>getBy*</code></td><td><strong>Throws</strong> (with the DOM printed)</td><td>Element</td><td>No</td><td>Asserting something IS there, now</td></tr>
+    <tr><td><code>queryBy*</code></td><td>Returns <code>null</code></td><td>Element</td><td>No</td><td><strong>Only</strong> way to assert absence</td></tr>
+    <tr><td><code>findBy*</code></td><td>Rejects after timeout (1000&nbsp;ms)</td><td>Promise&lt;Element&gt;</td><td>Yes</td><td>Something that appears later</td></tr>
+  </tbody>
+</table>
+<p><code>getAllBy</code>/<code>queryAllBy</code>/<code>findAllBy</code> return arrays; the singular forms throw if <em>more than one</em> element matches, which is a useful accident-detector.</p>
+<pre><code>// ✅ present
+expect(screen.getByRole('alert')).toHaveTextContent(/failed/i);
+
+// ✅ absent — getBy would throw before expect ever runs
+expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+// ❌ this ALWAYS passes: findBy returns a promise, and a promise is truthy
+expect(screen.findByText('done')).toBeInTheDocument();
+// ✅
+expect(await screen.findByText('done')).toBeInTheDocument();</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> <code>await screen.findByX</code> is <code>waitFor(() =&gt; getByX)</code> under the hood, so it retries. There is no "waitFor it to be gone" version of <code>findBy</code> — use <code>await waitForElementToBeRemoved(() =&gt; screen.queryByText(/loading/i))</code>, which throws helpfully if the element was never there in the first place.</div>
+
+<h2>user-event over fireEvent</h2>
+<p><code>fireEvent.click(el)</code> dispatches exactly one synthetic <code>click</code>. A real click is a sequence: <code>pointerdown</code>, <code>mousedown</code>, <code>focus</code>, <code>pointerup</code>, <code>mouseup</code>, <code>click</code>. Typing is <code>keydown</code>, <code>keypress</code>, <code>input</code>, <code>keyup</code> per character, with selection and cursor bookkeeping in between.</p>
+<pre><code>const user = userEvent.setup();          // once per test, BEFORE render
+await user.click(button);                // every method is async in v14 — always await
+await user.type(input, 'hello{enter}');
+await user.keyboard('{Shift&gt;}{Tab}{/Shift}');
+await user.selectOptions(select, 'uk');
+await user.upload(fileInput, file);</code></pre>
+<ul>
+  <li>user-event respects reality: it refuses to type into a <code>disabled</code> or <code>readOnly</code> input, and clicking moves focus — so a test that passes with <code>fireEvent</code> can be broken for real users.</li>
+  <li>It catches bugs in <code>onFocus</code>/<code>onBlur</code>/<code>onKeyDown</code> handlers that <code>fireEvent.change</code> would skip entirely.</li>
+  <li>Keep <code>fireEvent</code> for events a user cannot perform directly: <code>scroll</code>, <code>resize</code>, a synthetic <code>animationend</code>, or a low-level event you need in isolation.</li>
+</ul>
+
+<h2>Async, and what the <code>act(...)</code> warning really means</h2>
+<pre><code>// three ways to wait, in order of preference
+const row = await screen.findByRole('row', { name: /ada/i });   // element appears
+await waitForElementToBeRemoved(() =&gt; screen.queryByText(/loading/i));
+await waitFor(() =&gt; expect(mockSave).toHaveBeenCalledTimes(1)); // non-DOM assertion</code></pre>
+<p><code>act()</code> is React's marker for "I am about to change state — flush effects and re-render before anyone looks at the DOM". <em>"An update to X was not wrapped in act(...)"</em> means state changed <strong>outside</strong> anything the test was awaiting: usually a promise resolving after the test finished, or a timer firing later. It is a real warning about a test that is inspecting a half-settled tree.</p>
+<ul>
+  <li>You almost never call <code>act</code> yourself — RTL wraps <code>render</code>, <code>user-event</code> and <code>fireEvent</code> in it already.</li>
+  <li>The cure is to <em>await</em> the resulting change (<code>findBy</code>/<code>waitFor</code>) instead of asserting immediately.</li>
+  <li>Fake timers? Advance them inside <code>act</code>, and pass <code>userEvent.setup({ advanceTimers: jest.advanceTimersByTime })</code>.</li>
+  <li>A warning after the test ended usually means a missing cleanup, an unaborted fetch, or a component updating after unmount — a genuine bug worth fixing.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> Never put a bare <code>expect</code> with side effects inside <code>waitFor</code>, and never <code>waitFor</code> around a whole block — it re-runs the callback until it passes, so a <code>user.click</code> in there can fire many times.</div>
+
+<h2>Mocking: modules, fetch, and why MSW wins</h2>
+<pre><code>// module mock — the component's dependency is swapped at import time
+jest.mock('../api/users', () =&gt; ({ getUsers: jest.fn().mockResolvedValue([{ id: 1 }]) }));
+
+// hand-rolled fetch stub — brittle: you now maintain a fake Response
+global.fetch = jest.fn().mockResolvedValue({ ok: true, json: async () =&gt; [] });</code></pre>
+<p><strong>MSW (Mock Service Worker)</strong> intercepts at the network layer instead, so your code runs its real <code>fetch</code>/axios call, real URL building, real headers, real JSON parsing, real error branches:</p>
+<pre><code>import { http, HttpResponse } from 'msw';
+import { setupServer } from 'msw/node';
+
+const server = setupServer(
+  http.get('/api/users', () =&gt; HttpResponse.json([{ id: 1, name: 'Ada' }])),
+);
+beforeAll(() =&gt; server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() =&gt; server.resetHandlers());
+afterAll(() =&gt; server.close());
+
+test('shows the error state', async () =&gt; {
+  server.use(http.get('/api/users', () =&gt; new HttpResponse(null, { status: 500 })));
+  render(&lt;Users /&gt;);
+  expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't load/i);
+});</code></pre>
+<ul>
+  <li>The same handlers work in tests, Storybook, and the browser during development.</li>
+  <li>Swapping axios for fetch does not touch a single test.</li>
+  <li>Error, empty and slow states become one-line overrides instead of new mock shapes.</li>
+  <li><code>onUnhandledRequest: 'error'</code> catches requests you forgot existed — a genuinely useful safety net.</li>
+</ul>
+
+<h2>Custom hooks, and what NOT to test</h2>
+<pre><code>import { renderHook, act } from '@testing-library/react';
+
+const { result, rerender } = renderHook(({ start }) =&gt; useCounter(start),
+                                        { initialProps: { start: 0 } });
+expect(result.current.count).toBe(0);
+act(() =&gt; result.current.increment());     // state updates go inside act
+expect(result.current.count).toBe(1);</code></pre>
+<p><code>renderHook</code> (in <code>@testing-library/react</code> since v13.1 — it used to be a separate package) is for hooks you ship as a library or that carry real logic. For a hook that only exists to serve one component, testing it <em>through</em> that component is more valuable: it proves the wiring too. Note <code>result.current</code> is a snapshot — re-read it after every update rather than destructuring once.</p>
+<h3>Do not test</h3>
+<ul>
+  <li><strong>State internals.</strong> "count is 1" matters only if the user can see it.</li>
+  <li><strong>Implementation details</strong> — that <code>useMemo</code> was used, that a child received a specific prop, how many times something rendered (unless render count <em>is</em> the requirement, e.g. a perf regression test).</li>
+  <li><strong>Third-party libraries.</strong> React Router, React Query and date-fns have their own test suites. Test <em>your</em> use of them.</li>
+  <li><strong>CSS classes as a proxy for behaviour.</strong> Assert on visible text, <code>toBeDisabled()</code>, <code>toBeVisible()</code>, <code>aria-*</code>.</li>
+</ul>
+<h3>Snapshots</h3>
+<p>The failure mode is well known: a 400-line snapshot nobody reads, and every diff is "resolved" with <code>-u</code>. That is a test that can never fail meaningfully. Keep snapshots small and intentional — <code>expect(el).toMatchInlineSnapshot()</code> on one node, a serialized reducer result, an error message — and write explicit assertions for anything you actually care about.</p>
+
+<h2>Jest vs Vitest, and the pyramid for a React app</h2>
+<table>
+  <thead><tr><th></th><th>Jest</th><th>Vitest</th></tr></thead>
+  <tbody>
+    <tr><td>Setup</td><td>Needs babel/ts-jest transform config</td><td>Reuses your Vite config and transforms</td></tr>
+    <tr><td>ESM</td><td>Historically painful</td><td>Native</td></tr>
+    <tr><td>Speed</td><td>Slower cold start</td><td>Fast, with real watch-mode HMR</td></tr>
+    <tr><td>API</td><td><code>jest.fn/mock/spyOn</code></td><td>Near drop-in: <code>vi.fn/mock/spyOn</code></td></tr>
+    <tr><td>Ecosystem</td><td>Huge, mature, CRA default</td><td>Newer; the default for Vite projects</td></tr>
+  </tbody>
+</table>
+<p>RTL is identical on both — it is testing-runner-agnostic. Pick Vitest for a Vite app, Jest for an existing Jest/Next.js/CRA codebase; it is not an architectural decision.</p>
+<pre class="mermaid">
+flowchart TD
+  E["E2E with Playwright or Cypress - few, slow, highest confidence"] --> I["Component and integration with RTL - the bulk"]
+  I --> U["Unit tests for pure logic - reducers, formatters, utils"]
+</pre>
+<p>The classic pyramid undersells the middle for React. Pure unit tests of a component's internals are cheap but prove little; E2E tests prove everything but are slow and flaky at volume. <strong>Component-integration tests</strong> — render a feature with its children and a mocked network, then drive it as a user — give the best confidence per second of CI time. Keep unit tests for genuinely pure logic (reducers, date maths, permission checks) and a thin E2E layer for the two or three flows that must never break: sign-in, checkout, the money path.</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why does Testing Library refuse to let you read state or props?</summary><p>Because assertions on internals produce both false negatives (a pure refactor fails the test) and false positives (state is right but never rendered). Restricting you to what is on screen means tests describe behaviour, survive refactors, and fail only when the user-visible contract breaks.</p></details>
+  <details><summary>What is the query priority order and why does it matter beyond tests?</summary><p><code>getByRole</code> with an accessible name first, then label, placeholder, text, display value, alt/title, and <code>getByTestId</code> last. Roles and accessible names are exactly what assistive tech uses, so a control you cannot query by role is a control a screen reader cannot describe — the test doubles as an accessibility check.</p></details>
+  <details><summary>getBy, queryBy or findBy?</summary><p><code>getBy</code> throws immediately and is for things that must already be there. <code>queryBy</code> returns null and is the only correct choice for asserting absence. <code>findBy</code> returns a promise that retries until a timeout, for elements that appear after async work — and must be awaited, since an un-awaited promise is truthy and the assertion silently always passes.</p></details>
+  <details><summary>Why prefer user-event over fireEvent?</summary><p><code>fireEvent</code> dispatches a single synthetic event; <code>user-event</code> reproduces the real sequence (pointer, mouse, focus, key, input events) and honours disabled/readonly and focus behaviour. That catches handler bugs and impossible interactions a lone <code>click</code> or <code>change</code> would miss. In v14 you call <code>userEvent.setup()</code> and await every interaction.</p></details>
+  <details><summary>What does the "not wrapped in act(...)" warning tell you?</summary><p>A state update happened outside anything the test awaited — typically a promise or timer resolving after the assertions or after the test ended, so the tree was inspected mid-update. RTL already wraps render and events in <code>act</code>, so the fix is to await the resulting change with <code>findBy</code>/<code>waitFor</code>, or to fix the component updating after unmount.</p></details>
+  <details><summary>Why MSW instead of mocking fetch or the API module?</summary><p>Mocking the module skips your URL building, headers, response parsing and error handling; a stubbed <code>fetch</code> means hand-maintaining fake Response objects. MSW intercepts at the network layer so all of that real code runs, the same handlers serve tests, Storybook and dev, error and empty states are one-line overrides, and swapping HTTP client does not touch the tests.</p></details>
+  <details><summary>Where should a React team spend its testing budget?</summary><p>Mostly on component/integration tests with RTL: render a feature with real children and a mocked network and drive it as a user — highest confidence per second of CI. Keep unit tests for pure logic (reducers, formatters) and a small E2E suite for the critical flows. Avoid large snapshot tests, which get rubber-stamped and stop catching anything.</p></details>
+</div>

@@ -1,0 +1,119 @@
+<h1>useEffect &amp; Lifecycle <span class="tag react">React</span></h1>
+<p><strong>An effect synchronizes a component with an external system.</strong> That is the whole definition. A subscription, a timer, a network request, a browser API, a non-React widget (a map, a chart, a video player) — anything that lives outside React's render output and has to be kept in step with your props and state.</p>
+<p><code>useEffect</code> is <em>not</em> a lifecycle hook. Thinking "this is my <code>componentDidMount</code>" is the single biggest source of React bugs: it makes you write effects that fire once, capture stale values, and never clean up. Think in terms of <strong>synchronization that starts and stops</strong>, not moments in time.</p>
+
+<h2>The signature, and the three dependency forms</h2>
+<pre><code>useEffect(() =&gt; {
+  // setup: start synchronizing
+  return () =&gt; {
+    // cleanup: stop synchronizing
+  };
+}, [deps]);</code></pre>
+<p>The second argument is not "when to run" — it is "what this effect reads from the render". React compares each entry with <code>Object.is</code> against the previous render's array; if any differ, it cleans up and re-runs.</p>
+<table>
+  <thead><tr><th>Form</th><th>Runs</th><th>Means</th></tr></thead>
+  <tbody>
+    <tr><td><code>useEffect(fn)</code></td><td>After every render</td><td>"I depend on everything." Almost always a bug or a deliberate measurement.</td></tr>
+    <tr><td><code>useEffect(fn, [])</code></td><td>Once on mount, cleanup on unmount</td><td>"I read nothing reactive." Only legitimate if the body truly closes over no props/state.</td></tr>
+    <tr><td><code>useEffect(fn, [a, b])</code></td><td>On mount, and whenever <code>a</code> or <code>b</code> changes</td><td>The normal case: resynchronize when the inputs change.</td></tr>
+  </tbody>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> <code>[]</code> is a claim, not a filter. If the body references <code>userId</code>, an empty array does not "run it once" — it freezes the effect on the <em>first</em> <code>userId</code> forever. The dependency array must be a truthful list of every reactive value the body reads.</div>
+
+<h2>Timing: effects run after paint</h2>
+<p>Render is a pure calculation, commit writes to the DOM, then the browser paints. <code>useEffect</code> callbacks are deferred until <strong>after</strong> the paint, so they never block the user seeing the update.</p>
+<pre class="mermaid">
+flowchart LR
+  R["Render: compute JSX"] --> C["Commit: mutate DOM"]
+  C --> P["Browser paints"]
+  P --> E["useEffect runs"]
+  E --> S["setState here causes a second render"]
+</pre>
+<p>This is why setting state inside an effect that feeds back into the render causes a visible flash: the user sees the intermediate frame. <code>useLayoutEffect</code> runs synchronously after commit but <em>before</em> paint precisely to avoid that flicker — covered on the Advanced Hooks page.</p>
+
+<h2>Cleanup semantics and the exact ordering</h2>
+<p>The function you return is called <strong>before every re-run of the effect, and once more on unmount</strong>. It is not "on unmount only". React never runs two setups without the matching teardown in between.</p>
+<pre><code>useEffect(() =&gt; {
+  const conn = connect(roomId);         // setup for roomId = "general"
+  return () =&gt; conn.disconnect();       // teardown for roomId = "general"
+}, [roomId]);</code></pre>
+<p>With <code>roomId</code> going <code>"general"</code> → <code>"travel"</code> → unmount, the console order is exactly:</p>
+<pre><code>connect("general")
+disconnect("general")     ← cleanup of the OLD value runs first
+connect("travel")
+disconnect("travel")      ← unmount</code></pre>
+<p>The cleanup closes over the render that created it, so it sees the <em>old</em> <code>roomId</code> — which is exactly what you want, because you must disconnect the connection you actually opened.</p>
+<p>A cleanup is required for anything that outlives a render: subscriptions, <code>setInterval</code>/<code>setTimeout</code>, <code>addEventListener</code>, observers, websockets, and in-flight requests (via <code>AbortController</code> or an <code>ignore</code> flag to prevent an out-of-order response overwriting newer state).</p>
+<pre><code>useEffect(() =&gt; {
+  let ignore = false;
+  fetch(`/api/user/${id}`).then(r =&gt; r.json()).then(data =&gt; {
+    if (!ignore) setUser(data);         // drop the response of a superseded request
+  });
+  return () =&gt; { ignore = true; };
+}, [id]);</code></pre>
+
+<h2>StrictMode double-invocation, and why it helps</h2>
+<p>In <strong>development only</strong>, React 18+ <code>&lt;StrictMode&gt;</code> mounts every component, unmounts it, and mounts it again. Effects therefore run <code>setup → cleanup → setup</code>. Production is unaffected.</p>
+<p>This is a deliberate stress test. An effect that is correctly <em>resilient</em> — every setup balanced by a cleanup — is indistinguishable from a single mount. An effect that leaks shows up immediately as two subscriptions, two intervals, or a doubled counter.</p>
+<div class="callout tip"><strong>Senior tip:</strong> the answer to "StrictMode fires my effect twice, how do I stop it?" is never a <code>hasRunRef</code> guard. The double invocation is telling you cleanup is missing or incomplete. Suppressing it hides a real bug that will surface as a leak when the component remounts in production (a route change, a conditional render, a <code>key</code> change).</div>
+
+<h2>The classic bugs</h2>
+<h3>1. Missing dependencies → stale closures</h3>
+<p>Each render creates a new effect function closing over that render's values. Lie about the deps and the effect keeps running the <em>old</em> closure:</p>
+<pre><code>// ❌ interval callback captured count === 0 forever
+useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setCount(count + 1), 1000);
+  return () =&gt; clearInterval(id);
+}, []);                                  // lies: it reads `count`
+
+// ✅ the updater needs no snapshot, so the deps are honestly empty
+useEffect(() =&gt; {
+  const id = setInterval(() =&gt; setCount(c =&gt; c + 1), 1000);
+  return () =&gt; clearInterval(id);
+}, []);</code></pre>
+<p>The fix is never "delete the dependency". It is to remove the <em>need</em> for it: functional updates, moving the value into a ref, moving the function inside the effect, or extracting non-reactive logic outside the component.</p>
+<h3>2. Object / array / function deps → infinite loops</h3>
+<p>Non-primitive values are recreated on every render, so <code>Object.is</code> always reports a change: effect runs → sets state → re-render → new object → effect runs…</p>
+<pre><code>// ❌ new object literal every render → infinite loop
+const options = { userId, sort: 'asc' };
+useEffect(() =&gt; { load(options); }, [options]);
+
+// ✅ depend on the primitives it is really made of
+useEffect(() =&gt; { load({ userId, sort: 'asc' }); }, [userId]);</code></pre>
+<h3>3. <code>setState</code> in an effect with no guard</h3>
+<p>An effect whose only job is to set state from other state is almost always derived state in disguise — it costs an extra render and can loop. Compute it during render instead.</p>
+
+<h2>You Might Not Need an Effect</h2>
+<table>
+  <thead><tr><th>Situation</th><th>Do this instead</th></tr></thead>
+  <tbody>
+    <tr><td>Value computable from props/state</td><td>Compute during render; <code>useMemo</code> only if profiling demands it</td></tr>
+    <tr><td>Transforming a list for display (filter/sort)</td><td>Do it in the render body — not an effect + extra state</td></tr>
+    <tr><td>Something must happen <em>because the user did X</em></td><td>Put it in the event handler</td></tr>
+    <tr><td>Reset all state when an id changes</td><td>Pass <code>key={id}</code> and let React remount the component</td></tr>
+    <tr><td>Reset part of state when a prop changes</td><td>Adjust it during render (compare to a stored previous prop) — not an effect</td></tr>
+    <tr><td>Copying a prop into state to "keep it in sync"</td><td>Just read the prop; the copy freezes and drifts</td></tr>
+    <tr><td>Notifying a parent of a change</td><td>Call the parent's callback in the same handler that made the change</td></tr>
+    <tr><td>Fetching data</td><td>An effect works, but prefer a framework loader / React Query / RSC — they handle races, caching and dedupe</td></tr>
+  </tbody>
+</table>
+<div class="callout warn"><strong>Gotcha:</strong> chained effects ("effect A sets state that triggers effect B that triggers C") are the worst version of this. Each link is a full render pass, the intermediate states are visible, and the flow is impossible to follow. Compute the whole result in one place.</div>
+
+<h2>Effect or event handler? The decision rule</h2>
+<ul>
+  <li><strong>Event handler:</strong> the code should run because <em>a specific interaction happened</em> — a click, a submit, a keypress. Buying a product, showing a toast, sending an analytics click. Running it twice is wrong.</li>
+  <li><strong>Effect:</strong> the code should run because <em>the component is displayed with these values</em>, regardless of how it got there. Connecting to a chat room, subscribing to a store, starting a timer. Running the setup twice with a cleanup between is harmless.</li>
+</ul>
+<p>Litmus test: if you can't answer "what external system is this keeping in sync?", it probably belongs in a handler or in the render body.</p>
+<div class="callout tip"><strong>Senior tip:</strong> in an interview, describe an effect by its lifecycle in words — "start synchronizing with X; stop synchronizing with X" — rather than "on mount / on update / on unmount". It signals you think in React 18 terms and it makes the cleanup obviously mandatory.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>What is <code>useEffect</code> actually for?</summary><p>Synchronizing a component with an external system — subscriptions, timers, network, non-React widgets. It is not a lifecycle hook. If nothing external is involved, the logic usually belongs in the render body (derived values) or an event handler (user interactions).</p></details>
+  <details><summary>When exactly does cleanup run?</summary><p>Before every re-run of the effect and once on unmount. React never runs a second setup without the matching cleanup in between, and the cleanup closes over the render that created it, so it tears down the value it actually set up.</p></details>
+  <details><summary>Why does StrictMode run my effect twice, and how should I fix it?</summary><p>In development React mounts, unmounts and remounts the component so effects run setup → cleanup → setup. It is a probe for missing cleanup. Fix it by making the effect resilient to being re-run — not with a ref guard, which just hides a leak that will appear on any real remount.</p></details>
+  <details><summary>Why does an empty dependency array cause stale data?</summary><p>The effect closes over the first render's values. Claiming no dependencies while the body reads props or state freezes it on those initial values. The dependency array must list everything reactive the body reads; if that feels wrong, restructure (functional updates, move the function inside the effect, or use a ref).</p></details>
+  <details><summary>An effect depends on an object and loops forever. Why?</summary><p>Object, array and function literals get a new identity every render, so the <code>Object.is</code> comparison always reports a change. Depend on the primitive fields instead, construct the object inside the effect, or stabilize it with <code>useMemo</code>/<code>useCallback</code>.</p></details>
+  <details><summary>How do you avoid a race condition when fetching in an effect?</summary><p>Use the cleanup: set an <code>ignore</code> flag or abort with an <code>AbortController</code>, so a response from a superseded request is discarded rather than overwriting newer state. Better still, use a data library or framework loader that handles this for you.</p></details>
+  <details><summary>How do you reset state when a prop changes — and why not an effect?</summary><p>Pass <code>key={id}</code> so React remounts the component with fresh state. An effect that syncs props into state renders once with stale data, then renders again, and the copied value silently drifts from its source.</p></details>
+</div>

@@ -1,0 +1,153 @@
+<h1>Context &amp; State Management <span class="tag react">React</span></h1>
+<p><strong>Context solves one problem: getting a value from a provider to a deeply nested consumer without threading it through every component in between.</strong> That is dependency injection. It is not a state manager — it has no selectors, no subscriber-level batching, no devtools, no middleware, and no way for a consumer to say "wake me only when <em>this slice</em> changes".</p>
+<p>The senior version of this topic is knowing (a) that composition often removes the prop drilling for free, (b) that <em>every</em> consumer re-renders when the provider value changes identity, and (c) that most of the state people reach for Redux to manage is actually <strong>server cache</strong>, which needs a different tool entirely.</p>
+
+<h2>Prop drilling, and the cheaper fix people forget</h2>
+<p>Prop drilling is passing a prop through components that do not use it, purely to reach a descendant. Three levels is usually fine and readable. Ten levels of <code>user</code> through layout components is real coupling: every intermediate signature changes when the shape changes.</p>
+<p>Before reaching for Context, try <strong>component composition</strong> — render the subtree in the component that already owns the data and pass it down as <code>children</code>:</p>
+<pre><code>// ❌ Layout and Sidebar don't care about `user`, but must accept and forward it
+&lt;Layout user={user}&gt;
+  &lt;Sidebar user={user} /&gt;
+&lt;/Layout&gt;
+
+// ✅ the element is created where the data lives; Layout just renders a hole
+function Layout({ sidebar, children }) {
+  return &lt;div&gt;{sidebar}&lt;main&gt;{children}&lt;/main&gt;&lt;/div&gt;;
+}
+
+&lt;Layout sidebar={&lt;Avatar user={user} /&gt;}&gt;
+  &lt;Feed /&gt;
+&lt;/Layout&gt;</code></pre>
+<p>This has a second, underrated benefit: an element passed as <code>children</code> was created by the parent, so when <code>Layout</code> re-renders, that element object is the same reference and React can skip re-rendering it. Composition is both less plumbing and fewer renders.</p>
+<div class="callout tip"><strong>Senior tip:</strong> Reach for Context when a value is genuinely <em>ambient</em> — theme, locale, current user, a router, a design-system config — and is read by many unrelated components. Values that flow down one branch are usually a composition problem, not a Context problem.</div>
+
+<h2>The API: createContext, Provider, useContext</h2>
+<pre><code>const ThemeContext = createContext('light');   // default used ONLY when no Provider above
+
+function App() {
+  const [theme, setTheme] = useState('dark');
+  return (
+    &lt;ThemeContext.Provider value={theme}&gt;
+      &lt;Page /&gt;
+    &lt;/ThemeContext.Provider&gt;
+  );
+}
+
+function Button() {
+  const theme = useContext(ThemeContext);       // nearest Provider above, in the TREE
+  return &lt;button className={theme} /&gt;;
+}</code></pre>
+<ul>
+  <li><code>useContext</code> reads the <strong>nearest provider above in the React tree</strong>, not the nearest in the file. Nested providers of the same context shadow each other — that is a feature (per-subtree themes).</li>
+  <li>The <code>createContext</code> default value only applies when there is <em>no</em> matching Provider. A common bug is forgetting the Provider in tests and silently getting the default instead of an error. Guard it:</li>
+</ul>
+<pre><code>const AuthContext = createContext(null);
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (ctx === null) throw new Error('useAuth must be used inside &lt;AuthProvider&gt;');
+  return ctx;
+}</code></pre>
+<p>In React 19, <code>&lt;ThemeContext&gt;</code> can be rendered directly as the provider (<code>&lt;ThemeContext value={x}&gt;</code>); <code>.Provider</code> still works and is what you will see in most codebases.</p>
+
+<h2>Context is dependency injection, not a state manager</h2>
+<p>Context has no store. It holds whatever value you hand it and broadcasts identity changes. The state itself still lives in a <code>useState</code>/<code>useReducer</code> somewhere above. What a real state manager adds on top:</p>
+<table>
+  <thead><tr><th>Capability</th><th>Context</th><th>A store (Redux / Zustand / Jotai)</th></tr></thead>
+  <tbody>
+    <tr><td>Selector granularity</td><td>None — all consumers wake on any change</td><td>Subscribe to a slice; skip if the slice is equal</td></tr>
+    <tr><td>Read outside React</td><td>No</td><td>Yes (<code>store.getState()</code>)</td></tr>
+    <tr><td>Devtools / time travel</td><td>No</td><td>Yes</td></tr>
+    <tr><td>Middleware (logging, persistence, async)</td><td>No</td><td>Yes</td></tr>
+    <tr><td>Cost of a change</td><td>Re-render every consumer subtree</td><td>Re-render only components whose selection changed</td></tr>
+  </tbody>
+</table>
+<div class="callout"><strong>Note:</strong> "Context re-renders everything" is imprecise but the practical conclusion is right. React walks from the Provider and re-renders <em>the consumers</em> — components that called <code>useContext</code> — regardless of <code>React.memo</code>, because memo cannot block a context update. Non-consumers in between are skipped if they are memoized and their props are unchanged.</div>
+
+<h2>The performance pitfall: value identity</h2>
+<p>React compares the provider value with <code>Object.is</code>. An object literal in JSX is a <strong>new object on every render of the provider component</strong>, so every consumer re-renders even when the data is deeply equal:</p>
+<pre><code>// ❌ new object identity every single render — all consumers wake up
+&lt;UserContext.Provider value={{ user, setUser }}&gt;
+
+// ✅ stable identity while user is unchanged
+const value = useMemo(() =&gt; ({ user, setUser }), [user]);
+&lt;UserContext.Provider value={value}&gt;</code></pre>
+<p>Four escalating fixes, in the order you should try them:</p>
+<ol>
+  <li><strong>Memoize the value.</strong> Free, and removes the "provider re-rendered for an unrelated reason" churn.</li>
+  <li><strong>Split state and dispatch into two contexts.</strong> <code>dispatch</code> and setters from <code>useState</code>/<code>useReducer</code> are already stable for the component's lifetime, so components that only dispatch never re-render when state changes.</li>
+  <li><strong>Split by update frequency.</strong> A cursor position that changes 60×/s and a theme that changes twice a session must not share a context.</li>
+  <li><strong>Use a selector-based store.</strong> When consumers need different slices of one frequently-changing object, only per-subscriber selection fixes it. This is exactly what Zustand/Jotai/Redux give you (and what <code>useSyncExternalStore</code> lets you build).</li>
+</ol>
+<pre><code>const StateCtx    = createContext(null);
+const DispatchCtx = createContext(null);   // dispatch is referentially stable forever
+
+function Provider({ children }) {
+  const [state, dispatch] = useReducer(reducer, init);
+  return (
+    &lt;DispatchCtx.Provider value={dispatch}&gt;
+      &lt;StateCtx.Provider value={state}&gt;{children}&lt;/StateCtx.Provider&gt;
+    &lt;/DispatchCtx.Provider&gt;
+  );
+}</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> Memoizing the value does <em>not</em> help if the state object itself is recreated on every change — and it shouldn't, that is the point. Memoization removes accidental churn; it cannot give you selector granularity. Do not expect <code>useMemo</code> to fix a genuinely hot context.</div>
+
+<h2>Context + useReducer: the legitimate small-app pattern</h2>
+<p>For state that is app-wide but changes rarely — auth session, theme, a shopping cart, a wizard — <code>useReducer</code> + two contexts is a real architecture, not a compromise. You get named actions, a pure and unit-testable transition function, and zero dependencies.</p>
+<pre><code>function cartReducer(state, action) {
+  switch (action.type) {
+    case 'add':    return { ...state, items: [...state.items, action.item] };
+    case 'remove': return { ...state, items: state.items.filter(i =&gt; i.id !== action.id) };
+    default:       throw new Error('unknown action ' + action.type);
+  }
+}</code></pre>
+<p>Outgrow it when: consumers start needing slices (perf), you want devtools/time-travel, you need to read or write state outside React, or the reducer becomes a place where async lives.</p>
+
+<h2>The distinction that matters most: server state vs client state</h2>
+<p>Most "global state management" pain is people storing <strong>a cache of someone else's data</strong> in a tool designed for UI state. Server data is asynchronous, shared, owned elsewhere, and <em>goes stale</em>. It needs caching, deduplication, revalidation and retries — none of which Redux gives you out of the box.</p>
+<table>
+  <thead><tr><th>Kind</th><th>Examples</th><th>Right home</th></tr></thead>
+  <tbody>
+    <tr><td>Server cache</td><td>User profile, product list, orders</td><td>React Query / SWR / RTK Query, or RSC + framework loaders</td></tr>
+    <tr><td>Client UI state</td><td>Modal open, sidebar collapsed, selected tab</td><td><code>useState</code>, or Zustand/Jotai if truly global</td></tr>
+    <tr><td>URL state</td><td>Filters, page number, search query, sort</td><td>The URL — shareable, bookmarkable, survives reload and back-button</td></tr>
+    <tr><td>Form state</td><td>Field values, dirty/touched, errors</td><td>Local state or react-hook-form; rarely global</td></tr>
+    <tr><td>Ambient config</td><td>Theme, locale, feature flags, session</td><td>Context</td></tr>
+  </tbody>
+</table>
+<div class="callout tip"><strong>Senior tip:</strong> Answer "how do you manage state in a large React app?" with this table. Once server cache goes to React Query and navigational state goes to the URL, the genuinely global client state left over is usually small enough that Context or a 20-line Zustand store is sufficient.</div>
+
+<h2>Comparing the options</h2>
+<table>
+  <thead><tr><th>Tool</th><th>What it is actually for</th><th>Boilerplate</th><th>Devtools / middleware</th><th>Selector granularity</th></tr></thead>
+  <tbody>
+    <tr><td>Context + useReducer</td><td>Ambient, low-frequency app state; DI</td><td>Low, but grows with each new context</td><td>None</td><td>None — all consumers re-render</td></tr>
+    <tr><td>Redux Toolkit</td><td>Large, complex, auditable client state with a team convention</td><td>Medium (slices; far less than legacy Redux)</td><td>Best-in-class: time travel, middleware, RTK Query</td><td><code>useSelector</code> + equality fn</td></tr>
+    <tr><td>Zustand</td><td>Small global store with almost no ceremony</td><td>Very low — one hook, one object</td><td>Devtools + persist middleware available</td><td><code>useStore(s =&gt; s.slice)</code></td></tr>
+    <tr><td>Jotai / Recoil</td><td>Atomic, bottom-up state; fine-grained derived values</td><td>Low; you compose atoms</td><td>Basic devtools</td><td>Per-atom — the finest of all</td></tr>
+    <tr><td>React Query / SWR</td><td>Server cache, <em>not</em> client state</td><td>Low</td><td>Excellent devtools; retries, refetch, mutations</td><td>Per query key</td></tr>
+  </tbody>
+</table>
+<p><strong>How to choose:</strong> start with local state. Move server data to React Query. Put navigational state in the URL. If something is still global and rarely changes, use Context. If it is global <em>and</em> changes often <em>and</em> consumers want different slices, use Zustand or Jotai. Choose Redux Toolkit when you need the ecosystem, devtools, strict conventions across a large team, or complex cross-cutting middleware — not by default.</p>
+<pre class="mermaid">
+flowchart TD
+  A["Where does this state belong?"] --> B["Comes from a server?"]
+  B -->|Yes| C["React Query / SWR / RSC"]
+  B -->|No| D["Should it survive reload or be shareable?"]
+  D -->|Yes| E["Put it in the URL"]
+  D -->|No| F["Used by one branch?"]
+  F -->|Yes| G["useState plus composition"]
+  F -->|No| H["Changes often, many slices?"]
+  H -->|No| I["Context plus useReducer"]
+  H -->|Yes| J["Zustand or Jotai or Redux Toolkit"]
+</pre>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Is Context a state management solution?</summary><p>No. Context is a transport mechanism — dependency injection for a subtree. The state still lives in <code>useState</code>/<code>useReducer</code> above the Provider. Context provides no selectors, no subscriber-level granularity, no devtools and no middleware, which is exactly what distinguishes a store from a broadcast channel.</p></details>
+  <details><summary>Why does <code>value={{user, setUser}}</code> hurt performance?</summary><p>The object literal is a new reference on every render of the Provider component. React compares provider values with <code>Object.is</code>, so every consumer re-renders even though the data is identical. Wrap it in <code>useMemo</code>, and split state from dispatch so dispatch-only consumers never wake.</p></details>
+  <details><summary>Does <code>React.memo</code> stop a context update?</summary><p>No. <code>memo</code> only skips re-renders caused by unchanged props. A component that calls <code>useContext</code> is subscribed directly and will re-render on any provider value change. <code>memo</code> does help the non-consuming components in between, which is why splitting contexts works.</p></details>
+  <details><summary>How do you avoid prop drilling without Context?</summary><p>Component composition: render the subtree where the data already lives and pass it through as <code>children</code> or as element props. Intermediate components accept a hole to fill instead of a value to forward, and the passed element keeps a stable identity so React can skip re-rendering it.</p></details>
+  <details><summary>Server state vs client state — why does it matter?</summary><p>Server data is an asynchronous, shared cache that goes stale; it needs deduplication, background revalidation, retries and invalidation. Client UI state is synchronous and owned by you. Putting server data in Redux means hand-writing a cache badly; React Query/SWR/RTK Query exist to own that layer, which usually shrinks the remaining global state dramatically.</p></details>
+  <details><summary>When would you actually pick Redux Toolkit today?</summary><p>Large apps with complex, highly interconnected client state, a team that benefits from strict conventions, a need for time-travel devtools or cross-cutting middleware (analytics, undo, offline queues). For "a few global values" Zustand or Context is less machinery for the same result.</p></details>
+  <details><summary>How do you get selector-like behaviour without a library?</summary><p>Keep the state in an external store object with a subscribe/getSnapshot API and read it via <code>useSyncExternalStore</code>, comparing the selected slice yourself. That is roughly what Zustand is. It is a real option when you want one hot store without a dependency.</p></details>
+</div>

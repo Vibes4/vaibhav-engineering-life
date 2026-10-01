@@ -1,0 +1,66 @@
+<h1>AWS: Databases — RDS &amp; DynamoDB <span class="tag db">EY Sheet 03</span></h1>
+<p>The JD names <strong>RDS</strong> and <strong>DynamoDB</strong> explicitly. In a cloud-native round this section is really testing data modelling judgement: can you tell when a relational model is the right answer and when a single-table NoSQL design is, and can you talk about the failure modes of each under load?</p>
+<div class="callout tip"><strong>The line that wins this section:</strong> "I choose the database from the access patterns, not from the data. If I can enumerate every query the service will make and they're all key-based lookups with predictable shape, DynamoDB gives me flat single-digit-millisecond latency at any scale. If the queries are open-ended, ad-hoc, or need joins and transactions across entities, that's RDS — and paying for a relational engine is much cheaper than reinventing joins in application code."</div>
+
+<h2>RDS &amp; Aurora</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Multi-AZ vs read replicas — what does each solve?</summary>
+<p>They solve completely different problems and interviewers love that people confuse them.</p>
+<p><strong>Multi-AZ</strong> is <em>availability and durability</em>. RDS keeps a synchronous standby in a second AZ. The standby is <strong>not readable</strong> — it does nothing for performance. On failure (hardware, AZ event, or a manual reboot-with-failover) RDS promotes the standby and flips the DNS CNAME; clients see a connection drop and must reconnect. Typical failover is 60–120 seconds for RDS, often under 30 for Aurora.</p>
+<p><strong>Read replicas</strong> are <em>read scaling</em>. Asynchronous replication, so there's replica lag — you must not read your own writes from a replica unless the use case tolerates staleness. They can be in the same region, cross-region (for DR and locality), and can be promoted to standalone primaries, but promotion is manual and lossy relative to the async lag.</p>
+<p>The senior addition: after a Multi-AZ failover the classic bug is a connection pool or DNS cache still pinned to the old endpoint IP, so the app keeps failing after the database is healthy. Mitigate with short DNS caching, connection validation in the pool, or RDS Proxy.</p></details>
+
+<details class="qa"><summary>What does Aurora do differently, and when is it worth it?</summary>
+<p>Aurora decouples compute from storage: instead of replicating a block device, the database writes log records to a <strong>distributed storage layer that keeps six copies across three AZs</strong> with quorum writes (4 of 6) and quorum reads (3 of 6). Consequences: replicas share the same storage volume, so replica lag is typically milliseconds rather than seconds; you can have up to 15 replicas; failover is fast because there's no data to move; and storage auto-grows.</p>
+<p>Worth it when you need high read fan-out with low lag, fast failover, or Aurora-specific features — Global Database for cross-region DR with sub-second replication, or Serverless v2 for workloads with genuinely variable load. Not worth it when you have a modest steady workload that vanilla RDS PostgreSQL serves fine, since Aurora carries a price premium and adds I/O-based charges that can surprise you on write-heavy workloads.</p></details>
+
+<details class="qa"><summary><span class="qa-chip deep">Depth probe</span>A query got slow in production. Walk me through your diagnosis.</summary>
+<p>I'd narrow it in layers rather than guessing:</p>
+<ol>
+<li><strong>Is it the query or the box?</strong> CloudWatch: CPU, freeable memory, read/write IOPS versus the volume's provisioned ceiling, and <code>DatabaseConnections</code>. A saturated IOPS budget or burst-balance exhaustion on gp2 looks exactly like "the query got slow" but isn't.</li>
+<li><strong>Which query?</strong> Performance Insights ranks by database load and shows top waits. Slow query log as the fallback.</li>
+<li><strong>Why that query?</strong> <code>EXPLAIN ANALYZE</code>. I'm looking for a sequential scan where I expected an index scan, a bad row-count estimate (planner thinks 10 rows, reality is 2 million), or a nested loop that should be a hash join.</li>
+<li><strong>Common causes in order of likelihood:</strong> missing or unusable index (a function or implicit cast on the indexed column defeats it); stale statistics after a bulk load, fixed by ANALYZE; data growth crossing the threshold where the planner flips strategy; a new N+1 query pattern introduced by an ORM change; table bloat from churn without autovacuum keeping up; or lock contention from a long-running transaction.</li>
+<li><strong>Fix, then prevent.</strong> The fix might be an index, a query rewrite, or pagination. The prevention is the part that matters in an interview: a p99 query-latency alarm, a slow-query budget in CI, and a rule that migrations adding indexes on large tables use <code>CREATE INDEX CONCURRENTLY</code> so they don't lock writes.</li>
+</ol></details>
+
+<details class="qa"><summary>How do you handle schema migrations with zero downtime?</summary>
+<p><strong>Expand / migrate / contract.</strong> Never change a column in one deploy that both old and new code must work against.</p>
+<ol>
+<li><strong>Expand</strong> — add the new nullable column or new table. Old code ignores it; deploy is safe.</li>
+<li><strong>Migrate</strong> — deploy code that dual-writes to both old and new, then backfill existing rows in batches (batched so you don't hold a giant transaction or blow replica lag).</li>
+<li><strong>Contract</strong> — once all readers use the new column and the backfill is verified, stop writing the old one and drop it in a later deploy.</li>
+</ol>
+<p>Rules I'd state: migrations run as a separate pipeline step before the app deploy, never inside application startup (otherwise N instances race). Adding a NOT NULL column with a default rewrites the table on older engines — check the engine version. Renames are never done in place; they're an expand/contract. And every migration needs a tested rollback path, which usually means "additive only, drops come later".</p></details>
+
+<h2>DynamoDB</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Partition key design — what makes a good one, and what's a hot partition?</summary>
+<p>DynamoDB hashes the partition key to choose a physical partition. All items sharing a partition key live together — that's what makes a query by partition key fast, and it's also the trap. Each physical partition holds up to 10 GB and serves roughly 3,000 RCU / 1,000 WCU.</p>
+<p>A <strong>hot partition</strong> is when traffic concentrates on one key: table-level capacity sits idle while one partition throttles. Classic causes are a low-cardinality key (status, country, tenant where one tenant is 90% of traffic) or a time-based key like <code>2026-09-14</code> where all of today's writes hit one partition.</p>
+<p>Fixes: <strong>(1) higher-cardinality key</strong> — use the entity's own ID instead of its category. <strong>(2) Write sharding</strong> — append a suffix, <code>2026-09-14#7</code> with a random or calculated shard 0–N, then scatter-gather on read. <strong>(3)</strong> Adaptive capacity now auto-boosts hot partitions and isolates very hot keys, which softens the problem but doesn't remove the 10 GB/partition ceiling or the need for a sane key. The right answer is almost always a better key, not more capacity.</p></details>
+
+<details class="qa"><summary><span class="qa-chip deep">Depth probe</span>LSI vs GSI — when do you use which?</summary>
+<p><strong>LSI (Local Secondary Index)</strong> — same partition key, different sort key. Must be created with the table and can never be added later. Shares the table's throughput, supports strongly consistent reads, and imposes a 10 GB limit per partition-key value across the table and its LSIs. Use when you need an alternative sort order <em>within</em> the same partition.</p>
+<p><strong>GSI (Global Secondary Index)</strong> — different partition key entirely, effectively a separate table maintained asynchronously. Can be added or dropped any time, has its own provisioned capacity, and is <strong>eventually consistent only</strong>. Use when you need a genuinely different access pattern — "find the order by customer email" when the table is keyed by order ID.</p>
+<p>The gotcha worth volunteering: if a GSI is under-provisioned it throttles, and because writes to the base table must propagate to the GSI, <strong>a throttled GSI can throttle writes to the base table</strong>. Also project only the attributes you need — KEYS_ONLY or INCLUDE rather than ALL — because every projected attribute is duplicated storage and duplicated write cost.</p></details>
+
+<details class="qa"><summary>Explain single-table design. Would you always use it?</summary>
+<p>Single-table design puts multiple entity types in one table with generic keys (<code>PK</code>, <code>SK</code>) and overloaded values — <code>PK=CUSTOMER#123, SK=PROFILE</code> alongside <code>PK=CUSTOMER#123, SK=ORDER#456</code>. Because related entities share a partition, one Query returns a customer and their orders in a single round trip, which is the whole point: it replaces the join.</p>
+<p>No, I wouldn't always use it. It only pays off when you can enumerate the access patterns up front and they're stable. The costs are real: the model is opaque to newcomers, analytics queries become impossible without exporting to S3/Athena, and adding an unanticipated access pattern later can mean a migration or another GSI. On a consulting engagement where requirements shift, I'd rather have two or three purposeful tables than one clever one nobody else on the team can read. I'd say that out loud, because "always single-table" is a cargo-cult answer.</p></details>
+
+<details class="qa"><summary>On-demand vs provisioned capacity. And what are DynamoDB Streams for?</summary>
+<p><strong>On-demand</strong> — pay per request, no capacity planning, instant scaling within limits. Right for new workloads with unknown traffic, spiky traffic, or dev environments. Roughly 5–7x the per-request price of well-utilised provisioned capacity, so it gets expensive at steady high volume. <strong>Provisioned</strong> with auto-scaling — cheaper for predictable sustained load, but auto-scaling reacts in minutes, so a sudden spike throttles before capacity catches up. Reserved capacity cuts provisioned cost further for a 1–3 year commitment.</p>
+<p><strong>Streams</strong> give you an ordered, 24-hour change log per partition key — every insert, modify and delete, with configurable before/after images. That's the foundation for event-driven patterns: trigger a Lambda to update a search index, materialise an aggregate, fan out a domain event to EventBridge, or implement the transactional outbox so a state change and its event can't diverge. Lambda consumes Streams via an event source mapping with batching, and I'd always configure a failure destination and <code>bisectBatchOnFunctionError</code> so one poison record doesn't stall the shard forever.</p></details>
+
+<details class="qa"><summary><span class="qa-chip must">Certain</span>RDS or DynamoDB for this service — how do you decide?</summary>
+<p>I ask four questions:</p>
+<ol>
+<li><strong>Can I enumerate the access patterns?</strong> If yes and they're key-based, DynamoDB. If queries are exploratory, reporting-style, or will change with the business, relational.</li>
+<li><strong>Do I need joins, multi-row transactions, or referential integrity?</strong> DynamoDB has TransactWriteItems, but it's limited and expensive compared to a real transaction. Complex invariants across entities → RDS.</li>
+<li><strong>What's the scale and shape?</strong> Millions of small key-based ops with a strict latency SLO and unpredictable spikes → DynamoDB, which doesn't care. Moderate volume with complex reads → RDS is simpler and cheaper.</li>
+<li><strong>What does the team know?</strong> A team fluent in SQL will build a correct relational system faster than a mediocre NoSQL one. On a consulting engagement that's a legitimate, defensible input.</li>
+</ol>
+<p>And I'd note the hybrid is common and fine: RDS as the system of record, DynamoDB for the high-volume session/cart/idempotency-key workload, kept in sync by events.</p></details>
+
+<details class="qa"><summary>What is DAX, and when do you need ElastiCache instead?</summary>
+<p><strong>DAX</strong> is a DynamoDB-specific write-through cache cluster that sits in front of the table and speaks the DynamoDB API, so adoption is nearly transparent — it takes eventually-consistent reads from single-digit milliseconds to microseconds. It only helps DynamoDB, only helps eventually-consistent reads, and lives in your VPC.</p>
+<p><strong>ElastiCache (Redis)</strong> is a general-purpose cache and data structure server: it caches anything (RDS query results, computed aggregates, rendered fragments), and it gives you primitives DAX doesn't have — sorted sets for leaderboards, TTL'd keys for sessions, distributed locks, rate-limiter counters, pub/sub. I'd use DAX for a read-heavy DynamoDB hot-key problem and Redis for basically everything else, including as the token-bucket store for API rate limiting.</p></details>

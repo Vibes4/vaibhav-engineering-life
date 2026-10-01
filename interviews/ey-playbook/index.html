@@ -1,0 +1,75 @@
+<h1>EY GDS — Interview Playbook <span class="tag express">Senior Cloud Native Developer (AWS)</span></h1>
+<p>Role: <strong>Senior Cloud Native Developer — EY GDS Technology Consulting</strong>. Stack the JD actually names: <strong>Node.js / TypeScript</strong>, <strong>AWS</strong> (EC2, EKS, Lambda, S3, RDS, DynamoDB, VPC, IAM, SGs, API Gateway, SNS, SQS), <strong>IaC</strong> (CloudFormation, Terraform), and <strong>CI/CD + testing + security + cost</strong> as secondary weightings. Band: 4–8 years. One 60-minute slot.</p>
+<div class="callout tip"><strong>The single most important framing:</strong> this is a <em>consulting</em> delivery role, not a product-engineering role. Every answer should end in a trade-off and a business consequence ("…which costs ~30% more but takes RPO from 15 minutes to near-zero, so I'd only do it if the client's data-loss tolerance justified it"). EY hires people who can defend a design in front of a client architect, not people who can recite service limits.</div>
+
+<h2>What a 60-minute panel actually looks like</h2>
+<p>EY GDS experienced-hire loops are typically 3 stages: a <strong>technical panel</strong> (this one), then a <strong>managerial/senior-manager round</strong>, then <strong>HR/fitment</strong>. Some candidates get a Glider/HackerRank assessment first. A single 60-minute technical slot almost always splits roughly like this:</p>
+<table class="sheet">
+  <tr><th>Minutes</th><th>What happens</th><th>What they're scoring</th></tr>
+  <tr><td>0–5</td><td>Your intro + "walk me through your current project"</td><td>Can you narrate an architecture crisply? Do you own it or just work in it?</td></tr>
+  <tr><td>5–20</td><td>Node.js / TypeScript depth — event loop, async, error handling, memory</td><td>Is the "senior" real, or framework-deep only?</td></tr>
+  <tr><td>20–40</td><td>AWS breadth + depth — Lambda vs ECS/EKS, SQS vs SNS, RDS vs DynamoDB, VPC/IAM</td><td>Have you actually run production on AWS, or just done tutorials?</td></tr>
+  <tr><td>40–52</td><td>One open scenario — "design X" or "this is slow/failing, debug it"</td><td>Structured thinking under ambiguity. This is the round-decider.</td></tr>
+  <tr><td>52–60</td><td>CI/CD, IaC, security, cost — rapid fire; then your questions</td><td>Breadth across the SDLC; whether you think about money.</td></tr>
+</table>
+<div class="callout warn"><strong>Watch out:</strong> because you "know AWS but have never been interviewed on it", your risk is <em>not</em> knowledge — it's <strong>shape</strong>. Untrained candidates answer AWS questions by listing features. Trained candidates answer with: <em>definition → when I'd pick it → what breaks → what I'd pick instead</em>. Four beats, 60–90 seconds. Drill the shape, not more facts.</div>
+
+<h2>The 4-beat answer template (use it for every AWS question)</h2>
+<ol>
+  <li><strong>One-line definition</strong> — "SQS is a managed pull-based queue; one message goes to one consumer."</li>
+  <li><strong>When I reach for it</strong> — "I use it to decouple a spiky producer from a slow consumer, and to absorb backpressure."</li>
+  <li><strong>The sharp edge</strong> — "Standard is at-least-once and unordered, so consumers must be idempotent; visibility timeout must exceed max processing time or you get duplicate work."</li>
+  <li><strong>The alternative + why not</strong> — "If I needed fan-out to several independent consumers I'd put SNS or EventBridge in front; if I needed replay and ordered per-key history, Kinesis or MSK."</li>
+</ol>
+<div class="callout tip"><strong>Say this when you don't know something:</strong> "I haven't run that in production. What I'd do is check X, and my working assumption would be Y — is that the direction?" Senior candidates are allowed gaps; they are not allowed bluffing. EY panels probe, and a fabricated answer that collapses on the second question costs more than the admission.</div>
+
+<h2>Your 90-second opening (script it, don't improvise)</h2>
+<p>Structure: <em>years + stack → current system in one sentence → scale numbers → your specific ownership → why EY</em>. Numbers are what separate senior from mid. Fill these in from your own work before the call:</p>
+<div class="callout tip"><strong>Say this:</strong> "I'm a backend engineer with ~N years, primarily Node.js and TypeScript on AWS. Currently I work on &lt;system&gt; — a &lt;microservices / event-driven&gt; platform handling roughly &lt;X&gt; requests a day with &lt;Y&gt; services. I own &lt;2–3 specific services&gt; end-to-end: API design, the data model on &lt;RDS/DynamoDB&gt;, the async pipeline on &lt;SQS/SNS/EventBridge&gt;, plus the CI/CD pipeline and the CloudWatch alarms that page us. The piece I'm proudest of is &lt;one concrete win with a number — latency cut, cost cut, incident class eliminated&gt;. I'm looking at EY GDS because the work is client-facing modernization across many domains rather than one product, and that's the range I want next."</div>
+<p>Have three stories loaded and rehearsed — you will be asked for at least two of them:</p>
+<ul>
+  <li><strong>A production incident you debugged</strong> — symptom, how you narrowed it, root cause, the fix, and the <em>prevention</em> you added afterwards. The prevention is the senior part.</li>
+  <li><strong>A design decision with a real trade-off</strong> — including what you gave up and what you'd do differently now.</li>
+  <li><strong>A disagreement</strong> — with an architect, a PM, or a client. Resolution by evidence, not by seniority.</li>
+</ul>
+
+<h2>What the JD is quietly telling you to prepare</h2>
+<table class="sheet">
+  <tr><th>JD phrase</th><th>What it becomes in the room</th></tr>
+  <tr><td>"event-driven architectures"</td><td>SQS vs SNS vs EventBridge; idempotency; DLQs; ordering; exactly-once</td></tr>
+  <tr><td>"performance, observability, and fault tolerance"</td><td>p99 vs average; structured logs + correlation IDs + X-Ray; retries, timeouts, circuit breakers, bulkheads</td></tr>
+  <tr><td>"well-architected cloud solutions"</td><td>Name the six pillars and give a lever per pillar. They <em>will</em> check.</td></tr>
+  <tr><td>"monolith-to-microservices, cloud migration, re-platforming"</td><td>Strangler fig; the 7 Rs; how you split a database; how you avoid a distributed monolith</td></tr>
+  <tr><td>"IaC: CloudFormation, Terraform"</td><td>State, drift, modules, why you don't click in the console, how IaC runs in CI</td></tr>
+  <tr><td>"cost-optimization principles"</td><td>NAT Gateway bills, egress, idle resources, Savings Plans vs Spot, Lambda vs Fargate break-even</td></tr>
+  <tr><td>"mentoring of junior developers" / "code reviews"</td><td>Behavioural: how you review, how you give hard feedback, how you unblock someone</td></tr>
+  <tr><td>"distributed, multi-cultural teams"</td><td>Behavioural: async communication, timezone overlap, written-first working style</td></tr>
+</table>
+
+<h2>Gaps to pre-empt honestly</h2>
+<p>The JD mentions a few things you may not have touched. Do not pretend. Pre-empt them with a one-line honest frame plus adjacent experience — this reads as confidence, not weakness:</p>
+<ul>
+  <li><strong>EKS/Kubernetes</strong> — if your container experience is ECS/Fargate, say so: "I've run production on ECS Fargate; I know the K8s object model (deployments, services, ingress, probes, HPA) but haven't operated a cluster. Most of what I own transfers — the scheduling and networking concepts are the same, the operational surface is bigger."</li>
+  <li><strong>Terraform vs CloudFormation</strong> — if you only know one, say which, and demonstrate you understand the <em>concepts</em> (declarative desired state, drift, state locking, modules) rather than the syntax.</li>
+  <li><strong>"COFFEE, MQ"</strong> in the JD — COFFEE is an internal/client-specific integration platform; MQ is IBM MQ or Amazon MQ. Nobody expects you to know COFFEE. If asked: "I haven't used COFFEE; on the messaging side I've worked with &lt;SQS/SNS/Kafka/RabbitMQ&gt;, and the primitives — queues, topics, durable delivery, poison-message handling — carry over."</li>
+</ul>
+
+<h2>Questions to ask them (have 4 ready, ask 2–3)</h2>
+<ul>
+  <li>"Is this role on one long-running client engagement, or rotating across accounts? What's the typical engagement length?"</li>
+  <li>"How are the teams split between GDS and the onshore client team — do GDS engineers own services end-to-end including on-call, or is it build-and-hand-over?"</li>
+  <li>"What does the current AWS estate look like for the account I'd join — mostly serverless, mostly containers, or still mid-migration from on-prem?"</li>
+  <li>"Where does this team sit on IaC maturity today — is everything Terraform/CloudFormation, or is there still console-managed infrastructure to bring under control?"</li>
+  <li>"What separates someone who does well here in year one from someone who struggles?"</li>
+</ul>
+<div class="callout warn"><strong>Don't ask</strong> about salary, band, or WFH policy in the technical round — that's the HR round. Asking early reads as disengaged from the work.</div>
+
+<h2>The 48-hour prep order</h2>
+<ol>
+  <li><strong>Rapid revision sheet</strong> — skim it first to find your weak areas (it's the last page in this section).</li>
+  <li><strong>AWS sheets</strong> — Compute &amp; Storage, Data, Networking &amp; Security, Integration. These are ~40% of the round.</li>
+  <li><strong>Scenario sheet</strong> — read every scenario out loud. This is the round-decider and cannot be crammed silently.</li>
+  <li><strong>Node.js sheet</strong> — you likely know this; skim for the phrasing, not the content.</li>
+  <li><strong>Microservices, IaC/CI-CD, Well-Architected</strong> — one pass each.</li>
+  <li><strong>Behavioural</strong> — write your three stories out in full sentences. Do not wing these.</li>
+</ol>

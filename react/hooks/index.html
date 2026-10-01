@@ -1,0 +1,128 @@
+<h1>Hooks: Rules, Refs &amp; Memoization <span class="tag react">React</span></h1>
+<p><strong>Hooks let a function component have state, effects and context without a class — and, more importantly, let stateful logic be extracted and reused.</strong> Before hooks, sharing behaviour meant higher-order components and render props, which wrapped the tree in layers of anonymous components that showed up in the profiler and the devtools as "wrapper hell" while making the data flow untraceable.</p>
+<p>A custom hook is just a function that calls other hooks. That single idea replaces the entire HOC/render-prop pattern, and it composes: hooks call hooks call hooks, with no extra components in the tree.</p>
+
+<h2>The Rules of Hooks, and the real reason for them</h2>
+<ol>
+  <li><strong>Only call hooks at the top level</strong> — never inside conditions, loops, nested functions, or after an early <code>return</code>.</li>
+  <li><strong>Only call hooks from React function components or other custom hooks.</strong></li>
+</ol>
+<p>These are not stylistic. React stores a component's hooks in an ordered list attached to that component's fiber, and matches each call to its slot <strong>by call order</strong> — there are no names or keys involved. The internal model is essentially:</p>
+<pre><code>// render 1        slots: [ 0:'Ada', 1:0,   2:effect ]
+const [name]  = useState('Ada');   // slot 0
+const [count] = useState(0);       // slot 1
+useEffect(...);                    // slot 2</code></pre>
+<p>Skip a call on a later render and every subsequent hook shifts down one slot, so <code>useState</code> hands back another hook's value — often of the wrong type, sometimes without throwing:</p>
+<pre><code>// ❌ conditional hook
+if (isLoggedIn) {
+  const [name] = useState('Ada');  // slot 0 only on SOME renders
+}
+const [count] = useState(0);       // slot 0 or slot 1 depending on the branch → corrupt</code></pre>
+<p>React can often detect the change in hook count and throw "Rendered fewer hooks than expected", but when the counts happen to match it silently returns the wrong value. Enforce it with <code>eslint-plugin-react-hooks</code>: <code>rules-of-hooks</code> catches the ordering violations and <code>exhaustive-deps</code> catches lying dependency arrays.</p>
+<div class="callout tip"><strong>Senior tip:</strong> the correct pattern is to call the hook unconditionally and make the <em>value</em> conditional: <code>useEffect(() =&gt; { if (!enabled) return; … }, [enabled])</code>. Put the condition inside the hook, never around it.</div>
+
+<h2><code>useRef</code>: a mutable box that does not re-render</h2>
+<p><code>const ref = useRef(initial)</code> returns the <em>same</em> object <code>{ current: initial }</code> on every render. Writing <code>ref.current = x</code> mutates it in place: the value survives re-renders, and changing it triggers <strong>no</strong> render at all.</p>
+<table>
+  <thead><tr><th></th><th><code>useState</code></th><th><code>useRef</code></th><th>local variable</th></tr></thead>
+  <tbody>
+    <tr><td>Survives a re-render</td><td>yes</td><td>yes</td><td>no</td></tr>
+    <tr><td>Triggers a re-render</td><td>yes</td><td><strong>no</strong></td><td>no</td></tr>
+    <tr><td>Update style</td><td>replace (immutable)</td><td>mutate <code>.current</code></td><td>reassign</td></tr>
+  </tbody>
+</table>
+<p>It has exactly two jobs:</p>
+<ul>
+  <li><strong>A DOM handle.</strong> <code>&lt;input ref={inputRef} /&gt;</code> then <code>inputRef.current.focus()</code> — focus, scroll position, measurements, and controlling non-React widgets.</li>
+  <li><strong>Instance-like storage.</strong> Values the render output does not depend on: a timer id, a previous value, a "has submitted" flag, a websocket, a mutable counter.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> do not read or write <code>ref.current</code> <em>during render</em> (initializing it lazily on the first render is the accepted exception). Render must be pure so React can re-run, discard or replay it under concurrent rendering; a ref read during render makes the output depend on hidden mutable state. Touch refs in event handlers and effects — that is what "escape hatch" means.</div>
+<p>And if the UI must change when the value changes, it is state, not a ref: a ref update is invisible to React, so the screen simply will not update.</p>
+
+<h2><code>useMemo</code> and <code>useCallback</code></h2>
+<pre><code>const filtered = useMemo(() =&gt; items.filter(matches), [items, query]);   // caches a VALUE
+const onPick   = useCallback((id) =&gt; select(id), [select]);              // caches a FUNCTION
+// useCallback(fn, deps) === useMemo(() =&gt; fn, deps)</code></pre>
+<p>Both cache across renders keyed by a dependency array compared with <code>Object.is</code>. Neither is free: you pay an extra closure, an array allocation and a comparison on <em>every</em> render, plus the memory held by the cached value, in exchange for skipping the computation when deps match.</p>
+<p>Memoization is also a <strong>hint, not a guarantee</strong>: React may discard cached values (for example to free memory), so your code must stay correct if the factory re-runs. Never put a side effect or a "run once" flag inside <code>useMemo</code>.</p>
+<h3>The real job is referential stability</h3>
+<p>People reach for <code>useMemo</code> hoping for raw speed. In practice the compute saved is usually microseconds. What actually matters is the <strong>identity</strong> of the returned object or function, because identity feeds:</p>
+<ul>
+  <li><code>React.memo</code> children — a new function prop every render defeats the memo entirely, making the wrapper pure overhead.</li>
+  <li>Dependency arrays of <code>useEffect</code>/<code>useMemo</code>/<code>useCallback</code> — an unstable value re-fires the effect every render.</li>
+  <li>Context values — a fresh <code>{ user, login }</code> object re-renders every consumer on every provider render.</li>
+</ul>
+<pre><code>// a new object each render → every consumer of this context re-renders
+&lt;AuthCtx.Provider value={{ user, login }}&gt;
+
+// stable while its inputs are stable
+const value = useMemo(() =&gt; ({ user, login }), [user, login]);
+&lt;AuthCtx.Provider value={value}&gt;</code></pre>
+<h3>When memoizing is premature</h3>
+<ul>
+  <li>The child is not wrapped in <code>React.memo</code> and the value is not in a dependency array — then the memo buys nothing.</li>
+  <li>The computation is cheap (a small map, a string concat, arithmetic). Wrapping it costs more than it saves.</li>
+  <li>You have not profiled. Measure with the React DevTools Profiler; a re-render is not automatically a performance problem.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> the honest answer to "should I memoize everything?" is: fix the structure first (move state down, lift content up as <code>children</code>, split components), and note that the React Compiler in React 19 auto-memoizes, which is expected to make most hand-written <code>useMemo</code>/<code>useCallback</code> unnecessary. Where it is not enabled, memoize deliberately at the boundaries — memoized children, context values, expensive derivations.</div>
+
+<h2>Custom hooks: sharing logic, not state</h2>
+<p>A custom hook is any function whose name starts with <code>use</code> and which calls other hooks. The naming convention is what tells React, the linter and human readers that the Rules of Hooks apply to it.</p>
+<pre><code>function useLocalStorage(key, initial) {
+  const [value, setValue] = useState(() =&gt; {
+    const raw = localStorage.getItem(key);          // lazy init: read storage once
+    return raw ? JSON.parse(raw) : initial;
+  });
+
+  useEffect(() =&gt; {
+    localStorage.setItem(key, JSON.stringify(value));   // sync to an external system
+  }, [key, value]);
+
+  return [value, setValue];
+}</code></pre>
+<pre><code>function useDebounced(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() =&gt; {
+    const id = setTimeout(() =&gt; setDebounced(value), delay);
+    return () =&gt; clearTimeout(id);      // cleanup cancels the superseded timer
+  }, [value, delay]);
+  return debounced;
+}</code></pre>
+<div class="callout"><strong>The key insight:</strong> custom hooks share <strong>logic</strong>, not <strong>state</strong>. Each call site runs the hook body again and gets its own independent slots, exactly like calling <code>useState</code> twice in one component. Two components using <code>useLocalStorage</code> do not observe each other's value in memory. To share state you need lifted state, context, or an external store.</div>
+<h3>Composition</h3>
+<pre><code>function useSearch(query) {
+  const debounced = useDebounced(query, 300);   // hooks calling hooks
+  const [results, setResults] = useState([]);
+  useEffect(() =&gt; {
+    let ignore = false;
+    search(debounced).then(r =&gt; { if (!ignore) setResults(r); });
+    return () =&gt; { ignore = true; };
+  }, [debounced]);
+  return results;
+}</code></pre>
+<p>Good custom hooks are named after <em>what they do</em>, wrap a concrete concern (<code>useOnlineStatus</code>, <code>useInterval</code>, <code>useChatRoom</code>), and hide an effect behind a declarative value. A hook named <code>useEffectOnce</code> or a bag of unrelated logic named <code>useUtils</code> is a smell.</p>
+
+<h2>Choosing the right hook</h2>
+<table>
+  <thead><tr><th>You need…</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>A value that changes the UI</td><td><code>useState</code> (or <code>useReducer</code>)</td></tr>
+    <tr><td>A value that must persist but not render</td><td><code>useRef</code></td></tr>
+    <tr><td>A value derived from other values</td><td>plain computation; <code>useMemo</code> if expensive or identity matters</td></tr>
+    <tr><td>A stable function identity for a memo child or a dep array</td><td><code>useCallback</code></td></tr>
+    <tr><td>A DOM node handle</td><td><code>useRef</code> + <code>ref</code> attribute</td></tr>
+    <tr><td>To sync with something outside React</td><td><code>useEffect</code></td></tr>
+    <tr><td>To reuse stateful logic in several components</td><td>a custom hook</td></tr>
+  </tbody>
+</table>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why can't hooks be called conditionally?</summary><p>React keeps a per-component list of hook slots and matches each call to its slot purely by call order — there are no names. A skipped or extra call shifts every later hook by one slot, so a hook receives another hook's state. React sometimes throws "Rendered fewer hooks than expected"; when the counts coincide it silently returns the wrong value.</p></details>
+  <details><summary>What is the difference between <code>useRef</code> and <code>useState</code>?</summary><p>Both survive re-renders; only state triggers one. A ref is a stable mutable box you write in place, used for DOM handles and instance-like values the render output does not depend on. If changing the value should update the screen, it must be state.</p></details>
+  <details><summary>Why shouldn't you read or write a ref during render?</summary><p>Render must be pure and repeatable — React may re-run, abandon or replay it under concurrent rendering. A ref read during render makes the output depend on hidden mutable state, producing inconsistent UI. Read and write refs in event handlers and effects. Lazy initialization on the first render is the accepted exception.</p></details>
+  <details><summary><code>useMemo</code> vs <code>useCallback</code>?</summary><p><code>useMemo</code> caches the result of calling a function; <code>useCallback</code> caches the function itself. <code>useCallback(fn, deps)</code> is exactly <code>useMemo(() =&gt; fn, deps)</code>. Both compare deps with <code>Object.is</code>.</p></details>
+  <details><summary>Is memoizing everything a good default?</summary><p>No. Each one costs a closure, an allocation and a comparison every render, and memoization is a hint React may discard. Its real value is referential stability for <code>React.memo</code> children, dependency arrays and context values. Fix component structure first, profile before optimizing — and React 19's compiler auto-memoizes, removing most manual cases.</p></details>
+  <details><summary>Do two components using the same custom hook share state?</summary><p>No. A custom hook shares logic, not state: every call site executes the hook body with its own set of hook slots. Sharing state requires lifting it up, context, or an external store.</p></details>
+  <details><summary>Why do custom hooks have to start with <code>use</code>?</summary><p>It is a convention React's tooling relies on: the linter uses the prefix to decide where the Rules of Hooks apply and to check dependency arrays, and readers use it to know the function is stateful and must be called at the top level.</p></details>
+</div>

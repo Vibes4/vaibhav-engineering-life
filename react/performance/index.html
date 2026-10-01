@@ -1,0 +1,145 @@
+<h1>Performance &amp; Re-renders <span class="tag react">React</span></h1>
+<p><strong>Almost every React performance problem is a re-render problem</strong> — either too many components re-render, or one of them does too much work while it renders. Fixing it starts with knowing exactly what makes React run a component again, and that list is much shorter (and much dumber) than most people assume.</p>
+<p>The single most misunderstood fact: <strong>React does not compare props before re-rendering a child.</strong> If a parent renders, its children render, identical props or not. Everything else on this page — <code>memo</code>, <code>useCallback</code>, moving state down — exists to work around that default.</p>
+
+<h2>What actually triggers a re-render</h2>
+<p>A function component runs again for exactly four reasons:</p>
+<ul>
+  <li><strong>Its own state changed</strong> — a <code>useState</code> / <code>useReducer</code> setter produced a value that <code>Object.is</code> says is different.</li>
+  <li><strong>Its parent re-rendered</strong> — unconditionally, by default, regardless of props.</li>
+  <li><strong>A context it consumes got a new value</strong> — every consumer of that provider re-renders, and <code>memo</code> does <em>not</em> stop this.</li>
+  <li><strong>Its <code>key</code> or element type changed</strong> — which is not a re-render at all but an unmount plus a fresh mount, losing all state.</li>
+</ul>
+<p>Notice what is <em>not</em> on the list: "its props changed". Props changing is a consequence of the parent rendering, not an independent cause.</p>
+<pre><code>function Parent() {
+  const [count, setCount] = useState(0);
+  return (
+    &lt;div&gt;
+      &lt;button onClick={() =&gt; setCount(c =&gt; c + 1)}&gt;{count}&lt;/button&gt;
+      &lt;ExpensiveChild /&gt;   {/* no props at all — still re-renders every click */}
+    &lt;/div&gt;
+  );
+}</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> "My child takes no props, so React skips it" is false. React has no idea the output would be identical until it runs the component and diffs the result. Bailing out is opt-in via <code>React.memo</code>.</div>
+
+<h2>Render phase vs commit phase — a re-render is not a DOM update</h2>
+<p>React works in two phases. The <strong>render phase</strong> calls your components and builds a new element tree; it must be pure, and it can be interrupted, thrown away or repeated. The <strong>commit phase</strong> applies the minimal set of DOM mutations React computed, then runs layout effects and passive effects.</p>
+<table>
+  <thead><tr><th></th><th>Render phase</th><th>Commit phase</th></tr></thead>
+  <tbody>
+    <tr><td>What runs</td><td>Your component functions, <code>useMemo</code>, reducers</td><td>DOM mutations, refs, <code>useLayoutEffect</code>, then <code>useEffect</code></td></tr>
+    <tr><td>Interruptible</td><td>Yes (concurrent rendering)</td><td>No — synchronous and atomic</td></tr>
+    <tr><td>Side effects allowed</td><td>No</td><td>Yes</td></tr>
+    <tr><td>Cost</td><td>JS: calling functions, allocating elements</td><td>DOM writes, layout, paint</td></tr>
+  </tbody>
+</table>
+<p>So a component that re-renders and produces the same output costs you JS time only — no DOM touch. That is why a "wasted render" of a leaf with three divs is genuinely free, and why memoizing it can be a net loss. Wasted renders matter when they are <em>many</em> (a long list) or <em>expensive</em> (heavy computation, big subtree).</p>
+
+<h2><code>React.memo</code> — and the three ways it silently does nothing</h2>
+<p><code>memo(Component)</code> wraps a component so React does a <strong>shallow</strong> <code>Object.is</code> comparison of each prop before re-rendering it. Equal props → React reuses the previous output and skips the subtree.</p>
+<pre><code>const Row = memo(function Row({ id, label, onSelect }) { … });
+// optional second argument: custom comparator, returns true to SKIP the render
+const Row = memo(RowImpl, (prev, next) =&gt; prev.item.id === next.item.id);</code></pre>
+<p>It is defeated whenever any prop is a new reference each render:</p>
+<pre><code>// ❌ all three defeat memo — new identity on every parent render
+&lt;Row style={{ color: 'red' }} /&gt;         // new object
+&lt;Row tags={[]} /&gt;                        // new array
+&lt;Row onSelect={() =&gt; pick(id)} /&gt;        // new function
+
+// ❌ also defeated: children as JSX is a new element object every time
+&lt;Card&gt;&lt;Row /&gt;&lt;/Card&gt;                     // memo(Card) compares props.children — never equal</code></pre>
+<p>And <code>memo</code> does not block updates that come from inside: its own state, and any context it consumes, still re-render it.</p>
+<div class="callout warn"><strong>Gotcha:</strong> a single unstable prop makes the entire <code>memo</code> wrapper dead weight — you pay the comparison cost and get zero skips. This failure is silent; only the Profiler reveals it.</div>
+
+<h2><code>useMemo</code> / <code>useCallback</code>: referential stability first, caching second</h2>
+<p>Both cache a value across renders while the dependency array is shallow-equal. <code>useCallback(fn, deps)</code> is just <code>useMemo(() =&gt; fn, deps)</code>.</p>
+<ul>
+  <li><strong>Primary use — stable identity.</strong> Keep an object/array/function reference constant so a <code>memo</code> child, a <code>useEffect</code> dependency array, or a context value does not invalidate.</li>
+  <li><strong>Secondary use — skipping expensive work.</strong> Real computation (sorting 10k rows, parsing, building an index) worth more than the memo bookkeeping.</li>
+  <li><strong>They are not free.</strong> Each one allocates a closure and a deps array, compares deps every render, and holds the cached value alive. Memoizing <code>x * 2</code> is strictly slower than recomputing it.</li>
+  <li><strong>They are a hint, not a guarantee.</strong> React may discard a <code>useMemo</code> cache (e.g. to free memory); never rely on it for correctness.</li>
+</ul>
+<pre><code>// useCallback with no memo child downstream = pure overhead
+const onClick = useCallback(() =&gt; setOpen(o =&gt; !o), []);   // pointless if &lt;button&gt; is the consumer
+
+// useMemo that matters: the context value
+const value = useMemo(() =&gt; ({ user, logout }), [user, logout]);
+return &lt;AuthCtx.Provider value={value}&gt;{children}&lt;/AuthCtx.Provider&gt;;</code></pre>
+<div class="callout tip"><strong>Senior tip:</strong> React 19's compiler (React Compiler / "forget") auto-memoizes at build time, which is why the community advice has shifted from "memoize aggressively" to "write clean code and let the compiler do it". Until you have it enabled, memoize deliberately, guided by the Profiler.</div>
+
+<h2>The free wins: move state down, pass <code>children</code> through</h2>
+<p>Structural fixes beat memoization because they cost nothing at runtime and cannot be silently defeated.</p>
+<h3>1. Push state down</h3>
+<pre><code>// ❌ typing in the input re-renders the whole page
+function Page() {
+  const [text, setText] = useState('');
+  return &lt;&gt;&lt;input value={text} onChange={e =&gt; setText(e.target.value)} /&gt;&lt;HugeTree /&gt;&lt;/&gt;;
+}
+// ✅ the state now lives in a leaf; HugeTree never hears about it
+function SearchBox() { const [text, setText] = useState(''); return &lt;input … /&gt;; }
+function Page() { return &lt;&gt;&lt;SearchBox /&gt;&lt;HugeTree /&gt;&lt;/&gt;; }</code></pre>
+<h3>2. Lift the expensive subtree into <code>children</code></h3>
+<p>When state must stay at the top, pass the expensive part in as <code>children</code>. The element was created by the <em>grandparent</em>, so it is the same object across the stateful component's renders and React bails out of re-rendering it — no <code>memo</code> required.</p>
+<pre><code>function Counter({ children }) {
+  const [n, setN] = useState(0);
+  return &lt;div onClick={() =&gt; setN(n + 1)}&gt;{n}{children}&lt;/div&gt;;  // children not re-created
+}
+&lt;Counter&gt;&lt;HugeTree /&gt;&lt;/Counter&gt;   // HugeTree renders once</code></pre>
+<div class="callout"><strong>Note:</strong> this is the same bail-out <code>memo</code> uses — React compares the element object by reference. It just happens automatically because the JSX was evaluated one level up.</div>
+
+<h2>Lists, keys and virtualization</h2>
+<ul>
+  <li><strong>Stable keys.</strong> Use a domain id. An array index as key makes React reuse the wrong instance when items are inserted, removed or reordered — state and DOM attach to the wrong row. Index keys are only safe for a static, never-reordered list.</li>
+  <li><strong>Never <code>key={Math.random()}</code>.</strong> Every render remounts every row: the worst possible outcome.</li>
+  <li><strong>Memoize row components</strong> and pass primitives (<code>id</code>, and an <code>onSelect</code> that is stable) rather than freshly built objects.</li>
+  <li><strong>Virtualize past roughly a few hundred DOM-heavy rows.</strong> Below ~100 simple rows it is unnecessary; above ~1,000 it is close to mandatory. Use <code>react-window</code> (tiny, fixed/variable size lists) or TanStack Virtual (headless, grids, dynamic measurement).</li>
+</ul>
+<p>Virtualization renders only the visible window plus a small overscan, so cost stops scaling with data size:</p>
+<pre><code>&lt;FixedSizeList height={600} itemCount={100000} itemSize={40} width="100%"&gt;
+  {({ index, style }) =&gt; &lt;div style={style}&gt;{rows[index].label}&lt;/div&gt;}
+&lt;/FixedSizeList&gt;
+// ~15 visible + overscan ≈ 25 DOM nodes instead of 100,000</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> virtualized rows are not in the DOM, so browser Ctrl+F, print, and naive end-to-end selectors will not find them. That is a product decision, not just a technical one.</div>
+
+<h2>Code splitting, transitions and deferred values</h2>
+<h3>Code splitting</h3>
+<pre><code>const Settings = lazy(() =&gt; import('./Settings'));
+&lt;Suspense fallback={&lt;Spinner /&gt;}&gt;&lt;Settings /&gt;&lt;/Suspense&gt;</code></pre>
+<p>Split at <strong>route</strong> boundaries first — that is where the payoff is largest and the loading state is expected. Then split heavy, rarely-opened widgets (rich text editors, charts, maps, modals). Splitting tiny components just adds network round-trips. Prefetch on hover/intent to hide the latency.</p>
+<h3>Keeping the UI responsive</h3>
+<ul>
+  <li><code>useTransition</code> — mark an update as non-urgent: <code>startTransition(() =&gt; setQuery(v))</code>. The typed character commits immediately; the expensive filtered list renders at lower priority and can be interrupted. <code>isPending</code> lets you show a subtle stale indicator.</li>
+  <li><code>useDeferredValue</code> — the same idea when you only have a value, not a setter: <code>const deferred = useDeferredValue(query)</code>, then render the expensive list from <code>deferred</code>.</li>
+</ul>
+<div class="callout"><strong>Note:</strong> these do not make rendering faster. They change <em>priority</em> so the browser can paint the urgent update first. If a single render takes 400 ms, it still takes 400 ms — fix the algorithm or virtualize.</div>
+
+<h2>Measuring, and knowing when to stop</h2>
+<h3>Measure first — never guess</h3>
+<ul>
+  <li><strong>React DevTools Profiler.</strong> Record an interaction, read the flamegraph and the ranked chart; each commit shows what rendered and "why did this render" (enable it in settings).</li>
+  <li><strong>Highlight updates.</strong> DevTools setting that flashes a border around every re-rendering component — the fastest way to spot a cascade.</li>
+  <li><strong>&lt;Profiler&gt; component.</strong> Programmatic timings in code: <code>&lt;Profiler id="list" onRender={(id, phase, actualDuration, baseDuration) =&gt; …}&gt;</code>. <code>baseDuration</code> is the cost without any memoization, so <code>baseDuration - actualDuration</code> is what memoization actually bought you.</li>
+  <li><strong>Profile a PRODUCTION build.</strong> Development React is several times slower, double-invokes components under StrictMode, and carries warning machinery. Use <code>react-dom/profiling</code> (or the framework's profiling build) to keep the Profiler working in production mode.</li>
+  <li><strong>Browser tools too.</strong> Performance panel for long tasks and layout thrashing; Lighthouse / web-vitals for INP and LCP, which are what users actually feel.</li>
+</ul>
+
+<h3>Premature optimization traps</h3>
+<ul>
+  <li><strong>Memoizing everything.</strong> Every <code>memo</code>/<code>useMemo</code>/<code>useCallback</code> adds allocation, comparison and cognitive cost. Net negative on cheap components.</li>
+  <li><strong>Wrapping every callback in <code>useCallback</code></strong> when the consumer is a plain DOM element that never compares props.</li>
+  <li><strong>Memoizing a component that always gets a new prop</strong> — pure overhead, and it looks like it works.</li>
+  <li><strong>Fixing renders instead of the real cost.</strong> 200 cheap renders are usually cheaper than one 300 ms JSON parse or one unvirtualized 5,000-row table.</li>
+  <li><strong>Optimizing dev-mode numbers</strong> and chasing renders the user cannot perceive. If INP is fine, stop.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> the order to reach for fixes is: (1) fix the algorithm or payload, (2) move state down / pass children, (3) virtualize long lists, (4) split code, (5) transitions, and only then (6) <code>memo</code> + <code>useCallback</code> — each backed by a Profiler before/after.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Does React skip re-rendering a child whose props did not change?</summary><p>No. By default a parent re-render re-renders the whole subtree, identical props or not — React cannot know the output is the same without running the component. Skipping is opt-in through <code>React.memo</code> (or a class's <code>shouldComponentUpdate</code>/<code>PureComponent</code>), or it happens implicitly when the same element object is reused, as with <code>children</code> passed from a grandparent.</p></details>
+  <details><summary>Why did adding <code>React.memo</code> change nothing?</summary><p>Most likely a prop is a new reference every render — an inline object, array, arrow function, or <code>children</code> as JSX, all of which fail the shallow <code>Object.is</code> check. Or the re-render is not coming from the parent at all: <code>memo</code> never blocks the component's own state updates or a context value change.</p></details>
+  <details><summary>When is <code>useCallback</code> pointless?</summary><p>When the callback is only handed to a host element such as <code>&lt;button onClick&gt;</code>, which never compares props, or when the receiving component is not memoized. You then pay for a closure, a deps array and a comparison every render and skip nothing. It is worth it when the consumer is a <code>memo</code> component, a <code>useEffect</code> dependency, or part of a context value.</p></details>
+  <details><summary>What is the difference between a re-render and a DOM update?</summary><p>A re-render is the render phase — React calls your component and diffs the returned element tree. A DOM update happens in the commit phase and only for nodes that actually differ. A re-render that produces identical output costs JS time but touches no DOM, which is why isolated wasted renders are cheap and mass ones are not.</p></details>
+  <details><summary>Index keys or ids?</summary><p>Ids, unless the list is static and never reordered. Keys identify a child across renders; with index keys, inserting at the front makes React match old item 0 to new item 0, so it patches every row and leaves component state, inputs and focus attached to the wrong data instead of moving nodes.</p></details>
+  <details><summary>How do you decide to virtualize?</summary><p>By measuring: when the number of mounted DOM nodes makes mount time or scroll jank visible — practically a few hundred complex rows, or a thousand simple ones. Virtualization makes cost proportional to viewport size rather than data size, at the price of losing in-page find, print, and simple full-list selectors.</p></details>
+  <details><summary>Why must you profile a production build?</summary><p>Development React is significantly slower, ships warning and DevTools instrumentation, and under StrictMode intentionally double-invokes renders and effects. Dev timings therefore over-report cost and mislead about where it is. Use a profiling-enabled production build so the numbers reflect what users experience.</p></details>
+</div>

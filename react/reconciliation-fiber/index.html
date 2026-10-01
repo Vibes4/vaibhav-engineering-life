@@ -1,0 +1,131 @@
+<h1>Reconciliation &amp; Fiber <span class="tag react">React</span></h1>
+<p><strong>Reconciliation is how React turns "here is what the UI should look like now" into "here are the specific DOM mutations to perform".</strong> You describe the whole tree on every render; React diffs the new element tree against the previous one and commits only the differences.</p>
+<p><strong>Fiber</strong> is the data structure and scheduler that does this work. Rewritten in React 16, it turned reconciliation from one uninterruptible recursive call into a queue of small units of work that can be paused, prioritised, abandoned and restarted — which is what makes concurrent features like <code>useTransition</code> and Suspense possible at all.</p>
+
+<h2>The honest claim about the virtual DOM</h2>
+<p>The virtual DOM is a tree of plain JS objects (<code>{ type, props, key }</code>) that React builds when your components run. Diffing it is <em>extra</em> work compared with writing to the DOM directly — hand-written imperative DOM code will always be faster than React if you write it perfectly.</p>
+<p>What the virtual DOM actually buys you:</p>
+<ul>
+  <li><strong>A declarative programming model.</strong> You write UI as a function of state and never touch a node by hand; the whole class of "the DOM and my model drifted apart" bugs disappears.</li>
+  <li><strong>Batching.</strong> Many state updates collapse into one diff and one coordinated set of mutations, instead of N separate layout-triggering writes.</li>
+  <li><strong>Minimal, ordered mutations.</strong> React computes the set of changes before touching anything, so it avoids repeated layout thrashing.</li>
+  <li><strong>A platform-independent target.</strong> The same reconciler drives react-dom, React Native and custom renderers.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> "the virtual DOM is faster than the DOM" is a comparison error and a red flag in interviews. It is faster than <em>naive</em> re-rendering (blowing away and rebuilding innerHTML), and it is fast <em>enough</em> while being far easier to reason about. That is the real pitch.</div>
+
+<h2>The two heuristics that make diffing O(n)</h2>
+<p>Optimally diffing two arbitrary trees is O(n³). React refuses to pay that and instead assumes two things that are almost always true of real UIs, giving O(n):</p>
+<h3>1. Different element type ⇒ tear down the whole subtree</h3>
+<p>If the type at a position changes — <code>div</code> → <code>span</code>, or <code>ProfileA</code> → <code>ProfileB</code> — React does not try to match children. It unmounts the old subtree (running cleanup and <code>componentWillUnmount</code>), destroys all of its state and refs, and mounts the new one from scratch.</p>
+<pre><code>{isEditing ? &lt;EditForm value={v} /&gt; : &lt;ReadOnly value={v} /&gt;}
+// toggling this destroys the whole subtree each way — scroll position, focus,
+// uncontrolled input values and any local state are gone.</code></pre>
+<p>The same trap hides in a component defined <em>inside</em> another component: the function identity is new on every render, so the type differs, so React remounts it every time.</p>
+<pre><code>// ❌ new function identity per render → remount + state loss + focus loss, every keystroke
+function Page() {
+  function Row() { … }
+  return &lt;Row /&gt;;
+}</code></pre>
+<h3>2. Same type ⇒ keep the instance, update props</h3>
+<p>Same type at the same position means React keeps the existing DOM node and fiber, updates only the attributes that changed, and preserves state, refs and effects. This is why toggling a class on an element is cheap and why a component keeps its <code>useState</code> across prop changes.</p>
+
+<h2>Keys: identity across renders</h2>
+<p>Inside a list, position is not identity. A <code>key</code> tells React "this is the same logical child as before, even if it moved". Without keys (or with index keys) React matches children by position.</p>
+<pre><code>old: [a, b, c]        new: [c, a, b]        // one item moved to the front
+
+index keys : slot 0 was "a" now "c" → patch, slot 1 patch, slot 2 patch  (3 updates)
+stable ids : c matched to c, a to a, b to b → ONE move                    (1 move)</code></pre>
+<p>The extra patches are the cheap part of the damage. The expensive part is that <strong>state travels with the key</strong>: if row "a" had a half-typed input, an open menu or a focused field, an index key hands that state to whatever item now occupies index 0.</p>
+<table>
+  <thead><tr><th>Key choice</th><th>Verdict</th></tr></thead>
+  <tbody>
+    <tr><td>Stable domain id (<code>item.id</code>)</td><td>Correct default</td></tr>
+    <tr><td>Array index</td><td>Only for a static list that is never reordered, inserted into, filtered or sorted</td></tr>
+    <tr><td><code>Math.random()</code> / <code>uuid()</code> in render</td><td>Never — remounts every child on every render</td></tr>
+    <tr><td>Composite (<code>`${type}-${id}`</code>)</td><td>Fine when ids are only unique per group</td></tr>
+  </tbody>
+</table>
+<div class="callout tip"><strong>Senior tip:</strong> keys are scoped to their sibling list, not globally, and they are consumed by React — <code>props.key</code> is not readable inside the component. Flip the trick around and <code>key</code> becomes a deliberate reset: changing <code>key={userId}</code> on a form remounts it with fresh state.</div>
+
+<h2>Fiber: work as a linked list, not a call stack</h2>
+<p>Before React 16 the "stack reconciler" recursed through the tree synchronously. Once started, it could not stop — a big update blocked the main thread and dropped frames, with no way to say "the user just typed, handle that first".</p>
+<p>A <strong>fiber</strong> is a plain object representing one unit of work for one element. Fibers form a tree via three pointers — <code>child</code>, <code>sibling</code>, <code>return</code> (parent) — so React can walk the tree with a loop and an explicit cursor rather than the JS call stack. That means it can stop between any two fibers, keep the cursor, hand the thread back to the browser, and resume later.</p>
+<pre><code>fiber = {
+  tag, type, key,          // what this is
+  stateNode,               // the DOM node or class instance
+  child, sibling, return,  // tree traversal without recursion
+  pendingProps, memoizedProps, memoizedState,   // the hook list lives here
+  flags,                   // Placement / Update / Deletion effect tags
+  lanes,                   // priority of pending work
+  alternate,               // the other tree — see double buffering
+}</code></pre>
+<p>Work proceeds as <code>beginWork</code> going down (render the component, create child fibers) and <code>completeWork</code> coming back up (build/prepare DOM nodes, bubble effect flags to the parent). Between any two units, React checks whether its time slice has expired.</p>
+
+<h2>Render phase vs commit phase</h2>
+<pre class="mermaid">
+flowchart TD
+  U["State update scheduled with a lane"] --> S["Scheduler picks highest priority lane"]
+  S --> B["Render phase builds work in progress tree"]
+  B --> W["One fiber of work, then check the time budget"]
+  W --> B
+  W --> I["Higher priority came in, discard and restart"]
+  I --> S
+  B --> C["Commit phase, synchronous and uninterruptible"]
+  C --> M["Mutate the DOM and swap current to the finished tree"]
+  M --> L["Run layout effects, useLayoutEffect and refs"]
+  L --> P["Browser paints"]
+  P --> A["Run passive effects, useEffect"]
+</pre>
+<table>
+  <thead><tr><th></th><th>Render phase</th><th>Commit phase</th></tr></thead>
+  <tbody>
+    <tr><td>Runs</td><td>Components, <code>useMemo</code>, reducers, <code>getDerivedStateFromProps</code></td><td>DOM mutations, ref attach/detach, <code>useLayoutEffect</code>, then <code>useEffect</code></td></tr>
+    <tr><td>Interruptible</td><td>Yes — can be paused, thrown away or restarted</td><td>No — one synchronous, atomic block</td></tr>
+    <tr><td>Must be pure</td><td>Yes</td><td>Side effects belong here</td></tr>
+    <tr><td>Sees the DOM</td><td>No</td><td>Yes</td></tr>
+  </tbody>
+</table>
+<div class="callout warn"><strong>Why "no side effects in render" is a hard rule:</strong> a render can be discarded or replayed. If you mutate a module variable, fire analytics or write to a ref during render, it happens an unpredictable number of times. StrictMode double-invokes components in development precisely to surface this.</div>
+<p>Commit is split into three sub-phases: <em>before mutation</em> (snapshots, e.g. <code>getSnapshotBeforeUpdate</code>), <em>mutation</em> (insert/update/delete DOM, detach old refs), and <em>layout</em> (attach refs, run <code>useLayoutEffect</code> synchronously before paint). Passive effects (<code>useEffect</code>) are flushed after paint, which is why they never block the frame — and why measuring layout in <code>useEffect</code> can show a flicker where <code>useLayoutEffect</code> would not.</p>
+
+<h2>Double buffering: current and work-in-progress</h2>
+<p>React keeps <strong>two</strong> fiber trees. <code>current</code> is what is on screen. During a render React builds a <code>workInProgress</code> tree, reusing fibers from <code>current</code> where possible via the <code>alternate</code> pointer that links each pair.</p>
+<ul>
+  <li>An abandoned render simply drops the WIP tree — <code>current</code> was never touched, so the screen never showed a half-finished state.</li>
+  <li>Commit ends with a single pointer swap: the finished WIP tree becomes <code>current</code>. That is why commit is atomic.</li>
+  <li>The two trees are recycled between renders instead of being allocated fresh, which keeps GC pressure down.</li>
+</ul>
+
+<h2>Concurrent rendering: lanes and time slicing</h2>
+<p>Every update is tagged with a <strong>lane</strong> — a bitmask priority. Discrete input (click, keypress) gets a sync lane; the default lane covers ordinary updates; transitions get a lower lane; offscreen/idle work is lowest. The scheduler always works on the highest-priority pending lane, and entangles lanes that must not be split apart.</p>
+<p><strong>Time slicing:</strong> for non-sync work React renders a few fibers, checks <code>shouldYield()</code> against a ~5 ms budget, and if the budget is gone it yields to the browser via a <code>MessageChannel</code> task, so input and paint get a turn. It then resumes at the fiber it stopped on. If a higher-priority update arrives mid-render, the in-progress tree is thrown away and rendering restarts at the new priority.</p>
+<h3>How this powers <code>useTransition</code></h3>
+<pre><code>const [isPending, startTransition] = useTransition();
+
+function onChange(e) {
+  setQuery(e.target.value);                       // sync lane: the input updates now
+  startTransition(() =&gt; setResults(filter(e.target.value)));  // transition lane: interruptible
+}</code></pre>
+<p>The typed character commits in the next frame. The expensive results render at transition priority and can be interrupted and restarted by the next keystroke — so no frame is blocked and stale results are never shown. <code>useDeferredValue</code> is the same mechanism with a value instead of a setter. Without Fiber's interruptible render phase, neither could exist.</p>
+<div class="callout"><strong>Note:</strong> concurrent features do not make rendering faster. They reorder <em>when</em> work happens. A single 400 ms component render is still 400 ms and still blocks a frame — time slicing only helps when the work is spread across many fibers.</div>
+
+<h2>Hydration and mismatches</h2>
+<p>Server rendering ships HTML; <strong>hydration</strong> then walks the existing DOM with <code>hydrateRoot</code>, builds the fiber tree, and attaches events and state without re-creating nodes. It expects the client's first render to produce exactly the server markup.</p>
+<ul>
+  <li>Common causes of a mismatch: <code>Date.now()</code>/<code>Math.random()</code> in render, locale or timezone formatting, reading <code>window</code>/<code>localStorage</code>, browser extensions mutating the DOM, and invalid nesting such as a <code>&lt;div&gt;</code> inside a <code>&lt;p&gt;</code> which the parser silently rewrites.</li>
+  <li>React 18 recovers from a mismatch by discarding the server HTML for that subtree and client-rendering it — correct, but you lose the SSR benefit and get a console error. React 19 reports mismatches with a much clearer diff.</li>
+  <li>Deliberate escape hatches: <code>suppressHydrationWarning</code> for a single unavoidable node (a timestamp), or render the client-only value in an effect after mount.</li>
+  <li>Selective hydration: with streaming SSR, <code>Suspense</code> boundaries hydrate independently and React prioritises the boundary the user just interacted with — another thing only interruptible rendering makes possible.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Is the virtual DOM faster than the real DOM?</summary><p>No — it is additional work on top of the DOM. It wins by enabling a declarative model, batching many updates into one coordinated set of mutations, and computing a minimal ordered diff before touching anything. It is faster than naive full re-rendering and fast enough in practice, while removing an entire class of manual-DOM-sync bugs.</p></details>
+  <details><summary>How does React get O(n) diffing?</summary><p>Two heuristics instead of a general tree-diff. First, elements of different types produce different trees, so a type change tears down the subtree and rebuilds it rather than trying to match children. Second, keys let the developer declare which children are stable across renders, so sibling lists are matched by identity rather than searched. A general optimal diff would be O(n³).</p></details>
+  <details><summary>What breaks when you use the array index as a key?</summary><p>Keys are identity across renders. With index keys, inserting or reordering makes React match old index 0 to new index 0, so it patches every row's props instead of moving one node, and — the real bug — component state, uncontrolled input values, focus and refs stay attached to the position rather than the item. The half-typed comment ends up on the wrong row.</p></details>
+  <details><summary>What is a fiber, and what did it change?</summary><p>A fiber is a plain object representing one unit of work for one element, linked to its child, sibling and parent. Because the tree is walked with a loop over these pointers rather than the JS call stack, React can pause between units, yield to the browser, resume, reprioritise or discard work. The pre-16 stack reconciler recursed synchronously and could not be interrupted.</p></details>
+  <details><summary>Why are side effects forbidden during render?</summary><p>The render phase is interruptible: React may throw a partial render away and restart it, or render a component twice at different priorities, so anything you do there can happen zero, one or many times. Effects belong in the commit phase (<code>useEffect</code>/<code>useLayoutEffect</code>). StrictMode double-invokes components in development to make impure renders fail loudly.</p></details>
+  <details><summary>What is double buffering in React?</summary><p>React maintains two fiber trees linked by <code>alternate</code>: <code>current</code> (on screen) and <code>workInProgress</code> (being built). Discarding an interrupted render just drops the WIP tree, so the user never sees a partial UI, and commit is a single pointer swap making it atomic. The trees are recycled rather than reallocated.</p></details>
+  <details><summary>How does <code>useTransition</code> relate to Fiber?</summary><p><code>startTransition</code> tags its updates with a low-priority lane. The scheduler renders that work in slices, yielding roughly every 5 ms, and abandons and restarts it whenever a higher-priority update such as a keystroke arrives. The urgent update commits first; the expensive one catches up. This depends entirely on the render phase being interruptible, which is what Fiber provides.</p></details>
+  <details><summary>What causes a hydration mismatch?</summary><p>The client's first render producing different markup than the server sent — random or time-based values, locale/timezone formatting, reading browser-only APIs during render, invalid HTML nesting that the parser rewrites, or extensions mutating the DOM. React 18 falls back to client-rendering that subtree, losing the SSR benefit. Fix by making the first render deterministic, deferring the client-only value to an effect, or using <code>suppressHydrationWarning</code> for a single unavoidable node.</p></details>
+</div>

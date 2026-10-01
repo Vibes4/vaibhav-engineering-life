@@ -1,0 +1,96 @@
+<h1>Scenario &amp; Design Round <span class="tag express">EY Sheet 10</span></h1>
+<p>This is the round-decider. Somewhere around minute 40 you'll get an open-ended prompt — "design an order processing system on AWS", or "this API got slow, what do you do". They're not checking whether you produce <em>the</em> answer; they're checking whether you produce <em>a structured</em> answer under ambiguity, ask the right clarifying questions, and name your trade-offs out loud.</p>
+<div class="callout warn"><strong>The mistake to avoid:</strong> jumping straight to services. A candidate who starts with "I'd use Lambda and DynamoDB" before knowing the load, the consistency requirement or the budget has failed the question regardless of what they build next. Spend the first 2–3 minutes on requirements. Always.</div>
+
+<h2>The framework — use it every single time</h2>
+<ol>
+<li><strong>Clarify (2–3 min).</strong> Functional scope, scale (requests/day, peak-to-average ratio, data volume, growth), latency SLO, consistency requirement, availability target, compliance/data residency, budget, and team. Ask <em>who the users are</em> and <em>what happens if it's down for an hour</em> — the answers change the architecture more than anything technical.</li>
+<li><strong>State assumptions out loud.</strong> "I'll assume 10 million requests a day, peaking at 5x during business hours, p99 under 300 ms, and that we can tolerate seconds of eventual consistency on reads. Tell me if any of those are wrong."</li>
+<li><strong>Sketch the happy path.</strong> Client → edge → API → compute → data, plus the async pipeline. Keep it simple first; complexity gets added for stated reasons, never up front.</li>
+<li><strong>Then layer in the hard parts.</strong> Failure modes, idempotency, scaling bottleneck, security boundary, observability.</li>
+<li><strong>Name the trade-off and the cost.</strong> "This is roughly $X a month; the biggest line item is Y; if the budget is tighter I'd drop Z and accept W."</li>
+<li><strong>Say what you'd do differently at 10x.</strong> This is the senior signal — showing you know where your design breaks first.</li>
+</ol>
+<div class="callout tip"><strong>Say this when handed a vague prompt:</strong> "Before I design anything — can I ask about scale and the latency requirement? Those two change the answer more than anything else. And is there an existing AWS estate I should fit into, or is this greenfield?" That single sentence puts you in the top quartile of candidates.</div>
+
+<h2>Scenario 1 — Design an order processing system</h2>
+<p>The most likely prompt, because it exercises every primary skill on the JD at once: API Gateway, Lambda, SQS/SNS, DynamoDB/RDS, idempotency, and a saga.</p>
+<pre class="mermaid">
+flowchart LR
+  U[Client] --> CF[CloudFront + WAF]
+  CF --> AG[API Gateway<br/>JWT authorizer]
+  AG --> OS[Order Service<br/>ECS Fargate]
+  OS --> DB[(RDS PostgreSQL<br/>Multi-AZ)]
+  OS --> OB[(outbox table)]
+  OB -. "CDC / relay" .-> EB[EventBridge<br/>OrderCreated]
+  EB --> Q1[SQS: payments]
+  EB --> Q2[SQS: inventory]
+  EB --> Q3[SQS: notifications]
+  Q1 --> P[Payment worker]
+  Q2 --> I[Inventory worker]
+  Q3 --> N[Notification worker]
+  Q1 -. failures .-> D1[DLQ]
+  P --> SF[Step Functions<br/>saga + compensation]
+</pre>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Walk me through this design.</summary>
+<p><strong>Clarify first:</strong> orders per day and peak multiplier; is payment synchronous from the user's perspective or can we accept-then-confirm; what's the consistency requirement on inventory (can we oversell and compensate, or must we never oversell); is there an existing ERP or payment provider to integrate; what's the data residency requirement.</p>
+<p><strong>The write path.</strong> CloudFront with WAF at the edge, API Gateway with a JWT authorizer for authentication and throttling, and the Order Service on ECS Fargate — I'd pick Fargate over Lambda here because it's steady traffic with a relational connection pool, but Lambda is defensible if traffic is spiky. The service validates the request, checks the <code>Idempotency-Key</code> header against a store so a retried submit doesn't create two orders, and writes the order plus an outbox row <strong>in one database transaction</strong>. It returns 201 immediately with status <code>PENDING</code>.</p>
+<p><strong>Why RDS and not DynamoDB</strong> for orders: orders have relational structure (order → line items → customer), invariants that want a transaction, and reporting queries the business will inevitably ask for. If the volume were extreme and the access patterns strictly key-based, I'd revisit.</p>
+<p><strong>The async path.</strong> A relay publishes outbox rows to EventBridge as <code>OrderCreated</code>. EventBridge rules fan out to per-consumer SQS queues — payments, inventory, notifications — each with its own DLQ. Per-consumer queues matter: a notification failure must not block payment processing, and each consumer gets independent retry, scaling and backlog.</p>
+<p><strong>The saga.</strong> Payment → inventory reservation → fulfilment is orchestrated by Step Functions, because I want the execution history visible and the compensations explicit. If payment succeeds and inventory fails, the compensation refunds and marks the order failed with a customer notification. Every step is idempotent and has a timeout.</p>
+<p><strong>Failure handling.</strong> Consumers are idempotent via a DynamoDB dedup table with TTL. DLQs are alarmed on depth greater than zero. Visibility timeouts exceed p99 processing time. The order status is the source of truth the customer sees, so a stuck saga is visible rather than silent.</p>
+<p><strong>At 10x</strong> the first thing to break is the relational write path, so I'd shard by customer or move the high-volume event history out of RDS; the second is the payment provider's rate limit, which I'd handle by rate-limiting the consumer rather than scaling it.</p></details>
+
+<details class="qa"><summary>Follow-up: how do you make sure a customer is never charged twice?</summary>
+<p>Three layers, because any single one has a hole:</p>
+<ol>
+<li><strong>At the edge</strong> — the client sends an <code>Idempotency-Key</code> on the submit request. The API stores key → response; a retry with the same key returns the stored response rather than creating a second order. This handles the "user double-clicked" and "mobile retried on flaky network" cases.</li>
+<li><strong>In the queue consumer</strong> — SQS is at-least-once, so the payment worker does a conditional write to a dedup table keyed by <code>orderId</code> (or a payment attempt ID) before calling the provider. Crucially, the dedup record and the record of the charge must be written in the same transaction as the effect, or in a way that can be reconciled — otherwise a crash between "charged" and "recorded" produces exactly the double-charge you're preventing.</li>
+<li><strong>At the payment provider</strong> — every serious provider supports an idempotency key on their API. Pass a deterministic one derived from the order, so even if both previous layers fail, the provider deduplicates.</li>
+</ol>
+<p>And the honest caveat: with a network partition you can end up not knowing whether the charge succeeded. That's why you need a reconciliation job that compares your ledger against the provider's settlement report daily, and a double-entry ledger so discrepancies are detectable rather than invisible.</p></details>
+
+<h2>Scenario 2 — "The API got slow." Debug it.</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Walk me through your diagnosis.</summary>
+<p>I'd resist guessing and narrow systematically — and I'd say the first question out loud: <strong>"slow for whom, since when, and on which endpoints?"</strong> A global regression since a deploy is a different investigation from one tenant being slow for a week.</p>
+<ol>
+<li><strong>Quantify.</strong> Look at p50, p95 and p99 separately. If p50 is flat and p99 exploded, it's a tail problem — GC pauses, cold starts, a hot partition, one slow shard. If everything moved together, it's systemic — a downstream, a resource limit, or a bad deploy.</li>
+<li><strong>Correlate with change.</strong> Did it start at a deploy, a config change, a traffic increase, or a data-volume threshold? The deploy markers on the dashboard usually answer this in ten seconds and it's the highest-yield check.</li>
+<li><strong>Find the slow hop.</strong> A distributed trace on a slow request tells you whether the time is in my service, in a downstream service, or in the database. Without tracing this step becomes guesswork, which is the argument for having installed it before the incident.</li>
+<li><strong>Check the usual resources.</strong> CPU and memory on the task; <strong>event loop lag</strong> for Node specifically (a blocked loop is invisible in CPU metrics if the work is one long synchronous call); connection pool saturation — requests queueing for a database connection look exactly like a slow database but the fix is completely different; and IOPS/burst-balance on the database volume.</li>
+<li><strong>Then the database.</strong> Performance Insights for top queries by load, <code>EXPLAIN ANALYZE</code> on the suspect, and check for lock contention from a long transaction.</li>
+</ol>
+<p><strong>Mitigate before you fix:</strong> if there's an active customer impact, roll back the deploy, scale out, or shed load first, and root-cause afterwards. Getting that order right is itself a senior signal.</p>
+<p><strong>The most common actual causes</strong>, so I can say what I'd bet on: an N+1 query introduced by an ORM change; a missing index that only mattered once the table grew; connection pool exhaustion under a traffic increase; a downstream dependency that got slower without alerting; and a cache that quietly stopped working, sending all traffic to the database.</p></details>
+
+<h2>Scenario 3 — Migrate a monolith to AWS</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>A client has a Node monolith on-prem with a SQL Server database. Move it.</summary>
+<p><strong>Discovery first.</strong> What's the business driver — a data-centre lease expiring (deadline-driven, favour rehost), cost, scale, or release velocity? What's the current load and data volume? What integrations exist with systems that <em>aren't</em> moving? What's the compliance posture? What downtime is acceptable for cutover? I'd also ask what's already in AWS, because fitting the existing landing zone beats building a new one.</p>
+<p><strong>Then pick per component, not for the whole estate.</strong> For a typical Node monolith I'd propose <strong>replatform</strong>: containerise the application (it's already Node, so this is usually days not months), run it on ECS Fargate behind an ALB across two AZs, and move the database to RDS. Not a refactor to microservices on day one — that's a second phase with its own business case, and conflating the two is how migrations fail.</p>
+<p><strong>The database is the hard part and the schedule driver.</strong> SQL Server → RDS for SQL Server is the low-risk path (licensing cost, but no code change). SQL Server → Aurora PostgreSQL removes licence cost but means schema and stored-procedure conversion; AWS SCT plus DMS handles a lot of it, but stored procedures and T-SQL specifics need real work and real testing. I'd present both with cost and risk, and let the client choose — that's the consulting job.</p>
+<p><strong>Cutover.</strong> DMS with change data capture keeps the target in sync while the source stays live, so the cutover window is minutes, not hours: stop writes, let CDC drain, verify row counts and checksums, flip DNS, keep the old system available for rollback for a defined period. Run both in parallel and reconcile before you commit.</p>
+<p><strong>Phase two</strong>, once it's stable in AWS: instrument it, find the modules that actually need independent scaling or independent release, and strangle those out one at a time. Not before — you need production data on where the pain is, and the client needs a win banked first.</p></details>
+
+<h2>Scenario 4 — Rapid-fire designs</h2>
+<details class="qa"><summary>Design a file upload and processing service.</summary>
+<p>Pre-signed multipart URLs so the browser uploads directly to S3 and the file never touches my compute. Upload lands in a quarantine prefix. <strong>S3 event → SQS → worker</strong> (not S3 → Lambda directly, because the queue gives me retry, DLQ, backpressure and the ability to drain a backlog). Worker validates type and size, scans for malware, processes (transcode, thumbnail, extract text), writes output to a served prefix, and updates status in DynamoDB, which the client polls or receives via WebSocket. Long processing goes to Step Functions or Fargate rather than fighting Lambda's 15-minute cap. Served through CloudFront with signed URLs for private content. Lifecycle rules expire the quarantine prefix and abort incomplete multipart uploads.</p></details>
+
+<details class="qa"><summary>Design a rate limiter for a multi-tenant API.</summary>
+<p>First layer is free: API Gateway usage plans with per-API-key throttling handles the coarse case. For anything more specific — per-tenant, per-endpoint, or tiered by plan — I'd implement a <strong>token bucket in Redis</strong>, because it allows bursts while bounding the sustained rate, which matches how clients actually behave. The increment and check must be atomic, so a Lua script or <code>INCR</code> with an expiry, keyed by <code>tenant:endpoint:window</code>.</p>
+<p>Details that matter: return <strong>429 with <code>Retry-After</code></strong> and the standard <code>X-RateLimit-*</code> headers so clients can back off intelligently rather than hammering; decide the failure mode deliberately (if Redis is down, fail <em>open</em> for availability or <em>closed</em> for protection — that's a business decision, not a technical one, and I'd ask); and use a sliding window rather than a fixed one if a burst at a window boundary would be harmful. At very high volume, a local token bucket per instance with periodic sync to Redis trades precision for latency.</p></details>
+
+<details class="qa"><summary>Design a notification service (email, SMS, push).</summary>
+<p>An API accepts a notification request and validates it, then puts it on a queue immediately and returns 202 — never send synchronously, because third-party providers are slow and flaky and you don't want their latency in your API's p99. A router consumes the queue, resolves the user's channel preferences and locale, renders from a template, and dispatches per channel: SES for email, SNS or a provider like Twilio for SMS, SNS mobile push or FCM/APNs for push. Separate queue per channel so an SMS provider outage doesn't back up email.</p>
+<p>The hard parts: <strong>idempotency</strong> so a retry doesn't send the same alert twice (dedup key per notification); <strong>retries with backoff</strong> plus a DLQ per channel; <strong>provider failover</strong> for critical messages; <strong>rate limiting</strong> to respect provider quotas; <strong>preference and unsubscribe handling</strong>, which is a legal requirement not a feature; <strong>bounce and complaint handling</strong> via SES feedback into SNS, because ignoring bounces destroys your sender reputation; and <strong>delivery status tracking</strong> stored in DynamoDB with TTL so support can answer "did my customer get it". Scheduled and digest notifications go through EventBridge Scheduler rather than a cron box.</p></details>
+
+<details class="qa"><summary>Design a multi-tenant SaaS data layer.</summary>
+<p>Three isolation models, and the answer depends entirely on the client's compliance posture and tenant size distribution. <strong>Silo</strong> (a database or an account per tenant): strongest isolation, easiest compliance story, simplest noisy-neighbour story — and operationally expensive at a thousand tenants. <strong>Pool</strong> (shared tables with a <code>tenant_id</code> column): cheapest and most scalable, but every single query must be tenant-scoped and one missed <code>WHERE tenant_id</code> is a data breach. <strong>Bridge</strong> (shared database, schema per tenant) sits in between.</p>
+<p>For pooled, the controls I'd insist on: enforce tenant scoping in a data-access layer or with PostgreSQL <strong>row-level security</strong> so it cannot be forgotten in a handler; put <code>tenant_id</code> first in every composite index and as the DynamoDB partition key prefix; carry the tenant in the auth token and into <code>AsyncLocalStorage</code> so logs and metrics are tenant-tagged; and test the isolation explicitly, because "no test ever proved we can't read another tenant's data" is an audit finding.</p>
+<p>The pragmatic pattern is <strong>hybrid</strong>: pool the long tail, silo the enterprise tenants who pay for isolation and would otherwise be the noisy neighbour anyway.</p></details>
+
+<h2>Questions they may turn back on you</h2>
+<details class="qa"><summary>"What would you change about a system you built?"</summary>
+<p>Have a real answer ready. The strong shape is: a specific decision, why it was reasonable <em>at the time</em> with the information available, what it actually cost later, and what you'd do instead. Avoid both the humblebrag ("I'd have made it even more scalable") and the self-flagellation. What they're testing is whether you learn from your own systems in production, which is the thing that separates someone with eight years of experience from someone with one year repeated eight times.</p></details>
+
+<details class="qa"><summary>"How do you handle a requirement you think is wrong?"</summary>
+<p>Consulting-specific and worth rehearsing. The shape: understand the requirement behind the requirement first (a client asking for "multi-region active-active" usually means "we can't afford to be down during our trading window"); then present the trade-off with numbers rather than opinion — cost, timeline, complexity, and what it buys; offer a cheaper option that meets the underlying need; and if the client still wants the original after seeing the analysis, <strong>document the decision and build it well</strong>. The judgement call is that you raise concerns once, clearly, in writing — and then you commit. Litigating a decided question is what damages a client relationship, not disagreeing in the first place.</p></details>

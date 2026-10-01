@@ -1,0 +1,135 @@
+<h1>Data Fetching <span class="tag react">React</span></h1>
+<p><strong>React has no data-fetching layer.</strong> <code>useEffect</code> + <code>fetch</code> is not a pattern the React team recommends — it is the lowest-level escape hatch, and writing it correctly means handling race conditions, cancellation, a proper state machine, deduplication, caching, revalidation and retries by hand. That list is the entire reason React Query, SWR and RSC exist.</p>
+<p>The interview version of this topic is: name what the naive version gets wrong, fix the race condition two different ways, explain waterfalls, and explain why you would not hand-roll a cache.</p>
+
+<h2>The naive pattern, and everything it misses</h2>
+<pre><code>function User({ id }) {
+  const [user, setUser] = useState(null);
+  useEffect(() =&gt; {
+    fetch(`/api/users/${id}`)
+      .then(r =&gt; r.json())
+      .then(setUser);
+  }, [id]);
+}</code></pre>
+<ul>
+  <li><strong>Race condition:</strong> change <code>id</code> quickly and a slow earlier response can land after a fast later one, leaving the wrong user on screen.</li>
+  <li><strong>No cleanup:</strong> the <code>setUser</code> may run after unmount, and nothing aborts the in-flight request.</li>
+  <li><strong>No error handling:</strong> <code>fetch</code> does <em>not</em> reject on 404 or 500 — only on network failure. You must check <code>res.ok</code> yourself.</li>
+  <li><strong>No loading state</strong>, so the UI cannot distinguish "loading" from "loaded, empty".</li>
+  <li><strong>No cache, no dedupe:</strong> two components asking for the same user make two requests; navigating away and back refetches from scratch.</li>
+  <li><strong>Waterfall:</strong> the effect runs only after the component mounts and paints, so nested components fetch in sequence.</li>
+</ul>
+
+<h2>Race conditions — the classic bug</h2>
+<p>Requests are not guaranteed to resolve in the order they were fired. Type "a", then "ab": if the request for "a" takes 900ms and "ab" takes 100ms, the results for "a" arrive last and overwrite the fresher data. The UI now shows stale results with a fresh query in the box.</p>
+<pre class="mermaid">
+sequenceDiagram
+  participant C as Component
+  participant S as Server
+  C->>S: fetch "a" at t=0
+  C->>S: fetch "ab" at t=50
+  S-->>C: response "ab" at t=150
+  S-->>C: response "a" at t=900
+  Note over C: setState overwrites fresh with stale
+</pre>
+<h3>Fix 1 — the <code>ignore</code> flag in cleanup</h3>
+<pre><code>useEffect(() =&gt; {
+  let ignore = false;                        // scoped to THIS effect run
+  fetch(`/api/search?q=${q}`)
+    .then(r =&gt; r.json())
+    .then(data =&gt; { if (!ignore) setResults(data); });
+  return () =&gt; { ignore = true; };           // runs before the next effect and on unmount
+}, [q]);</code></pre>
+<p>The cleanup runs <em>before</em> the next effect, so an outdated response finds <code>ignore === true</code> and quietly does nothing. This is the fix in the official React docs. It does not cancel the request — it just stops it from being applied.</p>
+<h3>Fix 2 — <code>AbortController</code></h3>
+<pre><code>useEffect(() =&gt; {
+  const ctrl = new AbortController();
+  fetch(url, { signal: ctrl.signal })
+    .then(r =&gt; { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(setData)
+    .catch(e =&gt; { if (e.name !== 'AbortError') setError(e); });   // ignore our own abort
+  return () =&gt; ctrl.abort();
+}, [url]);</code></pre>
+<div class="callout tip"><strong>Senior tip:</strong> both fixes are correct; they solve different halves. <code>ignore</code> guarantees you never apply a stale result. <code>AbortController</code> additionally frees the connection and stops server work — the one that matters for expensive queries and mobile data. In production use both, or use a library that does.</div>
+
+<h2>One <code>status</code>, not three booleans</h2>
+<pre><code>// ❌ 8 combinations, most of them impossible
+const [loading, setLoading] = useState(false);
+const [error, setError]     = useState(null);
+const [data, setData]       = useState(null);
+
+// ✅ a state machine: idle → loading → success | error
+const [state, dispatch] = useReducer(reducer, { status: 'idle', data: null, error: null });</code></pre>
+<p>Three booleans let you render "loading" and "error" at the same time, or forget to clear the previous error on a retry. A single <code>status</code> string makes those states unrepresentable — and it is exactly what React Query exposes (<code>isPending</code>/<code>isError</code>/<code>isSuccess</code> are derived from one internal status).</p>
+
+<h2>StrictMode's double fetch is a symptom, not a bug</h2>
+<p>In development, <code>&lt;StrictMode&gt;</code> mounts, unmounts and remounts every component, so effects run twice and you see two requests. This is deliberate: it surfaces effects that are not cleanup-safe. If the double fetch causes a visible problem, your effect is missing a cleanup — the same missing cleanup that produces the race condition above.</p>
+<div class="callout warn"><strong>Gotcha:</strong> never "fix" it by adding a <code>useRef</code> guard like <code>if (didFetch.current) return;</code>. That silences the warning while leaving the real bug (no cancellation, no dedupe) in place, and it does not run in production anyway — StrictMode's double-invoke is development-only.</div>
+
+<h2>Waterfalls vs parallel fetching</h2>
+<p>A waterfall is requests that run in sequence when they could have run at once. React makes it easy to create one accidentally, because a child's effect cannot start until the parent has rendered — and a parent that renders a spinner while loading never renders the child at all.</p>
+<pre><code>// ❌ waterfall: Profile fetches, renders, only THEN Posts mounts and fetches
+function Profile({ id }) {
+  const user = useUser(id);
+  if (!user) return &lt;Spinner /&gt;;         // Posts does not exist yet
+  return &lt;Posts userId={user.id} /&gt;;
+}
+
+// ✅ independent requests start together
+const [user, posts] = await Promise.all([fetchUser(id), fetchPosts(id)]);</code></pre>
+<ul>
+  <li><strong>Genuine dependency</strong> (you need the user's id before you can fetch their posts) — a waterfall is unavoidable; consider a single endpoint or a server-side join instead.</li>
+  <li><strong>Accidental dependency</strong> (both only needed the route param) — hoist both requests to the same level and run them with <code>Promise.all</code>, parallel queries, or a route loader.</li>
+  <li><code>Promise.allSettled</code> when one failure should not sink the others; <code>Promise.all</code> rejects on the first failure.</li>
+</ul>
+
+<h2>Caching, deduplication and stale-while-revalidate</h2>
+<p>Three behaviours you will otherwise rewrite badly in every project:</p>
+<ul>
+  <li><strong>Deduplication:</strong> five components mount at once asking for the same key → one network request, five subscribers. Implemented by storing the in-flight <em>promise</em> in the cache, not just the result.</li>
+  <li><strong>Caching:</strong> a key already fetched renders instantly from memory instead of flashing a spinner.</li>
+  <li><strong>Stale-while-revalidate:</strong> serve the cached value immediately, refetch in the background, update when it lands. The UI is never blank and never permanently stale.</li>
+</ul>
+<p>A correct implementation also needs: cache invalidation, garbage collection of unused keys, refetch on window focus and reconnect, retry with backoff, pagination, and per-key subscriber notification. That is a library, not a hook you write in an afternoon.</p>
+<pre><code>const { data, isPending, error, refetch } = useQuery({
+  queryKey: ['user', id],                    // the cache key — deps array for the cache
+  queryFn: ({ signal }) =&gt; fetchUser(id, { signal }),
+  staleTime: 60_000,                         // how long a value is served without refetching
+});
+
+const mutation = useMutation({
+  mutationFn: updateUser,
+  onSuccess: () =&gt; queryClient.invalidateQueries({ queryKey: ['user', id] }),
+});</code></pre>
+<p>On top of that: <code>useInfiniteQuery</code> for pagination, retries with exponential backoff by default, and optimistic updates — apply the change locally, roll back in <code>onError</code>, invalidate in <code>onSettled</code>.</p>
+<div class="callout"><strong>Note:</strong> the request itself is a one-liner. What you are buying is the cache and its lifecycle. Answering "why React Query?" with "so I don't write <code>useEffect</code>" is shallow; answering with dedupe, SWR, invalidation and retries is not.</div>
+
+<h2>Suspense, and moving fetching out of the component</h2>
+<p><code>&lt;Suspense fallback={...}&gt;</code> inverts loading state: instead of each component rendering its own <code>if (isLoading)</code>, a component <em>suspends</em> and the nearest boundary above shows one fallback for the whole region. Combined with an error boundary, the happy path in your component has no branches at all.</p>
+<pre><code>&lt;ErrorBoundary fallback={&lt;Failed /&gt;}&gt;
+  &lt;Suspense fallback={&lt;Skeleton /&gt;}&gt;
+    &lt;Profile id={id} /&gt;      {/* renders as if data were already there */}
+  &lt;/Suspense&gt;
+&lt;/ErrorBoundary&gt;</code></pre>
+<p>Suspense for data requires a data source that integrates with it — React Query's <code>useSuspenseQuery</code>, Relay, or a framework. React 19 also adds the <code>use()</code> hook, which can read a promise and suspend; the promise must come from a cache or from the server, not be created during render.</p>
+<div class="callout tip"><strong>Framework-specific, and worth labelling as such:</strong> React Server Components and framework loaders (Next.js App Router server components, React Router / Remix <code>loader</code> functions) move fetching <em>out of the component lifecycle entirely</em>. The data is fetched on the server, in parallel, before render — which structurally eliminates client waterfalls, the race condition, and the loading-state plumbing. Say this is framework territory, not core React.</div>
+
+<h2>Errors and retries</h2>
+<ul>
+  <li><code>fetch</code> only rejects on network failure — always check <code>res.ok</code> and throw yourself, or every 500 becomes a successful render of an error page's JSON.</li>
+  <li>Retry only <strong>idempotent</strong> requests (GET), with exponential backoff and jitter, and a cap. Never blindly retry a POST that may have charged a card.</li>
+  <li>Distinguish an aborted request (<code>e.name === 'AbortError'</code>) from a real failure — showing "Something went wrong" because the user typed another character is a common bug.</li>
+  <li>Error boundaries catch render-phase errors, not rejected promises in an effect. Either set error state and render it, or use a library that rethrows during render so a boundary can catch it.</li>
+  <li>Keep the previous data visible while refetching (<code>placeholderData: keepPreviousData</code>) so pagination does not flash empty.</li>
+</ul>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Describe the race condition in <code>useEffect</code> + <code>fetch</code> and fix it.</summary><p>Responses can resolve out of order, so a slow earlier request can overwrite a fast later one with stale data. Fix by setting a <code>let ignore = false</code> in the effect and returning a cleanup that flips it, checking it before <code>setState</code>; or by aborting the previous request with an <code>AbortController</code> in cleanup. The flag guarantees stale data is never applied; the abort additionally cancels the work.</p></details>
+  <details><summary>Why does my component fetch twice in development?</summary><p>StrictMode intentionally mounts, unmounts and remounts components so effects run twice, surfacing effects that lack cleanup. It is development-only. The right response is to add the cleanup (ignore flag or abort), not a ref guard that hides the symptom.</p></details>
+  <details><summary>What is a request waterfall and how do you avoid it?</summary><p>Requests running sequentially that could have run in parallel — typically because a child component only mounts after the parent's data arrives. Hoist independent requests to the same level and use <code>Promise.all</code> or parallel queries, or fetch on the server via a route loader / RSC. Only a genuine data dependency justifies a waterfall.</p></details>
+  <details><summary>Why not just write your own cache?</summary><p>Because "a cache" really means keyed storage, in-flight deduplication, stale-while-revalidate, invalidation after mutations, garbage collection, refetch on focus and reconnect, retries with backoff, and per-key subscriptions. Getting all of that right and keeping it right is a library's job; React Query, SWR and RTK Query already do it.</p></details>
+  <details><summary>Why is one <code>status</code> better than <code>isLoading</code>/<code>isError</code>/<code>isSuccess</code>?</summary><p>Three booleans allow eight combinations, most of them impossible, and make it easy to forget to clear an error on retry. One status string ('idle' | 'loading' | 'success' | 'error') makes invalid states unrepresentable and the render logic a single switch.</p></details>
+  <details><summary>How does Suspense change data fetching?</summary><p>It moves the loading state from inside the component to a boundary above it: the component renders as if the data were present and suspends if it is not, and the nearest <code>&lt;Suspense&gt;</code> shows one fallback for the region. It needs a Suspense-aware data source (<code>useSuspenseQuery</code>, Relay, a framework, or React 19's <code>use()</code> reading a cached promise), and pairs with an error boundary for failures.</p></details>
+  <details><summary>Does <code>fetch</code> reject on a 500?</summary><p>No. It resolves; only network-level failures reject. You must check <code>res.ok</code> and throw, otherwise error responses are treated as successful data. This is the single most common data-fetching bug in code reviews.</p></details>
+</div>

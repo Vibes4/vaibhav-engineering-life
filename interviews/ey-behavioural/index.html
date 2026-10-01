@@ -1,0 +1,81 @@
+<h1>Behavioural, Managerial &amp; HR <span class="tag db">EY Sheet 11</span></h1>
+<p>EY GDS runs a separate <strong>managerial round</strong> and an <strong>HR/fitment round</strong> after the technical panel, and behavioural questions also appear in the last ten minutes of the technical slot. The JD's "Skills and Attributes" section is the scoring rubric: problem-solving, <em>working in distributed multi-cultural teams</em>, <em>communicating with technical and non-technical stakeholders</em>, ownership, and continuous learning. Every one of those is a question waiting to be asked.</p>
+<div class="callout warn"><strong>The most common failure here is not having prepared.</strong> Strong engineers routinely spend twenty hours on AWS revision and zero minutes on "tell me about a conflict", then give a vague, rambling answer that costs them the band. Write your stories out in full sentences. You will not improvise them well under pressure.</div>
+
+<h2>How to structure an answer: STAR, but weighted</h2>
+<p><strong>S</strong>ituation and <strong>T</strong>ask get one sentence each — context only. <strong>A</strong>ction gets 60% of the time and must be in the first person singular: what <em>you</em> decided and did, not what the team did. <strong>R</strong>esult must be quantified where possible, and should end with what you changed permanently as a result.</p>
+<div class="callout tip"><strong>The upgrade most people miss:</strong> add a fifth beat — <strong>what you'd do differently</strong>. "In hindsight I'd have raised it a week earlier, because by the time I did we'd already committed to the sprint." That one sentence signals reflection and is disproportionately persuasive to senior interviewers.</div>
+
+<h2>The three stories you must have written down</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Story 1 — A production incident you handled.</summary>
+<p><strong>Structure it as:</strong> the symptom the users saw → how you were alerted (and if you weren't alerted, say so, that's honest and leads somewhere good) → how you narrowed it down → the immediate mitigation → the root cause → the permanent prevention.</p>
+<p><strong>What separates a senior answer:</strong> you mitigated before you root-caused. Stopping customer impact first and investigating second is the correct instinct and many candidates get it backwards in the retelling. Also: name the <em>prevention</em>, not just the fix. "I added an alarm on DLQ depth and a runbook, so the next occurrence of this class of failure pages us in two minutes instead of being reported by a customer the next morning."</p>
+<p><strong>Have the numbers:</strong> how long the impact lasted, how many users or requests, how long detection took versus resolution. Even rough numbers beat "it was a big outage".</p>
+<p><strong>Don't:</strong> blame a colleague, blame the client, or tell a story where you were purely a spectator.</p></details>
+
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Story 2 — A technical decision with a real trade-off.</summary>
+<p>Pick something where you genuinely gave something up — chose the boring technology over the interesting one, chose eventual consistency to get availability, chose to ship a manual process because automating it wasn't worth the two weeks. The trade-off is the point; a story where the choice was obviously right isn't a decision, it's a task.</p>
+<p><strong>Include:</strong> the options you considered and why you rejected them, who you consulted, how you validated the choice afterwards, and whether it held up. If it didn't hold up entirely, say so — "we outgrew it in eighteen months, which was roughly what I'd predicted, and the migration path I left in place made that manageable" is a genuinely strong answer.</p></details>
+
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Story 3 — A disagreement you resolved.</summary>
+<p>The trap is picking a story where you were right and the other person was stubborn. That reads as inability to collaborate, which for a consulting role is disqualifying. The best version has one of these shapes: you changed your mind when shown evidence; you found a third option neither party had proposed; or you disagreed, lost, committed fully to the other approach, and reported the outcome honestly.</p>
+<p><strong>What they're scoring:</strong> do you resolve disagreements with data and options, or with volume and seniority? Do you separate the idea from the person? And can you commit to a decision you argued against — because on a client engagement you will have to, more than once.</p></details>
+
+<h2>Likely questions — technical behavioural</h2>
+<details class="qa"><summary>How do you approach a code review?</summary>
+<p>I separate what I'll <strong>block</strong> on from what I'll <strong>suggest</strong>, and I say which is which in the comment — because an unlabelled pile of comments makes a junior developer guess what's mandatory. Blocking: correctness, security, data loss, missing error handling, anything that can't be rolled back. Non-blocking: naming, structure, "here's a simpler way" — prefixed as a nit or a suggestion.</p>
+<p>Practices: review the <em>design</em> before the code exists for anything substantial, because a review comment on an architectural choice after two weeks of implementation is expensive and demoralising. Ask questions rather than issue instructions ("what happens if this promise rejects?") — it teaches, and occasionally I'm the one who's wrong. Approve with minor comments rather than blocking on nits, because a slow review queue does more damage to a team than imperfect naming. And if a review has more than about ten comments, I stop typing and have a five-minute conversation instead.</p></details>
+
+<details class="qa"><summary><span class="qa-chip must">Certain</span>How do you mentor junior developers? (The JD names this explicitly.)</summary>
+<p>Concretely, not abstractly: I pair on the first task in an unfamiliar area rather than handing over a ticket and hoping. I give problems with context rather than solutions — "we need this to be idempotent, here's why, have a look at how the payment service does it" — so they build judgement rather than following instructions. I'm deliberate about the size of the stretch; too easy is boring, too hard without support is how people quietly lose confidence.</p>
+<p>I review their PRs quickly, because a junior waiting two days for feedback learns to batch work into big unreviewable chunks. I let them make reversible mistakes and catch the irreversible ones. And I ask them to explain their design back to me — the gaps show up immediately and it's a kinder way to find them than a review comment.</p>
+<p>If I have a concrete example — someone I helped go from needing every PR rewritten to owning a service — that's the answer. Specificity beats philosophy here.</p></details>
+
+<details class="qa"><summary>How do you explain a technical problem to a non-technical stakeholder?</summary>
+<p>Lead with impact, not mechanism. "Checkout is failing for about 5% of customers, we've stopped the bleeding, and we expect a full fix by this afternoon" — not "the connection pool is exhausted because of a missing index". Then offer detail if they want it.</p>
+<p>Other things I'd name: use their units — money, customers affected, days of delay — not milliseconds and instances. Give options with trade-offs rather than a single technical recommendation, because a stakeholder's job is to choose and they can't choose from one option. Be honest about uncertainty with a time-box: "I don't know yet; I'll have an answer by 4pm" is far better than a confident guess that turns out wrong. And write it down afterwards, because verbal updates in a distributed team evaporate.</p></details>
+
+<details class="qa"><summary>How do you keep learning? (The JD says "continuous learner".)</summary>
+<p>Be specific and be honest — a vague "I read blogs" answer is worse than no answer. Name what you actually do: a certification you're working toward or hold, specific sources you follow, a side project (this learning repo is a legitimate and unusually good answer — <em>show</em> that you built a structured knowledge base), the last thing you learned deeply and why, and how you bring it back to the team (a brown-bag, a design doc, a PR that introduced a pattern).</p>
+<p>A strong closing line: "The last thing I went deep on was &lt;X&gt;, because we hit &lt;concrete problem&gt; and I didn't understand it well enough to have an opinion. That's usually what drives my learning — a gap I noticed in production rather than a syllabus."</p></details>
+
+<h2>Likely questions — EY / consulting fit</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Why EY? Why consulting?</summary>
+<p>Answer the real question, which is "will you stay, and do you understand what this job is?" Credible reasons: <strong>breadth</strong> — multiple clients, domains and estates in a few years rather than one product; <strong>scale</strong> — large transformation programmes you don't get access to in a product company; <strong>the modernization work specifically</strong>, since taking a legacy estate to cloud-native is a genuinely different and harder problem than greenfield; and structured progression with certifications funded.</p>
+<p>Then tie it to something specific in the JD so it doesn't sound generic — the monolith-to-microservices and re-platforming work, or the global delivery model. Avoid: "for the brand", "for a better package", or anything that would be equally true of any of the Big Four.</p></details>
+
+<details class="qa"><summary>How do you work in a distributed, multi-cultural team across time zones?</summary>
+<p>The JD names this twice, so answer it concretely. <strong>Written-first</strong>: decisions go in a document or a ticket, not only in a call, so people in other time zones aren't second-class participants. <strong>Async by default</strong>: I don't block on a synchronous answer when a well-framed written question with my proposed answer and a deadline will do. <strong>Protect the overlap window</strong> for the things that genuinely need conversation — design discussions, disagreements, anything with emotional content — and use the non-overlap for focused work.</p>
+<p>On the cultural half: I check for understanding rather than assuming, because "yes" means different things in different working cultures and directness varies enormously. I write plainly and avoid idiom and sarcasm in text, which travel badly. And I'm explicit about deadlines and ownership rather than relying on implication, because implication is exactly what gets lost across cultures and time zones.</p></details>
+
+<details class="qa"><summary>A client demands a feature by Friday and it isn't feasible. What do you do?</summary>
+<p>I don't say yes and I don't say no. I go back with <strong>what is achievable by Friday</strong> and what the trade-off costs: the full scope needs three weeks; here is a version that delivers the core value by Friday with these limitations; or here is the full scope by Friday if we pull two people off X and accept technical debt we'd repay in the following sprint. Then the client chooses, with real information.</p>
+<p>What I'd emphasise: raise it <strong>as soon as I know</strong>, not on Thursday. The damage from a missed deadline is mostly the surprise, not the delay. And whatever is agreed goes in writing — including the accepted limitations — because the conversation will be remembered differently by everyone in it.</p></details>
+
+<details class="qa"><summary>Tell me about a time you failed.</summary>
+<p>Pick a real failure with real consequences — a shipped bug, a missed estimate, a design that had to be reworked. The structure: what happened, what your specific contribution to it was (own your part without dragging in others), what the impact was, how you handled it at the time, and the <em>systemic</em> change you made afterwards.</p>
+<p>Two traps: the fake failure ("I work too hard") reads as evasion and is worse than a real one; and the unresolved failure, where you never identified what you'd do differently, reads as not having learned. The answer they want ends with something you now do permanently as a result.</p></details>
+
+<details class="qa"><summary>Where do you see yourself in three to five years?</summary>
+<p>Be honest but aligned. A credible senior answer: deepening into architecture — owning the design of a platform rather than services within it — while staying hands-on enough to be credible; taking more responsibility for client-facing technical conversations; and mentoring, since that's how the practice scales. If you're genuinely interested in an architect track, say so, because EY has a defined one and it maps to the JD's "Full Stack Architect" postings.</p>
+<p>Avoid: "running my own startup" and anything that implies this is a stopgap. Also avoid a purely managerial answer if you're applying for a hands-on senior developer role — it suggests you'll be unhappy in the job you're being hired for.</p></details>
+
+<h2>The HR round</h2>
+<details class="qa"><summary>What actually gets asked, and what to have ready.</summary>
+<p>The HR/fitment round is mostly logistics and cultural fit, but it is still an evaluation. Expect: walk me through your CV; why are you leaving your current role; current and expected compensation; notice period; location and willingness to relocate or work from a specific office; shift or overlap-hours flexibility for global clients; any gaps in employment; and "do you have any questions".</p>
+<p><strong>Prepare in advance:</strong> a specific number for expected compensation with a justification (market rate for the skill set, plus the scope of the role), your exact notice period and earliest joining date, and a positive framing for why you're leaving — about what you're moving <em>toward</em>, never about what's wrong with your current employer. Speaking badly about a current employer is the single most reliable way to fail this round.</p>
+<p><strong>Don't</strong> negotiate hard in the HR screening — that's for the offer conversation. Give a range and a reason, confirm you're interested, and keep it warm.</p></details>
+
+<details class="qa"><summary>Why are you leaving your current role?</summary>
+<p>Frame it as pull, not push. Strong shapes: "I've taken my current system as far as the role allows and I want exposure to more varied estates"; "I want to work on cloud modernization at a scale my current company doesn't have"; "I'm looking for a defined architecture track". If there's a genuine negative — no growth, a reorganisation, a long stretch of maintenance work — state it once, factually, without emotion, and immediately pivot to what you're looking for.</p>
+<p>What sinks candidates here is length and heat. Two sentences, neutral tone, forward-looking. Anything more invites follow-up questions in a direction you don't want.</p></details>
+
+<h2>Logistics checklist</h2>
+<ul>
+<li><strong>Glider platform</strong> — use Chrome, not incognito. Test camera, microphone and screen-sharing at least an hour before, not five minutes before.</li>
+<li>Join 5 minutes early. Have the JD open on a second screen or printed.</li>
+<li>Wired internet if possible; have a phone hotspot as a fallback and mention it if the connection drops rather than freezing silently.</li>
+<li>Have a pen and paper for the design question — ask "may I sketch this and talk you through it?" and narrate as you draw. If screen-sharing is available, a whiteboard tool or even a text editor works.</li>
+<li>Have your three stories, your compensation number, and your questions for them on one page beside you.</li>
+<li>Water. A 60-minute talking interview is longer than it sounds.</li>
+</ul>

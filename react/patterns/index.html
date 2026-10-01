@@ -1,0 +1,188 @@
+<h1>Component Patterns <span class="tag react">React</span></h1>
+<p><strong>Patterns are answers to "how do I share this?"</strong> — shared logic, shared state, shared control over a DOM node. React has cycled through mixins, higher-order components, render props and now hooks for logic reuse, and each generation was invented to fix the previous one's composition problems.</p>
+<p>A senior answer names the pattern, the problem it solves, and the concrete cost of using it. Three of these — error boundaries, portals and <code>forwardRef</code> — are not stylistic choices at all; they are the only supported way to do the thing they do.</p>
+
+<h2>Error boundaries — still class-only</h2>
+<p>A rendering error anywhere in the tree unmounts the <strong>entire</strong> React root by default (React 16+ chose a blank screen over a corrupted UI). An error boundary catches errors from its subtree and renders a fallback instead. There is still no hook equivalent: this is the one place you must write a class.</p>
+<pre><code>class ErrorBoundary extends React.Component {
+  state = { error: null };
+
+  static getDerivedStateFromError(error) {   // render phase: return the fallback state
+    return { error };
+  }
+  componentDidCatch(error, info) {           // commit phase: side effects belong here
+    logToSentry(error, info.componentStack);
+  }
+  render() {
+    if (this.state.error) return this.props.fallback ?? &lt;p&gt;Something went wrong.&lt;/p&gt;;
+    return this.props.children;
+  }
+}</code></pre>
+<p>Two methods, two jobs: <code>getDerivedStateFromError</code> is static and pure, and decides what to render; <code>componentDidCatch</code> is where you log, because it runs after commit.</p>
+<h3>What error boundaries do NOT catch</h3>
+<table>
+  <thead><tr><th>Not caught</th><th>Why / what to do</th></tr></thead>
+  <tbody>
+    <tr><td>Event handlers</td><td>They run outside the render/commit cycle — use <code>try/catch</code></td></tr>
+    <tr><td>Async code (<code>setTimeout</code>, promises, <code>fetch</code>)</td><td>The stack has left React — catch it and put the error in state, then throw it during render if you want the boundary</td></tr>
+    <tr><td>Server-side rendering</td><td>Boundaries are a client-render mechanism; handle SSR errors in the framework</td></tr>
+    <tr><td>Errors thrown by the boundary itself</td><td>They propagate to the next boundary above — so never let the fallback throw</td></tr>
+  </tbody>
+</table>
+<div class="callout tip"><strong>Senior tip:</strong> placement is the whole design. One boundary at the root gives a whole-app crash screen; boundaries per route give a broken page inside working chrome; boundaries per widget keep the dashboard alive when one chart fails. Ship at least route-level, plus one around any third-party or user-generated content, and give the fallback a "retry" that resets by changing a <code>key</code>.</div>
+<p><code>react-error-boundary</code> is the pragmatic library wrapper: <code>&lt;ErrorBoundary FallbackComponent={Fallback} onReset={…} onError={…}&gt;</code>, plus <code>useErrorBoundary()</code> whose <code>showBoundary(err)</code> lets async code hand an error to the nearest boundary — the missing hook, effectively.</p>
+
+<h2>Portals — render elsewhere, stay in the tree</h2>
+<p><code>createPortal(children, domNode)</code> renders children into a DOM node outside the parent's DOM hierarchy, while keeping them in the same React tree.</p>
+<pre><code>import { createPortal } from 'react-dom';
+
+function Modal({ children, onClose }) {
+  return createPortal(
+    &lt;div className="overlay" onClick={onClose}&gt;{children}&lt;/div&gt;,
+    document.body
+  );
+}</code></pre>
+<p>Use it whenever a child must visually escape its parent: modals, tooltips, dropdowns and toasts trapped by an ancestor's <code>overflow: hidden</code>, <code>transform</code>, or a stacking context that makes <code>z-index</code> unwinnable.</p>
+<div class="callout warn"><strong>The detail interviewers ask for:</strong> events from a portal bubble up the <strong>React</strong> tree, not the DOM tree. A click inside a portal rendered into <code>document.body</code> still fires the <code>onClick</code> of the JSX parent that rendered the portal. Context, error boundaries and Suspense all reach into portals for the same reason. Convenient for a dropdown inside a form; a surprise for "click outside to close" logic, which must account for the portal content not being a DOM descendant.</div>
+
+<h2>HOCs and render props — the two pre-hooks answers</h2>
+<h3>Higher-order component</h3>
+<p>A function that takes a component and returns a new one with extra props injected: <code>withRouter</code>, <code>connect</code>, <code>withTheme</code>.</p>
+<pre><code>function withWindowSize(Wrapped) {
+  return function WithWindowSize(props) {
+    const size = useWindowSize();
+    return &lt;Wrapped {...props} size={size} /&gt;;
+  };
+}</code></pre>
+<ul>
+  <li><strong>Wrapper hell.</strong> <code>withRouter(connect(...)(withTheme(Comp)))</code> — five anonymous layers in DevTools, and a real cost in tree depth.</li>
+  <li><strong>Prop collisions.</strong> Two HOCs both injecting <code>data</code>: one silently wins, and TypeScript will not always save you.</li>
+  <li><strong>Where does this prop come from?</strong> Nothing in the component's source says.</li>
+  <li><strong>Refs do not pass through</strong> — a ref lands on the wrapper unless you add <code>forwardRef</code>.</li>
+  <li><strong>Statics are lost</strong> — <code>Comp.defaultProps</code>, <code>Comp.getLayout</code> etc. need <code>hoist-non-react-statics</code>.</li>
+  <li><strong>Never create an HOC inside render</strong> — new type every render, so the subtree remounts every time.</li>
+</ul>
+<h3>Render prop</h3>
+<p>Pass a function as a prop (often <code>children</code>) and let the component call it with the data it manages.</p>
+<pre><code>&lt;WindowSize&gt;{size =&gt; &lt;Chart width={size.width} /&gt;}&lt;/WindowSize&gt;</code></pre>
+<p>It fixes prop collisions and makes the data source explicit, but composing several is the "callback pyramid":</p>
+<pre><code>&lt;Auth&gt;{user =&gt;
+  &lt;Theme&gt;{theme =&gt;
+    &lt;WindowSize&gt;{size =&gt;
+      &lt;Dashboard user={user} theme={theme} size={size} /&gt;
+    }&lt;/WindowSize&gt;}&lt;/Theme&gt;}&lt;/Auth&gt;</code></pre>
+
+<h2>Custom hooks — the modern replacement for both</h2>
+<p>The same logic, with no wrapper component and no nesting:</p>
+<pre><code>function useWindowSize() {
+  const [size, setSize] = useState(() =&gt; ({ width: window.innerWidth }));
+  useEffect(() =&gt; {
+    const on = () =&gt; setSize({ width: window.innerWidth });
+    window.addEventListener('resize', on);
+    return () =&gt; window.removeEventListener('resize', on);
+  }, []);
+  return size;
+}
+
+function Dashboard() {
+  const user  = useAuth();
+  const theme = useTheme();
+  const size  = useWindowSize();       // flat, explicit, renameable, no collisions
+  …
+}</code></pre>
+<table>
+  <thead><tr><th></th><th>HOC</th><th>Render prop</th><th>Custom hook</th></tr></thead>
+  <tbody>
+    <tr><td>Adds tree depth</td><td>Yes</td><td>Yes</td><td>No</td></tr>
+    <tr><td>Name collisions</td><td>Yes</td><td>No</td><td>No — you name the variable</td></tr>
+    <tr><td>Composing three</td><td>Nested calls</td><td>Nested callbacks</td><td>Three flat lines</td></tr>
+    <tr><td>Where the value comes from</td><td>Invisible</td><td>Visible</td><td>Visible</td></tr>
+    <tr><td>Typing</td><td>Awkward generics</td><td>OK</td><td>Natural</td></tr>
+    <tr><td>Still needed for</td><td>Legacy libs, class components</td><td>Rendering-shape control</td><td>Everything else</td></tr>
+  </tbody>
+</table>
+<div class="callout"><strong>Note:</strong> hooks share <em>logic</em>, not <em>markup</em>. When the thing you want to reuse is rendering structure with a hole in it, a render prop or a <code>children</code>-as-function API is still the right tool — that is why TanStack Table, virtualizers and chart libraries expose headless hooks plus render-prop escape hatches. Also note each caller of a hook gets its own independent state; nothing is shared unless the hook reads a context or an external store.</div>
+
+<h2>Compound components</h2>
+<p>A parent and a family of children that share state implicitly through context, so the consumer writes markup instead of wiring props:</p>
+<pre><code>&lt;Tabs defaultValue="billing"&gt;
+  &lt;TabList&gt;
+    &lt;Tab value="profile"&gt;Profile&lt;/Tab&gt;
+    &lt;Tab value="billing"&gt;Billing&lt;/Tab&gt;
+  &lt;/TabList&gt;
+  &lt;TabPanel value="billing"&gt;…&lt;/TabPanel&gt;
+&lt;/Tabs&gt;
+
+const TabsCtx = createContext(null);
+function Tabs({ defaultValue, children }) {
+  const [active, setActive] = useState(defaultValue);
+  const value = useMemo(() =&gt; ({ active, setActive }), [active]);
+  return &lt;TabsCtx.Provider value={value}&gt;{children}&lt;/TabsCtx.Provider&gt;;
+}
+function Tab({ value, children }) {
+  const { active, setActive } = useContext(TabsCtx);   // no props threaded from Tabs
+  return &lt;button aria-selected={active === value} onClick={() =&gt; setActive(value)}&gt;{children}&lt;/button&gt;;
+}</code></pre>
+<ul>
+  <li><strong>Worth it</strong> for reusable UI primitives with several arrangements — tabs, accordions, menus, selects, dialogs. It is why Radix and Headless UI are shaped this way.</li>
+  <li><strong>Not worth it</strong> for a one-off widget with a fixed layout: a config prop such as <code>&lt;Tabs items={items} /&gt;</code> is simpler and easier to type.</li>
+  <li><strong>Throw a clear error</strong> when the context is <code>null</code> — "useTabs must be used within &lt;Tabs&gt;" — instead of letting a child crash on undefined.</li>
+  <li><strong>Do not use <code>React.Children.map</code> + <code>cloneElement</code></strong> to inject props; it breaks the moment a child is wrapped in a <code>div</code> or another component. Context works at any depth.</li>
+</ul>
+
+<h2>Controlled, uncontrolled, and supporting both</h2>
+<ul>
+  <li><strong>Controlled:</strong> the parent owns the value and passes <code>value</code> + <code>onChange</code>. Needed for validation on every keystroke, formatting/masking, dependent fields, or disabling submit.</li>
+  <li><strong>Uncontrolled:</strong> the DOM owns the value; you pass <code>defaultValue</code> and read it via a ref or on submit through <code>FormData</code>. Fewer renders, less code, and what React 19's form actions encourage.</li>
+</ul>
+<p>Reusable components usually support both, exactly like <code>&lt;input&gt;</code> itself. The trick is to keep internal state <em>and</em> let a supplied prop win:</p>
+<pre><code>function useControllable({ value, defaultValue, onChange }) {
+  const [internal, setInternal] = useState(defaultValue);
+  const isControlled = value !== undefined;             // undefined, not null
+  const current = isControlled ? value : internal;
+  const set = (next) =&gt; {
+    if (!isControlled) setInternal(next);               // controlled: parent is the source of truth
+    onChange?.(next);
+  };
+  return [current, set];
+}</code></pre>
+<div class="callout warn"><strong>Gotcha:</strong> switching an input between controlled and uncontrolled mid-life triggers React's classic warning. It happens when <code>value</code> starts as <code>undefined</code> from an unloaded fetch — use <code>value={data?.name ?? ''}</code>, or key the form on the loaded id so it mounts fresh.</div>
+
+<h2>Providers, <code>forwardRef</code>, and <code>key</code> as a reset</h2>
+<h3>The provider pattern</h3>
+<p>Wrap a context, its state and its actions in one component and expose a hook, so consumers never touch <code>createContext</code> directly:</p>
+<pre><code>export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const value = useMemo(() =&gt; ({ user, login, logout }), [user]);   // memo or every consumer re-renders
+  return &lt;AuthCtx.Provider value={value}&gt;{children}&lt;/AuthCtx.Provider&gt;;
+}
+export const useAuth = () =&gt; {
+  const ctx = useContext(AuthCtx);
+  if (!ctx) throw new Error('useAuth must be used inside &lt;AuthProvider&gt;');
+  return ctx;
+};</code></pre>
+<p>Split a fast-changing value from a stable one into two contexts (state vs dispatch) so consumers of the stable half do not re-render.</p>
+<h3><code>forwardRef</code></h3>
+<p>Function components have no instance, so a <code>ref</code> passed to one is dropped. <code>forwardRef</code> lets a component expose an inner DOM node — required for focus management, scrolling, measurement, and any design-system input.</p>
+<pre><code>const Input = forwardRef(function Input(props, ref) {
+  return &lt;input ref={ref} {...props} /&gt;;
+});
+// React 19: forwardRef is no longer needed — ref arrives as a normal prop
+function Input({ ref, ...props }) { return &lt;input ref={ref} {...props} /&gt;; }</code></pre>
+<p><code>useImperativeHandle(ref, () =&gt; ({ focus, clear }), [])</code> narrows what you expose to a few methods instead of the raw node — use it sparingly, since imperative APIs are the exception in React.</p>
+<h3><code>key</code> as a deliberate remount</h3>
+<pre><code>&lt;ProfileForm key={userId} user={user} /&gt;      // switching user resets every field
+&lt;ErrorBoundary key={attempt}&gt;…&lt;/ErrorBoundary&gt; // bump attempt to retry after a crash</code></pre>
+<p>Changing a key unmounts and remounts, giving fresh state, fresh refs and re-run effects. It is the idiomatic reset — far cleaner than an effect that syncs props into state. The cost is real: everything in that subtree is destroyed and rebuilt, so do not put a changing key on an expensive tree.</p>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Why must an error boundary be a class?</summary><p>There is no hook equivalent of <code>getDerivedStateFromError</code> / <code>componentDidCatch</code>; React has not shipped one. In practice you write one class (or use <code>react-error-boundary</code>) and use it everywhere. Note it only catches errors thrown during render, in lifecycles and in constructors of its subtree — not event handlers, async callbacks, SSR, or errors thrown by the boundary itself.</p></details>
+  <details><summary>How do you get an async error into a boundary?</summary><p>Catch it where it happens and put it in state, then throw it during the next render — <code>if (error) throw error;</code> — so it goes through the render phase the boundary can see. <code>react-error-boundary</code>'s <code>useErrorBoundary().showBoundary(err)</code> packages exactly that.</p></details>
+  <details><summary>Where do events from a portal bubble?</summary><p>Up the React tree, not the DOM tree. The portal's children are DOM children of wherever you mounted them (often <code>document.body</code>), but React's synthetic event system propagates along the component hierarchy, so the JSX parent's <code>onClick</code> still fires. Context and error boundaries cross portals for the same reason. It surprises click-outside handlers, which test DOM containment.</p></details>
+  <details><summary>What problems do custom hooks solve that HOCs did not?</summary><p>No wrapper components, so no tree depth and no unreadable DevTools nesting; no injected-prop name collisions, since the caller names the variable; the source of every value is visible in the component body; composing three concerns is three flat lines instead of nested wrappers; and typing is natural. HOCs additionally drop refs and static properties unless you handle both by hand.</p></details>
+  <details><summary>When is a render prop still the right answer?</summary><p>When what you are sharing is rendering structure rather than logic — the component controls a shape and needs the consumer to fill a hole, as in headless table, list-virtualizer and chart libraries. Hooks share behaviour; they cannot hand you a slot in someone else's markup.</p></details>
+  <details><summary>How would you design a component that is both controlled and uncontrolled?</summary><p>Keep internal state seeded from <code>defaultValue</code>, treat <code>value !== undefined</code> as "controlled", read from the prop when controlled and from state otherwise, and always call <code>onChange</code>. Never write to internal state while controlled, or the two sources of truth drift. Do not let a component flip modes mid-life — that produces React's controlled/uncontrolled warning.</p></details>
+  <details><summary>What are compound components and what do they cost?</summary><p>A parent that owns state and shares it with a family of children through context, so the consumer composes markup instead of passing props — <code>&lt;Tabs&gt;&lt;Tab/&gt;&lt;/Tabs&gt;</code>. You gain a flexible, arrangement-agnostic API; you pay in more exported pieces, an implicit dependency children must be inside the parent (throw a clear error if the context is missing), and a harder-to-type surface. Worth it for reusable primitives, overkill for a one-off widget.</p></details>
+  <details><summary>When is changing <code>key</code> the right tool?</summary><p>When you want a full reset: a form that must clear when the selected record changes, a retry after an error boundary caught, or re-running mount effects. It unmounts and remounts the subtree, so state, refs and effects all start over — cheaper to reason about than syncing props into state in an effect, but expensive if the subtree is large.</p></details>
+</div>

@@ -1,0 +1,82 @@
+<h1>IaC, CI/CD &amp; Testing <span class="tag express">EY Sheet 08</span></h1>
+<p>The JD lists <strong>CloudFormation and Terraform</strong> as primary skills and <strong>CI/CD, automated builds, testing and deployments</strong> as secondary. In a 60-minute round this is usually 5–8 minutes of rapid fire near the end. You don't need syntax; you need to show you understand <em>declarative desired state, drift, and why nobody touches the console in production</em>.</p>
+<div class="callout tip"><strong>The line that wins this section:</strong> "Every environment I own is reproducible from source. If someone deleted the whole account, I could rebuild it from the repo plus the data backups. That means no console changes in anything above dev, IaC reviewed through pull requests like application code, and pipelines that assume a role via OIDC rather than holding long-lived keys."</div>
+
+<h2>Infrastructure as Code</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Terraform vs CloudFormation vs CDK — how do you choose?</summary>
+<table class="sheet">
+  <tr><th></th><th>Strengths</th><th>Costs</th></tr>
+  <tr><td><strong>Terraform</strong></td><td>Multi-cloud and multi-provider (AWS + Datadog + GitHub + Cloudflare in one graph), excellent module ecosystem, <code>plan</code> gives a genuinely readable diff before you apply, large talent pool</td><td>You own the state file and its backend, locking and security. Provider lag behind brand-new AWS features. Licensing changed to BUSL, hence OpenTofu.</td></tr>
+  <tr><td><strong>CloudFormation</strong></td><td>AWS-native, no state file to manage (AWS holds it), automatic rollback on failure, drift detection built in, StackSets for multi-account/multi-region, first-class support for new services</td><td>AWS only, verbose YAML/JSON, limited logic, slow stack operations, and painful <code>UPDATE_ROLLBACK_FAILED</code> states.</td></tr>
+  <tr><td><strong>CDK</strong></td><td>Real TypeScript — loops, conditionals, types, unit tests, IDE completion. Synthesises to CloudFormation. Constructs encode best practice so one line gives you a properly-configured VPC.</td><td>Abstraction hides what's actually deployed; the generated template can surprise you. Upgrades can produce unexpected diffs. Team needs to read TypeScript to read the infrastructure.</td></tr>
+</table>
+<p>My actual answer: on a client engagement I use whatever they already have, because introducing a second IaC tool into an estate is a net negative. Greenfield AWS-only with a TypeScript team → CDK, because the team can test infrastructure with the same tools they test code. Multi-cloud or heavy third-party providers → Terraform. And I'd say plainly that the choice matters far less than the discipline around it.</p></details>
+
+<details class="qa"><summary><span class="qa-chip must">Certain</span>What is Terraform state, and why is it dangerous?</summary>
+<p>State (<code>terraform.tfstate</code>) is Terraform's map from your configuration to real-world resource IDs, plus cached attributes and dependency metadata. Terraform needs it to know that <code>aws_instance.web</code> means instance <code>i-0abc123</code> — without it, Terraform can't tell "create this" from "this already exists".</p>
+<p>Why it's dangerous:</p>
+<ul>
+<li><strong>It contains secrets in plaintext</strong> — database passwords, generated keys, anything a resource returns. So the backend must be encrypted and access-controlled like a credential store, and state must never be committed to git.</li>
+<li><strong>Concurrent applies corrupt it.</strong> Two engineers or two pipeline runs applying simultaneously can produce a state that no longer matches reality. Hence <strong>state locking</strong> — an S3 backend with DynamoDB for locks (or S3's native locking now), or Terraform Cloud.</li>
+<li><strong>Losing it is worse than losing the code.</strong> Terraform will try to create everything again, colliding with resources that already exist. Hence versioning on the S3 bucket, so you can roll back a bad state.</li>
+<li><strong>Manual state surgery</strong> (<code>state rm</code>, <code>import</code>, <code>mv</code>) is occasionally necessary and is the highest-risk operation in the tool — always back up the state file first.</li>
+</ul>
+<p>And the blast-radius point: I split state by environment and by lifecycle — networking in one state, data stores in another, applications in a third — so an apply on the app layer can never accidentally propose destroying the VPC. One giant state file for a whole account is an outage waiting for a bad plan.</p></details>
+
+<details class="qa"><summary><span class="qa-chip deep">Depth probe</span>What is drift, how do you detect it, and how do you handle it?</summary>
+<p>Drift is when the real infrastructure no longer matches what the code and state say it should be — almost always because someone changed something in the console during an incident, or an auto-scaling process or a managed service mutated a resource.</p>
+<p><strong>Detect:</strong> <code>terraform plan</code> refreshes state against the real world and shows the difference; running it on a schedule in CI (a nightly drift check that alerts if the plan is non-empty) turns drift from a surprise into a ticket. CloudFormation has native drift detection; AWS Config can continuously evaluate resource compliance.</p>
+<p><strong>Handle</strong>, and the key point is that the response depends on <em>why</em> it drifted: if the console change was wrong, apply to revert. If the console change was <em>right</em> — an emergency fix during an incident — you back-port it into the code and then apply, so the fix survives the next deployment. If the resource is legitimately managed outside Terraform (an auto-scaling desired count, a tag applied by a governance tool), add a <code>lifecycle { ignore_changes = [...] }</code> so it stops showing up as noise.</p>
+<p>The cultural answer matters as much: drift is a symptom of the console being reachable. I'd move production access to read-only for humans, with break-glass roles that are alerted on and time-boxed, so console changes become a deliberate, logged event rather than a habit.</p></details>
+
+<details class="qa"><summary>How do you structure IaC for multiple environments?</summary>
+<p>Modules for reusable components (a "service" module producing an ECS service, task definition, target group, alarms and log group), and thin per-environment root configurations that call those modules with different variables. The environment difference should be <em>parameters</em> — instance sizes, counts, CIDRs — not forked copies of the code, because forked environments drift apart and then "it worked in staging" stops meaning anything.</p>
+<p>Separate <strong>AWS accounts</strong> per environment, not just separate VPCs — it's the strongest blast-radius boundary AWS offers and it makes cost attribution trivial. Separate state per environment, with the pipeline assuming a different role per account.</p>
+<p>On Terraform workspaces: I mostly avoid them for environment separation. They share a backend and a configuration, so a mistake is one CLI flag away from hitting prod, and they encourage conditional logic in the code (<code>count = terraform.workspace == "prod" ? 3 : 1</code>) that becomes unreadable. Separate directories with separate backends are more verbose and much safer.</p>
+<p>Finally, <strong>version and pin</strong>: pin provider versions and module versions, so an apply next month produces the same result as today. An unpinned provider means your infrastructure can change because someone else released software.</p></details>
+
+<h2>CI/CD</h2>
+<details class="qa"><summary><span class="qa-chip must">Certain</span>Walk me through the pipeline you'd build for a Node.js service on AWS.</summary>
+<p>Triggered on pull request and on merge to main, with different scopes:</p>
+<ol>
+<li><strong>On PR:</strong> install with a locked dependency tree (<code>npm ci</code>), lint, type-check, unit tests, integration tests against Testcontainers, build the container image, and run security scanning — dependency audit, SAST, IaC scanning (tfsec/checkov), and a container image scan. Plus <code>terraform plan</code> posted as a PR comment so the reviewer sees the infrastructure diff alongside the code diff. Nothing merges without a green pipeline and a review.</li>
+<li><strong>On merge:</strong> build once, tag the image with the git SHA, push to ECR. <strong>The same artifact is promoted through every environment</strong> — never rebuilt per environment, because a rebuild is a different artifact and invalidates everything you tested.</li>
+<li><strong>Deploy to dev/staging automatically</strong>, run smoke tests and a short load test against the SLO.</li>
+<li><strong>Production behind a manual approval gate</strong> (or fully automated with canary + automatic rollback if the team's maturity supports it). Deploy strategy: rolling or blue/green via CodeDeploy, with CloudWatch alarms wired as the rollback trigger so a deploy that raises the error rate reverts itself.</li>
+<li><strong>Post-deploy:</strong> verify health, watch the error budget, and annotate the dashboards with the deploy marker so the next person debugging can correlate.</li>
+</ol>
+<p>Cross-cutting: the pipeline authenticates to AWS via <strong>OIDC federation</strong>, assuming a role per environment — no long-lived access keys in CI secrets. Least privilege per stage, so the dev deploy role literally cannot touch production.</p></details>
+
+<details class="qa"><summary>Blue/green vs canary vs rolling — and how do you roll back?</summary>
+<p><strong>Rolling</strong>: replace instances in batches. Cheapest, no extra infrastructure, but rollback means another rolling deploy (slow) and two versions serve traffic simultaneously, so backward compatibility is mandatory.</p>
+<p><strong>Blue/green</strong>: full parallel environment, flip the load balancer target group, keep blue warm. <strong>Rollback is instant</strong> — flip back — which is why I'd choose it for anything high-stakes. Costs double capacity during the window, and stateful concerns (in-flight sessions, database migrations) need thought.</p>
+<p><strong>Canary</strong>: shift 1% → 10% → 50% → 100% with automated metric evaluation between steps. Best risk-to-cost ratio <em>if</em> you have trustworthy metrics and automated rollback; without those it's just a slow rolling deploy with extra steps.</p>
+<p>The honest closing point: the rollback path matters more than the deploy strategy. I'd rather have a boring rolling deploy with a tested one-command rollback than a sophisticated canary nobody has ever reverted. And database migrations don't roll back with the code — that's why expand/migrate/contract is a hard requirement, not a nicety.</p></details>
+
+<details class="qa"><summary>How do you handle secrets in a pipeline?</summary>
+<p>Nothing long-lived, and nothing in the repository. Concretely: CI authenticates to AWS through <strong>OIDC federation</strong> — GitHub Actions or GitLab presents a signed identity token, AWS trusts the provider and issues short-lived STS credentials scoped by a trust policy that pins the repo and branch. That removes the single biggest secret from the pipeline.</p>
+<p>Application secrets are never injected by the pipeline at all — the running workload reads them from Secrets Manager or SSM Parameter Store at startup using its own task/execution role. The pipeline therefore never sees production credentials, which means a compromised build agent doesn't hand over the database.</p>
+<p>Supporting controls: secret scanning in pre-commit and on push, masked output in CI logs (and the awareness that masking is defeated by base64-encoding, so scanning matters more), short-lived environment-scoped roles, and an approval gate on the job that can touch production. For third-party tokens with no OIDC option, store them in the platform's secret store scoped to a protected environment, and rotate on a schedule.</p></details>
+
+<h2>Quality &amp; security in the SDLC</h2>
+<details class="qa"><summary>What security checks live in your pipeline?</summary>
+<ul>
+<li><strong>SCA / dependency scanning</strong> — <code>npm audit</code>, Snyk or Dependabot against the lockfile. Most real-world vulnerabilities arrive through transitive dependencies, not your code.</li>
+<li><strong>SAST</strong> — static analysis on the source (CodeQL, SonarQube, Semgrep) for injection, unsafe deserialisation, hard-coded secrets.</li>
+<li><strong>Secret scanning</strong> — gitleaks/trufflehog on the diff and on history.</li>
+<li><strong>IaC scanning</strong> — checkov, tfsec or cfn-nag catching a public S3 bucket, an unencrypted volume, or an over-broad security group <em>before</em> it exists rather than in a quarterly audit.</li>
+<li><strong>Container scanning</strong> — Trivy or ECR scanning on the built image, plus a policy against running as root and against <code>:latest</code> tags.</li>
+<li><strong>DAST</strong> — running the deployed staging environment against OWASP ZAP for the authenticated paths.</li>
+</ul>
+<p>The policy point that matters: gate the build on <em>new</em> high and critical findings rather than on the total count. A pipeline that fails on 400 pre-existing medium findings gets bypassed within a week, and a bypassed gate is worse than no gate.</p></details>
+
+<details class="qa"><summary>The JD says "defect prevention" — what does that mean beyond writing tests?</summary>
+<p>Tests catch defects; prevention stops them being written. The levers I'd name:</p>
+<ul>
+<li><strong>Make invalid states unrepresentable</strong> — strict TypeScript, discriminated unions, branded ID types, schema validation at every boundary. A whole class of bugs becomes a compile error.</li>
+<li><strong>Shift left</strong> — the same checks run in pre-commit hooks and in CI, so feedback arrives in seconds rather than at review time.</li>
+<li><strong>Design review before implementation</strong> for anything non-trivial. The cheapest defect to fix is one in a document.</li>
+<li><strong>Blameless post-incident reviews with action items that are tracked.</strong> The question isn't "who broke it" but "what made this failure possible, and what class of failure does the fix eliminate". A post-mortem whose only output is "be more careful" has prevented nothing.</li>
+<li><strong>Definition of done that includes observability</strong> — a feature isn't done without logs, metrics and an alarm that would catch it failing.</li>
+<li><strong>Track escaped defects by root cause</strong> over time, so you fix categories rather than instances.</li>
+</ul></details>

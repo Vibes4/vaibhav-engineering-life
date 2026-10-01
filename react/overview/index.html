@@ -1,0 +1,107 @@
+<h1>React Overview <span class="tag react">React</span></h1>
+<p><strong>React is a library for describing user interfaces as a function of state.</strong> You never tell the browser <em>how</em> to change; you describe <em>what</em> the screen should look like for the current data, and React works out the minimal set of DOM operations to get there. That single inversion — <code>UI = f(state)</code> — is the whole idea, and everything else (the virtual DOM, hooks, reconciliation, concurrency) is machinery in service of it.</p>
+<p>It is deliberately <em>not</em> a framework. React ships a component model and a renderer, and stops. Routing, data fetching, global state and forms are left to an ecosystem — a design decision with real consequences for how you architect an app.</p>
+
+<h2>Imperative DOM vs declarative UI</h2>
+<p>With raw DOM (or jQuery), you own every transition. You must remember which nodes are affected by which change, and update all of them, in the right order, from every code path:</p>
+<pre><code>// imperative: you describe the TRANSITION
+function addTodo(text) {
+  const li = document.createElement('li');
+  li.textContent = text;
+  list.appendChild(li);
+  counter.textContent = list.children.length;   // easy to forget
+}
+function removeTodo(li) {
+  li.remove();
+  // ...and here someone forgot to update `counter`  → the bug
+}</code></pre>
+<p>The bug class is structural: <strong>N states × M update paths</strong> means every new feature multiplies the places that can drift out of sync. React removes the transition entirely — you re-describe the whole UI from the current state and let the library compute the transition:</p>
+<pre><code>// declarative: you describe the RESULT
+function TodoList({ todos }) {
+  return (
+    &lt;div&gt;
+      &lt;ul&gt;{todos.map(t =&gt; &lt;li key={t.id}&gt;{t.text}&lt;/li&gt;)}&lt;/ul&gt;
+      &lt;p&gt;{todos.length} items&lt;/p&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+<div class="callout tip"><strong>Senior tip:</strong> The counter cannot go stale, because there is no code path that updates the list without also re-deriving the count. Declarative UI trades a small constant cost (re-describe everything) for the elimination of an entire bug family.</div>
+
+<h2>The component model and one-way data flow</h2>
+<p>A component is a function from props to a description of UI. Components compose into a tree; data enters at the top and flows <strong>down</strong> through props, while events flow <strong>up</strong> through callbacks. There is no two-way binding and no observable magic.</p>
+<pre class="mermaid">
+flowchart TD
+  S["State lives in App"] --> H["Header props"]
+  S --> L["TodoList props"]
+  L --> I["TodoItem props"]
+  I -- onToggle callback --> S
+</pre>
+<p>Why this matters at a senior level: when a value on screen is wrong, there is exactly <strong>one</strong> place it could have come from — the prop chain above it. You walk up the tree until you find the owner of that state. In a two-way-binding system any of N watchers could have written the value, and the debugging cost grows with the size of the app rather than the depth of the tree.</p>
+<div class="callout"><strong>Note:</strong> "Single source of truth" is a consequence, not a slogan. Each piece of state has exactly one owner; everyone else receives a read-only copy through props.</div>
+
+<h2>The virtual DOM — what it actually buys you</h2>
+<p>Rendering a component produces a tree of plain JavaScript objects (React elements), not DOM nodes. React keeps the previous tree, compares it to the new one (<em>reconciliation</em>), and applies only the differences to the real DOM.</p>
+<p>The honest version of the story, which interviewers are listening for:</p>
+<ul>
+  <li><strong>The virtual DOM is not faster than hand-written DOM code.</strong> Optimal imperative updates will always beat diffing — you are adding a diff pass that a human writing the minimal mutation does not pay.</li>
+  <li><strong>It is faster than naive re-rendering</strong> (<code>innerHTML = template(state)</code>), which destroys focus, scroll position, selection and input state.</li>
+  <li><strong>What it really buys is predictability and batching.</strong> You get to write "re-render everything" code and still get a small, coalesced set of mutations, applied once per commit rather than once per <code>setState</code>.</li>
+  <li>It also decouples React from the DOM entirely, which is why <code>react-native</code>, <code>react-three-fiber</code> and custom renderers exist at all.</li>
+</ul>
+<div class="callout warn"><strong>Gotcha:</strong> "React is fast because of the virtual DOM" is a red flag answer. React is <em>fast enough</em> because diffing is cheap relative to layout and paint, and it is <em>maintainable</em> because you never write the transition. Signals-based frameworks (Solid, Svelte 5) skip the VDOM and update the DOM directly — proof the VDOM is a means, not the point.</div>
+
+<h2>The modern baseline (React 18 / 19)</h2>
+<ul>
+  <li><strong>Function components + hooks are the default.</strong> Classes are legacy. The only thing you cannot yet do with a function component is an <strong>error boundary</strong> (<code>componentDidCatch</code> / <code>getDerivedStateFromError</code>), so those stay classes — or you use <code>react-error-boundary</code>.</li>
+  <li><strong>React 18</strong> introduced <code>createRoot</code>, automatic batching everywhere (promises, timeouts, native handlers — not just event handlers), <code>StrictMode</code> double-invoking renders and effects in development, and concurrent features: <code>useTransition</code>, <code>useDeferredValue</code>, streaming SSR with <code>Suspense</code>.</li>
+  <li><strong>React 19</strong> adds Actions and <code>useActionState</code>, <code>useOptimistic</code>, <code>use()</code>, ref as a regular prop (no <code>forwardRef</code> needed), and stabilizes the Server Components model. The React Compiler (auto-memoization) is shipping separately and makes most manual <code>useMemo</code>/<code>useCallback</code> unnecessary over time.</li>
+  <li><strong>RSC is a framework-level feature.</strong> Server Components need a bundler + router integration; in practice that means Next.js App Router or React Router / Waku. Plain <code>create-react-app</code>-style SPAs do not have them (and CRA is deprecated — the docs now point at Vite or a framework).</li>
+</ul>
+
+<h2>React vs Angular vs Vue</h2>
+<table>
+  <thead><tr><th></th><th>React</th><th>Angular</th><th>Vue</th></tr></thead>
+  <tbody>
+    <tr><td>Scope</td><td>View library + ecosystem</td><td>Full framework (batteries included)</td><td>Progressive framework, official libs</td></tr>
+    <tr><td>Language</td><td>JS/TS + JSX</td><td>TypeScript + decorators, mandatory</td><td>SFCs, template DSL or JSX</td></tr>
+    <tr><td>Reactivity</td><td>Re-render + diff (VDOM)</td><td>Zone.js change detection; Signals since v16</td><td>Fine-grained proxy reactivity</td></tr>
+    <tr><td>Routing / HTTP / forms</td><td>Third-party (React Router, TanStack Query, RHF)</td><td>Built in and versioned together</td><td>Official Vue Router / Pinia</td></tr>
+    <tr><td>DI</td><td>None (context + props)</td><td>First-class hierarchical injector</td><td>provide/inject</td></tr>
+    <tr><td>Best fit</td><td>Teams that want to pick their stack</td><td>Large enterprises wanting one blessed path</td><td>Fast onboarding, mid-size apps</td></tr>
+  </tbody>
+</table>
+<p>The senior framing is not "which is better" but <strong>who owns the architecture decisions</strong>. Angular decides for you and upgrades the whole stack in lockstep — excellent for large orgs, constraining for product teams. React hands you the decisions and the maintenance of the choices you made; a five-year-old React app is usually an archaeology of the state library that was fashionable each year.</p>
+
+<h2>What React deliberately does not solve</h2>
+<table>
+  <thead><tr><th>Concern</th><th>React gives you</th><th>Ecosystem answer</th></tr></thead>
+  <tbody>
+    <tr><td>Routing</td><td>Nothing</td><td>React Router, TanStack Router, Next.js</td></tr>
+    <tr><td>Server data</td><td><code>useEffect</code> + <code>fetch</code> (and all its races)</td><td>TanStack Query, SWR, RSC + <code>use()</code></td></tr>
+    <tr><td>Global/shared state</td><td>Context (a delivery mechanism, not a store)</td><td>Zustand, Redux Toolkit, Jotai, XState</td></tr>
+    <tr><td>Forms &amp; validation</td><td>Controlled inputs, that is all</td><td>React Hook Form + Zod, React 19 Actions</td></tr>
+    <tr><td>Styling</td><td>A <code>className</code> string</td><td>Tailwind, CSS Modules, vanilla-extract</td></tr>
+    <tr><td>Build/SSR</td><td>Low-level <code>renderToPipeableStream</code></td><td>Vite, Next.js, Remix</td></tr>
+  </tbody>
+</table>
+<div class="callout"><strong>Note:</strong> Context is <em>not</em> a state manager. It solves prop drilling; it has no selectors, so every consumer re-renders when the provider value changes. Reaching for Context to hold frequently-changing global state is one of the most common architectural mistakes in React codebases.</div>
+
+<h2>When React is the wrong tool</h2>
+<ul>
+  <li><strong>Mostly-static content sites</strong> — a marketing site, docs, or a blog. Astro or a plain static generator ships zero JS by default; React ships a runtime and then hydrates markup the user could have had instantly.</li>
+  <li><strong>A tiny widget on an existing server-rendered page</strong> — a date picker on a Rails/Django page does not justify ~45 KB of runtime. Web components or a few dozen lines of vanilla JS win.</li>
+  <li><strong>Extremely high-frequency updates</strong> — 60fps canvas, charting with thousands of points, spreadsheets. Let React own the shell and drop to imperative code (canvas, WebGL, direct refs) inside it.</li>
+  <li><strong>Hard SEO/latency budgets with a small team</strong> — you end up needing SSR, which means adopting a framework anyway; decide that upfront rather than retrofitting it.</li>
+</ul>
+<div class="callout tip"><strong>Senior tip:</strong> The strongest signal for React is <em>lots of interactive state that changes over time</em>. If your page is 95% content and 5% interaction, you are paying React's cost for the 95%.</div>
+
+<div class="interview">
+  <h3>🎯 Interview questions</h3>
+  <details><summary>Is React a framework or a library, and why does the distinction matter?</summary><p>A library: it renders components and manages updates, and nothing else. Routing, data fetching, global state, forms and build tooling are your choices. That means flexibility and a stack you must curate and maintain yourself, versus Angular where those decisions come pre-made and version together.</p></details>
+  <details><summary>Is the virtual DOM faster than direct DOM manipulation?</summary><p>No. Optimal hand-written DOM updates beat diffing. The VDOM is faster than naive full re-rendering and, more importantly, it buys predictability and batching: you write "describe everything from state" code and React coalesces it into one minimal commit. It also abstracts the host, enabling React Native and other renderers.</p></details>
+  <details><summary>What does one-way data flow give you concretely?</summary><p>Traceability. Any value on screen came from props passed by an ancestor, so debugging is a walk up a single chain to the state's owner. With two-way binding, any watcher could have written the value, so the search space is the whole app rather than one path.</p></details>
+  <details><summary>Do you still need class components?</summary><p>Only for error boundaries, which have no hook equivalent — <code>getDerivedStateFromError</code> and <code>componentDidCatch</code> are class-only. Most teams use <code>react-error-boundary</code> so they never write a class. Everything else is function components with hooks.</p></details>
+  <details><summary>What did React 18 actually change for an app author?</summary><p><code>createRoot</code> instead of <code>ReactDOM.render</code>; automatic batching extended to promises, timeouts and native handlers; StrictMode double-invoking renders and effects in development to surface impurity and missing cleanup; and opt-in concurrent features (<code>useTransition</code>, <code>useDeferredValue</code>, Suspense-based streaming SSR).</p></details>
+  <details><summary>When would you argue against using React?</summary><p>Content-dominant sites where shipping a runtime and hydrating is pure overhead (use Astro or static HTML); a single small widget inside an existing server-rendered app; and render loops at animation frequency, where you keep React for the shell and go imperative (canvas/WebGL/refs) for the hot path.</p></details>
+  <details><summary>Why is Context not a substitute for a state library?</summary><p>Context is a distribution mechanism with no selector layer: any change to the provider's value re-renders every consumer, no matter which slice it reads. Stores like Zustand or Redux subscribe per-selector so only affected components re-render. Context is right for stable values (theme, locale, the store handle itself).</p></details>
+</div>
